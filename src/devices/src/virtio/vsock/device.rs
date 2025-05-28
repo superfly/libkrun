@@ -11,6 +11,8 @@ use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crossbeam_channel::Sender;
+use event::Event;
 use utils::byte_order;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
@@ -22,6 +24,7 @@ use super::super::{
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
+use super::proxy::HostPortMap;
 use super::{defs, defs::uapi};
 use crate::legacy::IrqChip;
 
@@ -57,7 +60,7 @@ pub struct Vsock {
 impl Vsock {
     pub(crate) fn with_queues(
         cid: u64,
-        host_port_map: Option<HashMap<u16, u16>>,
+        host_port_map: Option<HostPortMap>,
         queues: Vec<VirtQueue>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     ) -> super::Result<Vsock> {
@@ -102,7 +105,7 @@ impl Vsock {
     /// Create a new virtio-vsock device with the given VM CID.
     pub fn new(
         cid: u64,
-        host_port_map: Option<HashMap<u16, u16>>,
+        host_port_map: Option<HostPortMap>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     ) -> super::Result<Vsock> {
         let queues: Vec<VirtQueue> = defs::QUEUE_SIZES

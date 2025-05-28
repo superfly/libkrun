@@ -166,7 +166,8 @@ impl PortOutputLog {
     }
 
     fn force_flush(&mut self) {
-        log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "[missing newline]{}", String::from_utf8_lossy(&self.buf));
+        println!("[missing newline]{}", String::from_utf8_lossy(&self.buf));
+        // log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "[missing newline]{}", String::from_utf8_lossy(&self.buf));
         self.buf.clear();
     }
 }
@@ -178,7 +179,8 @@ impl PortOutput for PortOutputLog {
         let mut start = 0;
         for (i, ch) in self.buf.iter().cloned().enumerate() {
             if ch == b'\n' {
-                log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "{}", String::from_utf8_lossy(&self.buf[start..i]));
+                println!("{}", String::from_utf8_lossy(&self.buf[start..i]));
+                // log::log!(target: PortOutputLog::LOG_TARGET, Level::Error, "{}", String::from_utf8_lossy(&self.buf[start..i]));
                 start = i + 1;
             }
         }

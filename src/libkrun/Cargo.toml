@@ -8,8 +8,8 @@ build = "build.rs"
 [features]
 tee = []
 amd-sev = [ "blk", "tee" ]
-net = []
-blk = []
+net = [ "devices/net", "vmm/net" ]
+blk = [ "devices/blk", "vmm/blk" ]
 efi = [ "blk", "net" ]
 gpu = []
 snd = []
@@ -27,6 +27,7 @@ devices = { path = "../devices" }
 polly = { path = "../polly" }
 utils = { path = "../utils" }
 vmm = { path = "../vmm" }
+event = { path = "../event" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { path = "../hvf" }
@@ -38,4 +39,4 @@ vm-memory = ">=0.13"
 
 [lib]
 name = "krun"
-crate-type = ["cdylib"]
+# crate-type = ["cdylib"]

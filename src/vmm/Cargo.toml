@@ -28,6 +28,7 @@ devices = { path = "../devices" }
 kernel = { path = "../kernel" }
 utils = { path = "../utils"}
 polly = { path = "../polly" }
+event = { path = "../event" }
 
 # Dependencies for amd-sev
 codicon = { version = "3.0.0", optional = true }

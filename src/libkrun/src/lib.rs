@@ -5,9 +5,9 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
-use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
+use std::ffi::{CStr, OsStr};
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
@@ -16,18 +16,20 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
-#[cfg(not(feature = "efi"))]
-use std::sync::LazyLock;
 use std::sync::Mutex;
+#[cfg(not(feature = "efi"))]
+use std::sync::OnceLock;
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Sender};
 #[cfg(feature = "blk")]
 use devices::virtio::block::ImageType;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
+use devices::virtio::HostPortMap;
 use env_logger::Env;
+use event::Event;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
@@ -68,8 +70,7 @@ const KRUNFW_NAME: &str = "libkrunfw.4.dylib";
 const INIT_PATH: &str = "/init.krun";
 
 #[cfg(not(feature = "efi"))]
-static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+static KRUNFW: OnceLock<libloading::Library> = OnceLock::new();
 
 #[cfg(not(feature = "efi"))]
 pub struct KrunfwBindings {
@@ -85,11 +86,27 @@ pub struct KrunfwBindings {
 
 #[cfg(not(feature = "efi"))]
 impl KrunfwBindings {
-    fn load_bindings() -> Result<KrunfwBindings, libloading::Error> {
-        let krunfw = match KRUNFW.as_ref() {
-            Some(krunfw) => krunfw,
-            None => return Err(libloading::Error::DlOpenUnknown),
+    fn load_bindings<P: AsRef<OsStr>>(
+        path: Option<P>,
+    ) -> Result<KrunfwBindings, libloading::Error> {
+        if let Some(p) = path {
+            eprintln!("setting custom krunfw");
+            KRUNFW
+                .set(unsafe { libloading::Library::new(p)? })
+                .expect("could not set custom KRUNFW");
+        }
+        let krunfw = if let Some(krunfw) = KRUNFW.get() {
+            krunfw
+        } else {
+            eprintln!("attempting to load default krunfw {KRUNFW_NAME}");
+            let lib = unsafe { libloading::Library::new(KRUNFW_NAME)? };
+            KRUNFW.set(lib).expect("could not set default KRUNFW");
+            KRUNFW.get().unwrap()
         };
+        // match KRUNFW.get_or_init(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() }) {
+        //     Some(krunfw) => krunfw,
+        //     None => return Err(libloading::Error::DlOpenUnknown),
+        // };
         Ok(unsafe {
             KrunfwBindings {
                 get_kernel: krunfw.get(b"krunfw_get_kernel")?,
@@ -101,14 +118,14 @@ impl KrunfwBindings {
         })
     }
 
-    pub fn new() -> Option<Self> {
-        Self::load_bindings().ok()
+    pub fn new<P: AsRef<OsStr>>(path: Option<P>) -> Option<Self> {
+        Self::load_bindings(path).ok()
     }
 }
 
 #[derive(Default)]
 struct TsiConfig {
-    port_map: Option<HashMap<u16, u16>>,
+    port_map: Option<HostPortMap>,
 }
 
 enum NetworkConfig {
@@ -152,6 +169,7 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    kernel_cmdline: Option<String>,
 }
 
 impl ContextConfig {
@@ -250,7 +268,7 @@ impl ContextConfig {
         self.mac = Some(mac);
     }
 
-    fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
+    fn set_port_map(&mut self, new_port_map: HostPortMap) -> Result<(), ()> {
         match &mut self.net_cfg {
             NetworkConfig::Tsi(tsi_config) => {
                 tsi_config.port_map.replace(new_port_map);
@@ -315,8 +333,7 @@ pub extern "C" fn krun_set_log_level(level: u32) -> i32 {
     KRUN_SUCCESS
 }
 
-#[no_mangle]
-pub extern "C" fn krun_create_ctx() -> i32 {
+pub fn krun_create_ctx<P: AsRef<OsStr>>(krunfw: Option<P>) -> i32 {
     let ctx_cfg = {
         let shutdown_efd = if cfg!(feature = "efi") {
             Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
@@ -326,7 +343,7 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 
         ContextConfig {
             #[cfg(not(feature = "efi"))]
-            krunfw: KrunfwBindings::new(),
+            krunfw: KrunfwBindings::new(krunfw),
             shutdown_efd,
             ..Default::default()
         }
@@ -686,44 +703,7 @@ pub unsafe extern "C" fn krun_set_net_mac(ctx_id: u32, c_mac: *const u8) -> i32 
     KRUN_SUCCESS
 }
 
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
-    let mut port_map = HashMap::new();
-    let port_map_array: &[*const c_char] = slice::from_raw_parts(c_port_map, MAX_ARGS);
-    for item in port_map_array.iter().take(MAX_ARGS) {
-        if item.is_null() {
-            break;
-        } else {
-            let s = match CStr::from_ptr(*item).to_str() {
-                Ok(s) => s,
-                Err(_) => return -libc::EINVAL,
-            };
-            let port_tuple: Vec<&str> = s.split(':').collect();
-            if port_tuple.len() != 2 {
-                return -libc::EINVAL;
-            }
-            let host_port: u16 = match port_tuple[0].parse() {
-                Ok(p) => p,
-                Err(_) => return -libc::EINVAL,
-            };
-            let guest_port: u16 = match port_tuple[1].parse() {
-                Ok(p) => p,
-                Err(_) => return -libc::EINVAL,
-            };
-
-            if port_map.contains_key(&guest_port) {
-                return -libc::EINVAL;
-            }
-            for hp in port_map.values() {
-                if *hp == host_port {
-                    return -libc::EINVAL;
-                }
-            }
-            port_map.insert(guest_port, host_port);
-        }
-    }
-
+pub fn krun_set_port_map(ctx_id: u32, port_map: HostPortMap) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -1346,8 +1326,29 @@ pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     KRUN_SUCCESS
 }
 
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+pub unsafe extern "C" fn krun_set_kernel_cmdline(ctx_id: u32, c_cmdline: *const c_char) -> i32 {
+    let cmdline = match CStr::from_ptr(c_cmdline).to_str() {
+        Ok(cmdline) => cmdline,
+        Err(e) => {
+            error!("Error parsing cmdline: {:?}", e);
+            return -libc::EINVAL;
+        }
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.kernel_cmdline = Some(cmdline.to_owned());
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+pub fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(target_os = "linux")]
     {
         let prname = match env::var("HOSTNAME") {
@@ -1408,18 +1409,39 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    let boot_source = BootSourceConfig {
-        kernel_cmdline_prolog: Some(format!(
-            "{} init={} {} {} {} {}",
-            DEFAULT_KERNEL_CMDLINE,
-            INIT_PATH,
-            ctx_cfg.get_exec_path(),
-            ctx_cfg.get_workdir(),
-            ctx_cfg.get_rlimits(),
-            ctx_cfg.get_env(),
-        )),
-        kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+    let boot_source = if let Some(kernel_cmdline) = &ctx_cfg.kernel_cmdline {
+        BootSourceConfig {
+            kernel_cmdline_prolog: Some(kernel_cmdline.clone()),
+            kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+        }
+    } else {
+        BootSourceConfig {
+            kernel_cmdline_prolog: Some(format!(
+                "{} init={} {} {} {} {}",
+                DEFAULT_KERNEL_CMDLINE,
+                "/sbin/init", // INIT_PATH,
+                ctx_cfg.get_exec_path(),
+                ctx_cfg.get_workdir(),
+                ctx_cfg.get_rlimits(),
+                ctx_cfg.get_env(),
+            )),
+            kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+        }
     };
+
+    // eprintln!(
+    //     "cmdline: {}{}",
+    //     boot_source
+    //         .kernel_cmdline_prolog
+    //         .as_ref()
+    //         .map(|s| s.as_str())
+    //         .unwrap_or_default(),
+    //     boot_source
+    //         .kernel_cmdline_epilog
+    //         .as_ref()
+    //         .map(|s| s.as_str())
+    //         .unwrap_or_default()
+    // );
 
     if ctx_cfg.vmr.set_boot_source(boot_source).is_err() {
         return -libc::EINVAL;

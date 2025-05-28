@@ -21,7 +21,9 @@ use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
-use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{
+    HostPortMap, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -372,7 +374,7 @@ impl Proxy for UdpProxy {
         &mut self,
         _pkt: &VsockPacket,
         _req: TsiListenReq,
-        _host_port_map: &Option<HashMap<u16, u16>>,
+        _host_port_map: &Option<HostPortMap>,
     ) -> ProxyUpdate {
         ProxyUpdate::default()
     }
