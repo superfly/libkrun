@@ -1,10 +1,13 @@
+use log::{debug, error, warn};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{
     bind, connect, getsockopt, recv, send, setsockopt, socket, sockopt, AddressFamily, MsgFlags,
     SockFlag, SockType, UnixAddr,
 };
 use nix::unistd::unlink;
-use std::os::fd::{AsRawFd, RawFd};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
@@ -12,45 +15,28 @@ use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
 
 pub struct Gvproxy {
-    fd: RawFd,
+    sock: UnixDatagram,
 }
 
 impl Gvproxy {
     /// Connect to a running gvproxy instance, given a socket file descriptor
     pub fn new(path: PathBuf) -> Result<Self, ConnectError> {
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Datagram,
-            SockFlag::empty(),
-            None,
-        )
-        .map_err(ConnectError::CreateSocket)?;
-        let peer_addr = UnixAddr::new(&path).map_err(ConnectError::InvalidAddress)?;
-        let local_addr = UnixAddr::new(&PathBuf::from(format!("{}-krun.sock", path.display())))
-            .map_err(ConnectError::InvalidAddress)?;
-        if let Some(path) = local_addr.path() {
-            _ = unlink(path);
+        let local_path = format!("{}-krun.sock", path.display());
+        _ = unlink(local_path.as_str());
+
+        let sock = UnixDatagram::bind(&local_path).map_err(ConnectError::Binding)?;
+        sock.connect(&path).map_err(ConnectError::Binding)?;
+
+        sock.send(&VFKIT_MAGIC)
+            .map_err(ConnectError::SendingMagic)?;
+
+        if let Err(e) = sock.set_nonblocking(true) {
+            warn!(
+                "error switching to non-blocking: fs={}, err={}",
+                sock.as_raw_fd(),
+                e
+            );
         }
-        bind(fd, &local_addr).map_err(ConnectError::Binding)?;
-
-        // Connect so we don't need to use the peer address again. This also
-        // allows the server to remove the socket after the connection.
-        connect(fd, &peer_addr).map_err(ConnectError::Binding)?;
-
-        send(fd, &VFKIT_MAGIC, MsgFlags::empty()).map_err(ConnectError::SendingMagic)?;
-
-        // macOS forces us to do this here instead of just using SockFlag::SOCK_NONBLOCK above.
-        match fcntl(fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                        warn!("error switching to non-blocking: id={}, err={}", fd, e);
-                    }
-                }
-                None => error!("invalid fd flags id={}", fd),
-            },
-            Err(e) => error!("couldn't obtain fd flags id={}, err={}", fd, e),
-        };
 
         #[cfg(target_os = "macos")]
         {
@@ -58,7 +44,7 @@ impl Gvproxy {
             let option_value: libc::c_int = 1;
             unsafe {
                 libc::setsockopt(
-                    fd,
+                    sock.as_raw_fd(),
                     libc::SOL_SOCKET,
                     libc::SO_NOSIGPIPE,
                     &option_value as *const _ as *const libc::c_void,
@@ -67,35 +53,34 @@ impl Gvproxy {
             };
         }
 
-        if let Err(e) = setsockopt(fd, sockopt::SndBuf, &(7 * 1024 * 1024)) {
+        if let Err(e) = setsockopt(&sock, sockopt::SndBuf, &(7 * 1024 * 1024)) {
             log::warn!("Failed to increase SO_SNDBUF (performance may be decreased): {e}");
         }
-        if let Err(e) = setsockopt(fd, sockopt::RcvBuf, &(7 * 1024 * 1024)) {
+        if let Err(e) = setsockopt(&sock, sockopt::RcvBuf, &(7 * 1024 * 1024)) {
             log::warn!("Failed to increase SO_SNDBUF (performance may be decreased): {e}");
         }
 
         log::debug!(
-            "passt socket (fd {fd}) buffer sizes: SndBuf={:?} RcvBuf={:?}",
-            getsockopt(fd, sockopt::SndBuf),
-            getsockopt(fd, sockopt::RcvBuf)
+            "gvproxy socket (fd {}) buffer sizes: SndBuf={:?} RcvBuf={:?}",
+            sock.as_raw_fd(),
+            getsockopt(&sock, sockopt::SndBuf),
+            getsockopt(&sock, sockopt::RcvBuf)
         );
 
-        Ok(Self { fd })
+        Ok(Self { sock })
     }
 }
 
 impl NetBackend for Gvproxy {
     /// Try to read a frame from passt. If no bytes are available reports ReadError::NothingRead
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let frame_length = match recv(self.fd, buf, MsgFlags::empty()) {
+        let frame_length = match self.sock.recv(buf) {
             Ok(f) => f,
             #[allow(unreachable_patterns)]
-            Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
-                return Err(ReadError::NothingRead)
-            }
-            Err(e) => {
-                return Err(ReadError::Internal(e));
-            }
+            Err(e) => match e.kind() {
+                io::ErrorKind::WouldBlock => return Err(ReadError::NothingRead),
+                _ => return Err(ReadError::Internal(e)),
+            },
         };
         debug!("Read eth frame from passt: {} bytes", frame_length);
         Ok(frame_length)
@@ -111,8 +96,10 @@ impl NetBackend for Gvproxy {
     /// If this function returns WriteError::PartialWrite, you have to finish the write using
     /// try_finish_write.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret =
-            send(self.fd, &buf[hdr_len..], MsgFlags::empty()).map_err(WriteError::Internal)?;
+        let ret = self
+            .sock
+            .send(&buf[hdr_len..])
+            .map_err(WriteError::Internal)?;
         debug!(
             "Written frame size={}, written={}",
             buf.len() - hdr_len,
@@ -131,6 +118,6 @@ impl NetBackend for Gvproxy {
     }
 
     fn raw_socket_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.sock.as_raw_fd()
     }
 }

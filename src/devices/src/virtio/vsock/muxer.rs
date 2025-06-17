@@ -82,7 +82,7 @@ pub fn push_packet(
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &GuestMemoryMmap,
-) {
+) -> bool {
     let mut queue = queue_mutex.lock().unwrap();
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
@@ -91,10 +91,12 @@ pub fn push_packet(
                 error!("failed to add used elements to the queue: {:?}", e);
             }
         }
+        true
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
+        false
     }
 }
 
@@ -230,7 +232,7 @@ impl VsockMuxer {
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                warn!("deferring proxy removal: {}", id);
+                debug!("deferring proxy removal: {}", id);
                 if let Some(reaper_sender) = &self.reaper_sender {
                     if reaper_sender.send(id).is_err() {
                         self.proxy_map.write().unwrap().remove(&id);

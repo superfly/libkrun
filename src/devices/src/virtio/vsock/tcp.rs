@@ -374,7 +374,7 @@ impl TcpProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn push_reset(&self) {
+    fn push_reset(&self) -> bool {
         debug!(
             "push_reset: id: {}, peer_port: {}, local_port: {}",
             self.id, self.peer_port, self.local_port
@@ -385,7 +385,7 @@ impl TcpProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem)
     }
 
     fn switch_to_connected(&mut self) {
@@ -711,7 +711,7 @@ impl Proxy for TcpProxy {
         };
 
         if let Err(e) = shutdown(self.fd, how) {
-            warn!("error sending shutdown to socket: {}", e);
+            debug!("error sending shutdown to socket: {}", e);
         }
 
         if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
@@ -741,18 +741,42 @@ impl Proxy for TcpProxy {
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
+        // If already closed, ignore all events to prevent infinite loops
+        if self.status == ProxyStatus::Closed {
+            debug!(
+                "process_event: ignoring event for closed proxy: {:?}",
+                evset
+            );
+            update.polling = Some((self.id, self.fd, EventSet::empty()));
+            return update;
+        }
+
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
-            if self.status == ProxyStatus::Connecting {
+
+            // Determine removal type and status before changing status
+            let was_listening = self.status == ProxyStatus::Listening;
+            let was_connecting = self.status == ProxyStatus::Connecting;
+
+            // Set status to closed FIRST to prevent re-processing
+            self.status = ProxyStatus::Closed;
+
+            // Immediately stop polling this fd to prevent infinite HANG_UP events
+            update.polling = Some((self.id, self.fd, EventSet::empty()));
+
+            // Try to send appropriate response based on what status we had before closing
+            if was_listening {
+                // Don't send reset for listening sockets
+            } else if was_connecting {
                 self.push_connect_rsp(-libc::ECONNREFUSED);
             } else {
-                self.push_reset();
+                // Try to send reset, but don't worry if it fails due to queue being full
+                let _success = self.push_reset();
+                // Note: If push_reset fails, the reset will be queued in rxq and sent later
             }
 
-            self.status = ProxyStatus::Closed;
-            update.polling = Some((self.id, self.fd, EventSet::empty()));
             update.signal_queue = true;
-            update.remove_proxy = if self.status == ProxyStatus::Listening {
+            update.remove_proxy = if was_listening {
                 ProxyRemoval::Immediate
             } else {
                 ProxyRemoval::Deferred
@@ -818,7 +842,9 @@ impl Proxy for TcpProxy {
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd, EventSet::empty()));
             } else {
-                error!("vsock::tcp: EventSet::OUT while not connecting");
+                // OUT events on non-connecting sockets are normal (socket ready for writing)
+                // Just ignore them since we don't currently use write buffering that would need this
+                debug!("process_event: OUT ignored for status {:?}", self.status);
             }
         }
 

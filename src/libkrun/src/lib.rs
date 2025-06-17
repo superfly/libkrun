@@ -27,15 +27,17 @@ use devices::virtio::block::ImageType;
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
-use devices::virtio::HostPortMap;
+use devices::virtio::{HostPortMap, Queue};
 use env_logger::Env;
 use event::Event;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
+use net_proxy::backend::NetBackend;
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+use vm_memory::GuestMemoryMmap;
 use vmm::resources::VmResources;
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::BlockDeviceConfig;
@@ -130,8 +132,9 @@ struct TsiConfig {
 
 enum NetworkConfig {
     Tsi(TsiConfig),
-    VirtioNetPasst(RawFd),
+    // VirtioNetPasst(RawFd),
     VirtioNetGvproxy(PathBuf),
+    DirectProxy(Vec<(u16, String)>),
 }
 
 impl Default for NetworkConfig {
@@ -274,8 +277,9 @@ impl ContextConfig {
                 tsi_config.port_map.replace(new_port_map);
                 Ok(())
             }
-            NetworkConfig::VirtioNetPasst(_) => Err(()),
+            // NetworkConfig::VirtioNetPasst(_) => Err(()),
             NetworkConfig::VirtioNetGvproxy(_) => Err(()),
+            NetworkConfig::DirectProxy(_) => Err(()),
         }
     }
 
@@ -648,13 +652,13 @@ pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
         return -libc::ENOTSUP;
     }
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.set_net_cfg(NetworkConfig::VirtioNetPasst(fd));
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
+    // match CTX_MAP.lock().unwrap().entry(ctx_id) {
+    //     Entry::Occupied(mut ctx_cfg) => {
+    //         let cfg = ctx_cfg.get_mut();
+    //         cfg.set_net_cfg(NetworkConfig::VirtioNetPasst(fd));
+    //     }
+    //     Entry::Vacant(_) => return -libc::ENOENT,
+    // }
     KRUN_SUCCESS
 }
 
@@ -675,6 +679,22 @@ pub unsafe extern "C" fn krun_set_gvproxy_path(ctx_id: u32, c_path: *const c_cha
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
             cfg.set_net_cfg(NetworkConfig::VirtioNetGvproxy(path));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
+pub fn krun_set_direct_proxy(ctx_id: u32, listeners: &[(u16, &str)]) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.set_net_cfg(NetworkConfig::DirectProxy(
+                listeners
+                    .iter()
+                    .map(|(vm_port, path)| (*vm_port, (*path).to_owned()))
+                    .collect(),
+            ));
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -1348,6 +1368,18 @@ pub unsafe extern "C" fn krun_set_kernel_cmdline(ctx_id: u32, c_cmdline: *const 
     KRUN_SUCCESS
 }
 
+pub struct StartVmm {
+    pub handle: std::thread::JoinHandle<Result<(), polly::event_manager::Error>>,
+    pub virtio_net: Option<VirtioNetDevice>,
+}
+
+pub struct VirtioNetDevice {
+    pub rx_queue: Queue,
+    pub tx_queue: Queue,
+    pub tx_eventfd: std::fs::File, // The File for notifying the guest
+    pub guest_memory: GuestMemoryMmap, // The shared memory region
+}
+
 pub fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(target_os = "linux")]
     {
@@ -1386,8 +1418,8 @@ pub fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(feature = "blk")]
     for block_cfg in ctx_cfg.get_block_cfg() {
-        if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
-            error!("Error configuring virtio-blk for block");
+        if let Err(e) = ctx_cfg.vmr.add_block_device(block_cfg) {
+            error!("Error configuring virtio-blk for block: {e}");
             return -libc::EINVAL;
         }
     }
@@ -1460,22 +1492,31 @@ pub fn krun_start_enter(ctx_id: u32) -> i32 {
         vsock_set = true;
     }
 
+    let mut wants_virtio_net = false;
+
     match ctx_cfg.net_cfg {
         NetworkConfig::Tsi(tsi_cfg) => {
             vsock_config.host_port_map = tsi_cfg.port_map;
             vsock_set = true;
         }
-        NetworkConfig::VirtioNetPasst(_fd) => {
-            #[cfg(feature = "net")]
-            {
-                let backend = VirtioNetBackend::Passt(_fd);
-                create_virtio_net(&mut ctx_cfg, backend);
-            }
-        }
+        // NetworkConfig::VirtioNetPasst(_fd) => {
+        //     #[cfg(feature = "net")]
+        //     {
+        //         let backend = VirtioNetBackend::Passt(_fd);
+        //         create_virtio_net(&mut ctx_cfg, backend);
+        //     }
+        // }
         NetworkConfig::VirtioNetGvproxy(ref _path) => {
             #[cfg(feature = "net")]
             {
                 let backend = VirtioNetBackend::Gvproxy(_path.clone());
+                create_virtio_net(&mut ctx_cfg, backend);
+            }
+        }
+        NetworkConfig::DirectProxy(ref listeners) => {
+            #[cfg(feature = "net")]
+            {
+                let backend = VirtioNetBackend::DirectProxy(listeners.clone());
                 create_virtio_net(&mut ctx_cfg, backend);
             }
         }
