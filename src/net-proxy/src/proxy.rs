@@ -79,6 +79,7 @@ impl AnyConnection {
         }
     }
 
+    #[cfg(test)]
     fn to_vm_buffer(&self) -> &VecDeque<Bytes> {
         match self {
             AnyConnection::EgressConnecting(conn) => &conn.to_vm_buffer,
@@ -481,11 +482,11 @@ impl NetProxy {
                                 }
                             }
 
-                            if payload.is_empty()
-                                && (flags & (TcpFlags::FIN | TcpFlags::RST | TcpFlags::SYN)) == 0
-                            {
-                                should_ack = true;
-                            }
+                            // if payload.is_empty()
+                            //     && (flags & (TcpFlags::FIN | TcpFlags::RST | TcpFlags::SYN)) == 0
+                            // {
+                            //     should_ack = true;
+                            // }
 
                             if (flags & TcpFlags::FIN) != 0 {
                                 conn.tx_ack = conn.tx_ack.wrapping_add(1);
