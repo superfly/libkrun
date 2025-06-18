@@ -414,7 +414,6 @@ impl NetProxy {
                         if incoming_seq == conn.tx_ack {
                             let flags = tcp_packet.get_flags();
 
-                            // *** FIX START: Handle RST packets first ***
                             // An RST packet immediately terminates the connection.
                             if (flags & TcpFlags::RST) != 0 {
                                 info!(?token, "RST received from VM. Tearing down connection.");
@@ -423,7 +422,6 @@ impl NetProxy {
                                 // It will be cleaned up at the end of the event loop.
                                 return Ok(());
                             }
-                            // *** FIX END ***
 
                             let payload = tcp_packet.payload();
                             let mut should_ack = false;

@@ -145,26 +145,20 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
-    let mut stx = MaybeUninit::<libc::statx>::zeroed();
-
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
     // Safe because the kernel will only write data in `st` and we check the return
     // value.
     let res = unsafe {
-        libc::statx(
-            f.as_raw_fd(),
-            pathname.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
-            stx.as_mut_ptr(),
+        rustix::fs::statx(
+            f,
+            pathname,
+            rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            rustix::fs::StatxFlags::BASIC_STATS | rustix::fs::StatxFlags::MNT_ID,
         )
     };
-    if res >= 0 {
-        // Safe because the kernel guarantees that the struct is now fully initialized.
-        let stx = unsafe { stx.assume_init() };
-
+    if let Ok(stx) = res {
         // Unfortunately, we cannot use an initializer to create the stat64 object,
         // because it may contain padding and reserved fields (depending on the
         // architecture), and it does not implement the Default trait.

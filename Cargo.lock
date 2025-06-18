@@ -526,6 +526,7 @@ dependencies = [
  "pnet",
  "polly",
  "rand 0.8.5",
+ "rustix",
  "rutabaga_gfx",
  "socket2",
  "thiserror 1.0.69",
