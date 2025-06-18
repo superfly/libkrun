@@ -174,7 +174,6 @@ impl NetWorker {
                     }
                     BACKEND_WAKER_TOKEN => {
                         if event.is_readable() {
-                            trace!("backend was readable");
                             if let Some(waker) = &self.waker {
                                 _ = waker.read(); // Correctly reset the waker
                             }
@@ -184,11 +183,10 @@ impl NetWorker {
                         }
                         if event.is_writable() {
                             // The `if` is important
-                            trace!("backend was writable");
                             self.process_backend_socket_writeable();
                         }
                     }
-                    token => {
+                    _token => {
                         // log::trace!("passing through token to backend: {token:?}");
                         self.backend.handle_event(
                             event.token(),

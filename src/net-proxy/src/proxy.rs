@@ -169,7 +169,7 @@ type BoxedHostStream = Box<dyn HostStream>;
 
 type NatKey = (IpAddr, u16, IpAddr, u16);
 
-const HOST_READ_BUDGET: usize = 1;
+const HOST_READ_BUDGET: usize = 16;
 const MAX_PROXY_QUEUE_SIZE: usize = 32;
 
 pub struct NetProxy {
@@ -635,6 +635,26 @@ impl NetProxy {
             info!(?nat_key, "New egress UDP flow detected");
             let new_token = Token(self.next_token);
             self.next_token += 1;
+
+            // Determine IP domain
+            let domain = if dst_addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+
+            // Create and configure the socket using socket2
+            let socket = Socket::new(domain, socket2::Type::DGRAM, None).unwrap();
+            const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer
+            if let Err(e) = socket.set_recv_buffer_size(BUF_SIZE) {
+                warn!(error = %e, "Failed to set UDP receive buffer size.");
+            }
+            if let Err(e) = socket.set_send_buffer_size(BUF_SIZE) {
+                warn!(error = %e, "Failed to set UDP send buffer size.");
+            }
+            socket.set_nonblocking(true).unwrap();
+
+            // Bind to a wildcard address
             let bind_addr: SocketAddr = if dst_addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -642,18 +662,18 @@ impl NetProxy {
             }
             .parse()
             .unwrap();
+            socket.bind(&bind_addr.into()).unwrap();
 
-            if let Ok(socket) = std::net::UdpSocket::bind(bind_addr) {
-                let real_dest = SocketAddr::new(dst_addr, dst_port);
-                if socket.connect(real_dest).is_ok() {
-                    let mut mio_socket = UdpSocket::from_std(socket);
-                    self.registry
-                        .register(&mut mio_socket, new_token, Interest::READABLE)
-                        .unwrap();
-                    self.reverse_udp_nat.insert(new_token, nat_key);
-                    self.host_udp_sockets
-                        .insert(new_token, (mio_socket, Instant::now()));
-                }
+            // Connect to the real destination
+            let real_dest = SocketAddr::new(dst_addr, dst_port);
+            if socket.connect(&real_dest.into()).is_ok() {
+                let mut mio_socket = UdpSocket::from_std(socket.into());
+                self.registry
+                    .register(&mut mio_socket, new_token, Interest::READABLE)
+                    .unwrap();
+                self.reverse_udp_nat.insert(new_token, nat_key);
+                self.host_udp_sockets
+                    .insert(new_token, (mio_socket, Instant::now()));
             }
             new_token
         });
@@ -1029,15 +1049,28 @@ impl NetBackend for NetProxy {
                     }
                     self.host_connections.insert(token, connection);
                 } else if let Some((socket, last_seen)) = self.host_udp_sockets.get_mut(&token) {
-                    if let Ok(n) = socket.recv(&mut self.read_buf) {
-                        if let Some(nat_key) = self.reverse_udp_nat.get(&token).copied() {
-                            let response_packet = build_udp_packet(
-                                &mut self.packet_buf,
-                                nat_key,
-                                &self.read_buf[..n],
-                            );
-                            self.to_vm_control_queue.push_back(response_packet);
-                            *last_seen = Instant::now();
+                    'read_loop: for _ in 0..HOST_READ_BUDGET {
+                        match socket.recv(&mut self.read_buf) {
+                            Ok(n) => {
+                                if let Some(nat_key) = self.reverse_udp_nat.get(&token).copied() {
+                                    let response_packet = build_udp_packet(
+                                        &mut self.packet_buf,
+                                        nat_key,
+                                        &self.read_buf[..n],
+                                    );
+                                    self.to_vm_control_queue.push_back(response_packet);
+                                    *last_seen = Instant::now();
+                                }
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // No more packets to read for now, break the loop.
+                                break 'read_loop;
+                            }
+                            Err(e) => {
+                                // An unexpected error occurred.
+                                error!(?token, "Error receiving from UDP socket: {}", e);
+                                break 'read_loop;
+                            }
                         }
                     }
                 }

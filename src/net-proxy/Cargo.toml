@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
 nix = { version = "0.30", features = ["fs", "socket"] }
 log = "0.4.0"
 libc = ">=0.2.39"
@@ -13,7 +14,6 @@ mio = { version = "1.0.4", features = ["net", "os-ext", "os-poll"] }
 socket2 = { version = "0.5.10", features = ["all"] }
 pnet = "0.35.0"
 rand = "0.9.1"
-tracing = { version = "0.1.41" }                                     #, features = ["release_max_level_debug"] }
 utils = { path = "../utils" }
 
 [dev-dependencies]
