@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
-use mio::event::{Event, Source};
+use mio::event::Source;
 use mio::net::{TcpStream, UdpSocket, UnixListener, UnixStream};
 use mio::{Interest, Registry, Token};
 use pnet::packet::arp::{ArpOperations, ArpPacket, MutableArpPacket};
@@ -13,7 +13,6 @@ use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 use socket2::{Domain, SockAddr, Socket};
 use std::any::Any;
-use std::cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
@@ -79,7 +78,6 @@ impl AnyConnection {
         }
     }
 
-    #[cfg(test)]
     fn to_vm_buffer(&self) -> &VecDeque<Bytes> {
         match self {
             AnyConnection::EgressConnecting(conn) => &conn.to_vm_buffer,
@@ -331,44 +329,32 @@ impl NetProxy {
             .copied();
 
         if let Some(token) = token {
-            if self.paused_reads.remove(&token) {
-                if let Some(conn) = self.host_connections.get_mut(&token) {
-                    info!(
-                        ?token,
-                        "Packet received for paused connection. Unpausing reads."
-                    );
-                    let interest = if conn.write_buffer().is_empty() {
-                        Interest::READABLE
-                    } else {
-                        Interest::READABLE.add(Interest::WRITABLE)
-                    };
+            if let Some(mut connection) = self.host_connections.remove(&token) {
+                // This is the single source of truth for un-pausing.
+                // An incoming packet is a trigger to re-evaluate the pause state.
+                if self.paused_reads.contains(&token) {
+                    // Only un-pause if the buffer has drained below the hysteresis threshold.
+                    if connection.to_vm_buffer().len() < (MAX_PROXY_QUEUE_SIZE / 2) {
+                        info!(?token, "Connection buffer drained, unpausing reads.");
+                        self.paused_reads.remove(&token);
 
-                    // Try to reregister the stream's interest.
-                    if let Err(e) = self.registry.reregister(conn.stream_mut(), token, interest) {
-                        // A deregistered stream might cause either NotFound or InvalidInput.
-                        // We must handle both cases by re-registering the stream from scratch.
-                        if e.kind() == io::ErrorKind::NotFound
-                            || e.kind() == io::ErrorKind::InvalidInput
-                        {
-                            info!(?token, "Stream was deregistered, re-registering.");
-                            if let Err(e_reg) =
-                                self.registry.register(conn.stream_mut(), token, interest)
-                            {
-                                error!(
-                                    ?token,
-                                    "Failed to re-register stream after unpause: {}", e_reg
-                                );
-                            }
+                        let interest = if connection.write_buffer().is_empty() {
+                            Interest::READABLE
                         } else {
+                            Interest::READABLE.add(Interest::WRITABLE)
+                        };
+
+                        if let Err(e) =
+                            self.registry
+                                .reregister(connection.stream_mut(), token, interest)
+                        {
                             error!(
                                 ?token,
-                                "Failed to reregister to unpause reads on ACK: {}", e
+                                "Failed to reregister to unpause reads in handle_tcp_packet: {}", e
                             );
                         }
                     }
                 }
-            }
-            if let Some(connection) = self.host_connections.remove(&token) {
                 let new_connection_state = match connection {
                     AnyConnection::EgressConnecting(conn) => AnyConnection::EgressConnecting(conn),
                     AnyConnection::IngressConnecting(mut conn) => {
@@ -424,7 +410,8 @@ impl NetProxy {
                             }
 
                             let payload = tcp_packet.payload();
-                            let mut should_ack = false;
+
+                            let mut ack_bytes = 0; // Track how much we can ACK
 
                             // If the host-side write buffer is already backlogged, queue new data.
                             if !conn.write_buffer.is_empty() {
@@ -434,27 +421,31 @@ impl NetProxy {
                                         "Host write buffer has backlog; queueing new data from VM."
                                     );
                                     conn.write_buffer.push_back(Bytes::copy_from_slice(payload));
-                                    conn.tx_ack = conn.tx_ack.wrapping_add(payload.len() as u32);
-                                    should_ack = true;
+                                    ack_bytes = payload.len() as u32; // We take responsibility for the bytes
                                 }
                             } else if !payload.is_empty() {
                                 // Attempt a direct write if the buffer is empty.
                                 match conn.stream_mut().write(payload) {
                                     Ok(n) => {
-                                        conn.tx_ack =
-                                            conn.tx_ack.wrapping_add(payload.len() as u32);
-                                        should_ack = true;
+                                        ack_bytes = payload.len() as u32; // We still ACK the full payload
 
                                         if n < payload.len() {
                                             let remainder = &payload[n..];
                                             trace!(?token, "Partial write to host. Buffering {} remaining bytes.", remainder.len());
                                             conn.write_buffer
                                                 .push_back(Bytes::copy_from_slice(remainder));
-                                            self.registry.reregister(
+
+                                            let mut interest = Interest::WRITABLE;
+                                            if !self.paused_reads.contains(&token) {
+                                                interest = interest.add(Interest::READABLE);
+                                            }
+                                            if let Err(e) = self.registry.reregister(
                                                 conn.stream_mut(),
                                                 token,
-                                                Interest::READABLE | Interest::WRITABLE,
-                                            )?;
+                                                interest,
+                                            ) {
+                                                error!(?token, "reregister failed in handle_tcp_packet partial write: {}", e);
+                                            }
                                         }
                                     }
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -464,14 +455,19 @@ impl NetProxy {
                                         );
                                         conn.write_buffer
                                             .push_back(Bytes::copy_from_slice(payload));
-                                        conn.tx_ack =
-                                            conn.tx_ack.wrapping_add(payload.len() as u32);
-                                        should_ack = true;
-                                        self.registry.reregister(
+                                        ack_bytes = payload.len() as u32; // We take responsibility for the bytes
+
+                                        let mut interest = Interest::WRITABLE;
+                                        if !self.paused_reads.contains(&token) {
+                                            interest = interest.add(Interest::READABLE);
+                                        }
+                                        if let Err(e) = self.registry.reregister(
                                             conn.stream_mut(),
                                             token,
-                                            Interest::READABLE | Interest::WRITABLE,
-                                        )?;
+                                            interest,
+                                        ) {
+                                            error!(?token, "reregister failed in handle_tcp_packet wouldblock: {}", e);
+                                        }
                                     }
                                     Err(e) => {
                                         error!(?token, error = %e, "Error writing to host socket. Closing connection.");
@@ -486,12 +482,14 @@ impl NetProxy {
                             //     should_ack = true;
                             // }
 
+                            // Check for FIN flag separately
                             if (flags & TcpFlags::FIN) != 0 {
-                                conn.tx_ack = conn.tx_ack.wrapping_add(1);
-                                should_ack = true;
+                                ack_bytes += 1;
                             }
 
-                            if should_ack {
+                            // Only advance our ack number and send a reply if something happened
+                            if ack_bytes > 0 {
+                                conn.tx_ack = conn.tx_ack.wrapping_add(ack_bytes);
                                 if let Some(&nat_key) = self.reverse_tcp_nat.get(&token) {
                                     let ack_packet = build_tcp_packet(
                                         &mut self.packet_buf,
@@ -505,6 +503,7 @@ impl NetProxy {
                                 }
                             }
 
+                            // Transition to closing state if FIN was received
                             if (flags & TcpFlags::FIN) != 0 {
                                 self.host_connections
                                     .insert(token, AnyConnection::Closing(conn.close()));
@@ -512,6 +511,25 @@ impl NetProxy {
                                 self.host_connections
                                     .insert(token, AnyConnection::Established(conn));
                             }
+                        } else if incoming_seq < conn.tx_ack {
+                            // This is a retransmission of a packet we have already processed.
+                            // The VM likely missed our last ACK. To prevent deadlock, we must
+                            // re-send our most current ACK.
+                            trace!(?token, "Detected retransmission from VM, re-sending ACK.");
+                            if let Some(&nat_key) = self.reverse_tcp_nat.get(&token) {
+                                let ack_packet = build_tcp_packet(
+                                    &mut self.packet_buf,
+                                    nat_key,
+                                    conn.tx_seq,
+                                    conn.tx_ack, // Critically, send the *new* ACK number again
+                                    None,
+                                    Some(TcpFlags::ACK),
+                                );
+                                self.to_vm_control_queue.push_back(ack_packet);
+                            }
+                            // Put the connection back, its state is unchanged.
+                            self.host_connections
+                                .insert(token, AnyConnection::Established(conn));
                         } else {
                             trace!(token = ?token, incoming_seq, expected_ack = conn.tx_ack, "Ignoring out-of-order packet from VM.");
                             self.host_connections
@@ -706,6 +724,32 @@ impl NetBackend for NetProxy {
 
                     let packet_len = packet.len();
                     buf[..packet_len].copy_from_slice(&packet);
+
+                    if self.paused_reads.contains(&token) {
+                        if conn.to_vm_buffer().len() < (MAX_PROXY_QUEUE_SIZE / 2) {
+                            info!(
+                                ?token,
+                                "Connection buffer drained via read_frame. Unpausing reads."
+                            );
+                            self.paused_reads.remove(&token);
+
+                            let interest = if conn.write_buffer().is_empty() {
+                                Interest::READABLE
+                            } else {
+                                Interest::READABLE.add(Interest::WRITABLE)
+                            };
+
+                            if let Err(e) =
+                                self.registry.reregister(conn.stream_mut(), token, interest)
+                            {
+                                error!(
+                                    ?token,
+                                    "Failed to reregister to unpause reads in read_frame: {}", e
+                                );
+                            }
+                        }
+                    }
+
                     return Ok(packet_len);
                 }
             }
@@ -897,55 +941,65 @@ impl NetBackend for NetProxy {
                                         "Ignoring readable event because connection is paused."
                                     );
                                 } else {
+                                    let ack_for_this_batch = conn.tx_ack;
                                     // Connection is not paused, so we can read from the host.
-                                    'read_loop: for _ in 0..HOST_READ_BUDGET {
-                                        match conn.stream.read(&mut self.read_buf) {
-                                            Ok(0) => {
-                                                conn_closed = true;
-                                                break 'read_loop;
-                                            }
-                                            Ok(n) => {
-                                                if let Some(&nat_key) =
-                                                    self.reverse_tcp_nat.get(&token)
+                                    // 'read_loop: for _ in 0..HOST_READ_BUDGET {
+                                    match conn.stream.read(&mut self.read_buf) {
+                                        Ok(0) => {
+                                            conn_closed = true;
+                                            // break 'read_loop;
+                                        }
+                                        Ok(n) => {
+                                            if let Some(&nat_key) = self.reverse_tcp_nat.get(&token)
+                                            {
+                                                let was_empty = conn.to_vm_buffer.is_empty();
+                                                for chunk in
+                                                    self.read_buf[..n].chunks(MAX_SEGMENT_SIZE)
                                                 {
-                                                    let was_empty = conn.to_vm_buffer.is_empty();
-                                                    for chunk in
-                                                        self.read_buf[..n].chunks(MAX_SEGMENT_SIZE)
+                                                    if conn.to_vm_buffer.len()
+                                                        >= MAX_PROXY_QUEUE_SIZE
                                                     {
-                                                        let packet = build_tcp_packet(
-                                                            &mut self.packet_buf,
-                                                            nat_key,
-                                                            conn.tx_seq,
-                                                            conn.tx_ack,
-                                                            Some(chunk),
-                                                            Some(TcpFlags::ACK | TcpFlags::PSH),
-                                                        );
-                                                        conn.to_vm_buffer.push_back(packet);
-                                                        conn.tx_seq = conn
-                                                            .tx_seq
-                                                            .wrapping_add(chunk.len() as u32);
+                                                        if !self.paused_reads.contains(&token) {
+                                                            info!(?token, "Connection buffer full. Pausing reads.");
+                                                            self.paused_reads.insert(token);
+                                                        }
+                                                        break; // Break from the inner chunking loop
                                                     }
-                                                    if was_empty && !conn.to_vm_buffer.is_empty() {
-                                                        self.data_run_queue.push_back(token);
-                                                    }
+
+                                                    let packet = build_tcp_packet(
+                                                        &mut self.packet_buf,
+                                                        nat_key,
+                                                        conn.tx_seq,
+                                                        ack_for_this_batch,
+                                                        Some(chunk),
+                                                        Some(TcpFlags::ACK | TcpFlags::PSH),
+                                                    );
+                                                    conn.to_vm_buffer.push_back(packet);
+                                                    conn.tx_seq = conn
+                                                        .tx_seq
+                                                        .wrapping_add(chunk.len() as u32);
+                                                }
+                                                if was_empty && !conn.to_vm_buffer.is_empty() {
+                                                    self.data_run_queue.push_back(token);
                                                 }
                                             }
-                                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                                break 'read_loop
-                                            }
-                                            Err(ref e)
-                                                if e.kind() == io::ErrorKind::ConnectionReset =>
-                                            {
-                                                info!(?token, "Host connection reset.");
-                                                conn_aborted = true;
-                                                break 'read_loop;
-                                            }
-                                            Err(_) => {
-                                                conn_closed = true;
-                                                break 'read_loop;
-                                            }
+                                        }
+                                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                            // break 'read_loop
+                                        }
+                                        Err(ref e)
+                                            if e.kind() == io::ErrorKind::ConnectionReset =>
+                                        {
+                                            info!(?token, "Host connection reset.");
+                                            conn_aborted = true;
+                                            // break 'read_loop;
+                                        }
+                                        Err(_) => {
+                                            conn_closed = true;
+                                            // break 'read_loop;
                                         }
                                     }
+                                    // }
                                 }
                             }
 
@@ -981,12 +1035,12 @@ impl NetBackend for NetProxy {
                                 }
                                 AnyConnection::Closing(closing_conn)
                             } else {
-                                if conn.to_vm_buffer.len() >= MAX_PROXY_QUEUE_SIZE {
-                                    if !self.paused_reads.contains(&token) {
-                                        info!(?token, "Connection buffer full. Pausing reads.");
-                                        self.paused_reads.insert(token);
-                                    }
-                                }
+                                // if conn.to_vm_buffer.len() >= MAX_PROXY_QUEUE_SIZE {
+                                //     if !self.paused_reads.contains(&token) {
+                                //         info!(?token, "Connection buffer full. Pausing reads.");
+                                //         self.paused_reads.insert(token);
+                                //     }
+                                // }
 
                                 let needs_read = !self.paused_reads.contains(&token);
                                 let needs_write = !conn.write_buffer.is_empty();
@@ -1023,11 +1077,24 @@ impl NetBackend for NetProxy {
                                             });
                                     }
                                     (false, false) => {
-                                        // No interests; deregister the stream from the poller completely.
-                                        if let Err(e) = self.registry.deregister(conn.stream_mut())
-                                        {
-                                            error!(?token, "Deregister failed: {}", e);
-                                        }
+                                        // The stream is paused for reads and has nothing to write.
+                                        // We must remove READABLE from the interest set to prevent a
+                                        // busy-loop. Deregistering is too dangerous and causes stalls.
+                                        // Instead, we reregister for WRITABLE only. This keeps the
+                                        // socket alive in the poller but stops the readable events.
+                                        // Receiving a spurious writable event is harmless.
+                                        self.registry
+                                            .reregister(
+                                                conn.stream_mut(),
+                                                token,
+                                                Interest::WRITABLE,
+                                            )
+                                            .unwrap_or_else(|e| {
+                                                error!(
+                                                    ?token,
+                                                    "reregister W-only for idle failed: {}", e
+                                                )
+                                            });
                                     }
                                 }
                                 AnyConnection::Established(conn)
@@ -2770,5 +2837,631 @@ mod tests {
         );
 
         info!("Simultaneous close test passed.");
+    }
+
+    #[test]
+    fn test_retransmission_deadlock_and_recovery() {
+        // This test simulates the exact deadlock scenario seen in the logs.
+        // 1. VM sends a packet.
+        // 2. Proxy processes it, but its ACK back to the VM is "lost".
+        // 3. VM retransmits the same packet.
+        // 4. A correct proxy must re-send its ACK. A buggy one will ignore the
+        //    retransmission, causing a permanent stall.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, nat_key, host_write_buffer, _) =
+            setup_proxy_with_established_conn(registry);
+
+        let (vm_ip, vm_port, host_ip, host_port) = nat_key;
+        let initial_vm_seq = 200;
+        let proxy_ack_num = 100;
+
+        // Manually set the connection's expected ACK to match our test packet's sequence
+        if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
+            conn.tx_ack = initial_vm_seq;
+            conn.tx_seq = proxy_ack_num;
+        }
+
+        // --- 1. The VM sends the initial packet ---
+        info!("Step 1: VM sends initial data packet (seq=200)");
+        let data_from_vm = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            initial_vm_seq,
+            proxy_ack_num,
+            Some(b"hello"), // 5 bytes of data
+            Some(TcpFlags::ACK | TcpFlags::PSH),
+        );
+        proxy.handle_packet_from_vm(&data_from_vm).unwrap();
+
+        // --- 2. The proxy processes it correctly ---
+        // Assert that the payload was written to the host
+        assert_eq!(*host_write_buffer.lock().unwrap(), b"hello");
+        // Assert that the proxy generated an ACK for the VM
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            1,
+            "Proxy should have generated an ACK"
+        );
+
+        // Assert that the proxy now expects the next sequence number (200 + 5)
+        if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get(&token) {
+            assert_eq!(conn.tx_ack, initial_vm_seq + 5);
+        } else {
+            panic!("Connection lost its established state");
+        }
+
+        // --- 3. The ACK is "lost" ---
+        info!("Step 2: Simulating the proxy's ACK being lost (clearing the queue)");
+        proxy.to_vm_control_queue.clear();
+
+        // --- 4. The VM retransmits the *same* packet ---
+        info!("Step 3: VM retransmits the same packet (seq=200)");
+        proxy.handle_packet_from_vm(&data_from_vm).unwrap();
+
+        // --- 5. The proxy must recover ---
+        info!("Step 4: Verifying the proxy handles the retransmission correctly");
+        // The BUG is here: The proxy ignores this packet and the queue remains empty.
+        // The FIX is that the proxy should see this "old" packet and re-send its ACK.
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            1,
+            "Proxy failed to re-send an ACK for the retransmitted packet. Deadlock would occur."
+        );
+
+        // Verify the re-sent ACK is correct
+        let resent_ack = proxy.to_vm_control_queue.pop_front().unwrap();
+        assert_packet(
+            &resent_ack,
+            host_ip,
+            vm_ip,
+            host_port,
+            vm_port,
+            TcpFlags::ACK,
+            proxy_ack_num,
+            initial_vm_seq + 5, // It must acknowledge the data it has already processed
+        );
+        info!("Retransmission deadlock test passed!");
+    }
+
+    #[test]
+    fn test_hybrid_unpause_avoids_livelock_and_stall() {
+        // This test validates the hybrid un-pause logic. It ensures that an ACK from
+        // the VM does NOT un-pause a connection if its send buffer is still mostly full,
+        // which prevents a livelock. It then confirms that an ACK *does* un-pause
+        // the connection once the buffer has been drained.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, nat_key, _, _) = setup_proxy_with_established_conn(registry);
+
+        let mock_stream = proxy
+            .host_connections
+            .get_mut(&token)
+            .unwrap()
+            .stream_mut()
+            .as_any_mut()
+            .downcast_mut::<MockHostStream>()
+            .unwrap();
+
+        // --- 1. Fill the to_vm_buffer from the host until it's full ---
+        info!("Step 1: Filling the to_vm_buffer to capacity.");
+        // Stuff the mock stream with plenty of data to read.
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![0; 65536]));
+
+        // Call handle_event until the buffer is full and reading is paused.
+        while !proxy.paused_reads.contains(&token) {
+            proxy.handle_event(token, true, false);
+        }
+        info!(
+            "Step 2: Buffer is full and reads are paused. Buffer size: {}",
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len()
+        );
+        assert!(proxy.paused_reads.contains(&token));
+        assert_eq!(
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len(),
+            MAX_PROXY_QUEUE_SIZE
+        );
+
+        // --- 3. Simulate a partial drain (NOT enough to un-pause) ---
+        info!("Step 3: Simulating a partial drain of the buffer (to 80% capacity).");
+        let target_len = MAX_PROXY_QUEUE_SIZE * 8 / 10;
+        while proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len()
+            > target_len
+        {
+            let mut buf = [0u8; 2048];
+            // Use read_frame to correctly drain the queue.
+            let _ = proxy.read_frame(&mut buf);
+        }
+        info!(
+            "Buffer partially drained. Current size: {}",
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len()
+        );
+
+        // --- 4. Send an ACK from the VM ---
+        info!("Step 4: Simulating an ACK from the VM while buffer is still mostly full.");
+        let ack_from_vm = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            500, // sequence/ack numbers don't matter for this part of the test
+            500,
+            None,
+            Some(TcpFlags::ACK),
+        );
+        proxy.handle_packet_from_vm(&ack_from_vm).unwrap();
+
+        // --- 5. Assert that the connection remains paused ---
+        // This is the crucial check. The old eager logic would have unpaused here,
+        // causing a livelock. The new logic should see the buffer is still too full
+        // and keep the connection paused.
+        info!("Step 5: Verifying connection remains paused.");
+        assert!(
+            proxy.paused_reads.contains(&token),
+            "Connection should NOT have unpaused, as its buffer is still too full!"
+        );
+
+        // --- 6. Drain the buffer completely ---
+        info!("Step 6: Draining the rest of the buffer.");
+        while proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len()
+            > 0
+        {
+            let mut buf = [0u8; 2048];
+            let _ = proxy.read_frame(&mut buf);
+        }
+        info!("Buffer is now empty.");
+
+        // --- 7. Send another ACK from the VM ---
+        info!("Step 7: Simulating another ACK from the VM now that buffer is empty.");
+        proxy.handle_packet_from_vm(&ack_from_vm).unwrap();
+
+        // --- 8. Assert that the connection is now un-paused ---
+        info!("Step 8: Verifying connection is now unpaused.");
+        assert!(
+            !proxy.paused_reads.contains(&token),
+            "Connection should have unpaused now that its buffer is empty."
+        );
+
+        info!("Hybrid unpause test passed!");
+    }
+
+    #[test]
+    fn test_unpause_from_read_frame_recovers_flow() {
+        // This test validates the scenario where:
+        // 1. A connection's buffer fills up and it gets paused.
+        // 2. The VM drains the buffer by calling `read_frame`.
+        // 3. This draining should cause the connection to be unpaused AND
+        //    re-registered for READABLE events with mio.
+        // 4. A subsequent `handle_event` call for a readable event should
+        //    then successfully read more data into the buffer.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, _, _, _) = setup_proxy_with_established_conn(registry);
+
+        let mock_stream = proxy
+            .host_connections
+            .get_mut(&token)
+            .unwrap()
+            .stream_mut()
+            .as_any_mut()
+            .downcast_mut::<MockHostStream>()
+            .unwrap();
+
+        // --- 1. Fill the to_vm_buffer until reads are paused ---
+        info!("Step 1: Filling the to_vm_buffer to capacity.");
+        // Give the mock stream two large chunks of data.
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![0; 65536]));
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![1; 65536]));
+
+        // Call handle_event until the buffer is full and reading is paused.
+        proxy.handle_event(token, true, false);
+        assert!(proxy.paused_reads.contains(&token));
+        let buffer_len_after_pause = proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len();
+        info!(
+            "Step 2: Buffer is full and reads are paused. Buffer size: {}",
+            buffer_len_after_pause
+        );
+        assert_eq!(buffer_len_after_pause, MAX_PROXY_QUEUE_SIZE);
+
+        // --- 3. Drain the buffer via read_frame until it's below the unpause threshold ---
+        info!("Step 3: Draining buffer via read_frame to trigger unpause.");
+        let target_len = MAX_PROXY_QUEUE_SIZE / 2 - 1;
+        while proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len()
+            > target_len
+        {
+            let mut buf = [0u8; 2048];
+            // This drain should trigger the unpause and reregister logic inside read_frame.
+            let _ = proxy.read_frame(&mut buf);
+        }
+        info!(
+            "Buffer drained below threshold. Current size: {}",
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len()
+        );
+        // The fix in read_frame should have removed the token from the paused set.
+        assert!(
+            !proxy.paused_reads.contains(&token),
+            "Connection should have been unpaused by read_frame!"
+        );
+
+        // --- 4. Simulate another readable event ---
+        // With the corrected code, the socket is now re-registered for readable events.
+        // This call to handle_event should now read the second chunk of data from the mock stream.
+        info!("Step 4: Simulating another readable event.");
+        proxy.handle_event(token, true, false);
+
+        // --- 5. Assert that more data was read ---
+        // If the reregister didn't happen, the proxy would ignore the readable event
+        // and the buffer length would not have increased.
+        let buffer_len_after_unpause = proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len();
+        info!("Buffer length after new read: {}", buffer_len_after_unpause);
+        assert!(
+            buffer_len_after_unpause > target_len,
+            "Buffer should have been refilled after unpausing and getting a readable event."
+        );
+        info!("Test passed: Unpausing via read_frame correctly resumed data flow.");
+    }
+
+    #[test]
+    fn test_non_greedy_read_prevents_livelock() {
+        // This test validates that the removal of the greedy read loop in `handle_event`
+        // prevents an immediate "fill and pause" cycle, which is the cause of the livelock.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, _, _, _) = setup_proxy_with_established_conn(registry);
+
+        let mock_stream = proxy
+            .host_connections
+            .get_mut(&token)
+            .unwrap()
+            .stream_mut()
+            .as_any_mut()
+            .downcast_mut::<MockHostStream>()
+            .unwrap();
+
+        // --- 1. Load the mock stream with more data than the buffer can handle ---
+        let bytes_to_send = (MAX_PROXY_QUEUE_SIZE as usize * MAX_SEGMENT_SIZE) * 3; // Ensure plenty of data
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![0; bytes_to_send]));
+
+        // --- 2. Simulate a single readable event ---
+        info!("Step 2: Simulating a single readable event on a busy socket.");
+        proxy.handle_event(token, true, false);
+
+        // --- 3. Assert that the buffer is NOT yet full ---
+        // With the fix (non-greedy read), one event should only read one chunk, which is
+        // not enough to fill the entire to_vm_buffer.
+        let buffer_len = proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len();
+        info!("Buffer length after one event: {}", buffer_len);
+        assert!(
+            buffer_len < MAX_PROXY_QUEUE_SIZE,
+            "Buffer should NOT be full after a single non-greedy read"
+        );
+        assert!(
+            !proxy.paused_reads.contains(&token),
+            "Connection should NOT be paused after a single non-greedy read"
+        );
+
+        // --- 4. Keep simulating readable events until the connection pauses ---
+        // This confirms that the pause mechanism still works correctly under load,
+        // just not greedily.
+        info!("Step 4: Simulating more readable events to fill the buffer.");
+        while !proxy.paused_reads.contains(&token) {
+            // We must check if the connection still exists, as the test could fail
+            // and loop forever if it's removed unexpectedly.
+            if !proxy.host_connections.contains_key(&token) {
+                panic!(
+                    "Connection with token {:?} was removed unexpectedly!",
+                    token
+                );
+            }
+            proxy.handle_event(token, true, false);
+        }
+
+        // --- 5. Assert that the buffer is now full and the connection is paused ---
+        let final_buffer_len = proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len();
+        info!("Buffer length after pausing: {}", final_buffer_len);
+
+        assert_eq!(
+            final_buffer_len, MAX_PROXY_QUEUE_SIZE,
+            "Buffer should be full after enough readable events"
+        );
+        assert!(
+            proxy.paused_reads.contains(&token),
+            "Connection should now be paused"
+        );
+
+        info!("Test passed: Non-greedy read correctly prevents immediate pause while still allowing pause under sustained load.");
+    }
+
+    #[test]
+    fn test_greedy_read_causes_livelock_stall() {
+        // This test specifically reproduces the stall caused by the livelock.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, _, _, _) = setup_proxy_with_established_conn(registry);
+
+        let mock_stream = proxy
+            .host_connections
+            .get_mut(&token)
+            .unwrap()
+            .stream_mut()
+            .as_any_mut()
+            .downcast_mut::<MockHostStream>()
+            .unwrap();
+
+        // 1. GIVEN: A fast host with more data than the buffer can hold.
+        info!("Step 1: Stuffing the mock host stream with a large amount of data");
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![0; 65536]));
+        mock_stream
+            .read_buffer
+            .lock()
+            .unwrap()
+            .push_back(Bytes::from(vec![1; 65536]));
+
+        // 2. WHEN: We simulate the event loop firing readable events until the buffer fills.
+        info!("Step 2: Simulating readable events until buffer is full and connection pauses.");
+        let mut safety_break = 0;
+        while !proxy.paused_reads.contains(&token) {
+            if !proxy.host_connections.contains_key(&token) {
+                panic!("Connection was unexpectedly removed during the read loop.");
+            }
+            proxy.handle_event(token, true, false);
+            safety_break += 1;
+            if safety_break > 100 {
+                panic!("LIVELOCK TEST FAILED: Connection never paused. This indicates a problem with the pause logic itself.");
+            }
+        }
+
+        // 3. THEN: The connection should now be paused and the buffer full.
+        // This assertion will now pass because we looped until it was true.
+        info!("Step 3: Asserting that the connection is now paused.");
+        assert!(
+            proxy.paused_reads.contains(&token),
+            "Connection should be paused after buffer fills."
+        );
+        assert_eq!(
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len(),
+            MAX_PROXY_QUEUE_SIZE,
+            "Buffer should be full."
+        );
+
+        // --- The rest of the test proceeds as before ---
+
+        // 4. WHEN: The VM drains the buffer just past the unpause threshold.
+        info!("Step 4: Simulating the VM draining the buffer to trigger un-pause logic.");
+        let target_len = MAX_PROXY_QUEUE_SIZE / 2 - 1;
+        while proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len()
+            > target_len
+        {
+            let mut buf = [0u8; 2048];
+            proxy
+                .read_frame(&mut buf)
+                .expect("read_frame should succeed");
+        }
+        info!(
+            "Buffer drained below threshold. Current size: {}",
+            proxy
+                .host_connections
+                .get(&token)
+                .unwrap()
+                .to_vm_buffer()
+                .len()
+        );
+        // The un-pause logic inside read_frame should have fired.
+        assert!(
+            !proxy.paused_reads.contains(&token),
+            "Connection should have been un-paused by read_frame."
+        );
+
+        // 5. WHEN: A *single* second readable event occurs.
+        info!("Step 5: Simulating a single second readable event.");
+        proxy.handle_event(token, true, false);
+
+        // 6. THEN: A correct implementation should NOT have immediately re-paused.
+        let final_buffer_len = proxy
+            .host_connections
+            .get(&token)
+            .unwrap()
+            .to_vm_buffer()
+            .len();
+        info!("Buffer length after second read: {}", final_buffer_len);
+
+        assert!(
+            !proxy.paused_reads.contains(&token),
+            "BUG: Connection was immediately re-paused, indicating a livelock."
+        );
+        assert!(
+            final_buffer_len < MAX_PROXY_QUEUE_SIZE,
+            "BUG: Connection re-filled its buffer in a single event. It should have read a smaller chunk."
+        );
+
+        info!("Test passed: The proxy correctly handled backpressure without stalling.");
+    }
+
+    #[test]
+    fn test_partial_write_to_host_does_not_stall_connection() {
+        // This test reproduces a stall caused by premature ACK-ing.
+        // 1. A packet with data arrives from the VM ("Packet A").
+        // 2. The proxy attempts to write it to the host, but the host socket can only
+        //    accept a portion of the data (a partial write).
+        // 3. The BUG: The proxy buffers the remainder but ACKs the *entire* payload
+        //    to the VM, advancing its expected sequence number too far.
+        // 4. The VM, having received the ACK, sends the next data packet ("Packet B").
+        // 5. The proxy receives Packet B, but because its expected ACK was advanced
+        //    prematurely, it misinterprets Packet B as an old retransmission and ignores it.
+        // 6. The connection is now stalled.
+        _ = tracing_subscriber::fmt::try_init();
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        let (mut proxy, token, nat_key, host_write_buffer, _) =
+            setup_proxy_with_established_conn(registry);
+
+        let (vm_ip, vm_port, host_ip, host_port) = nat_key;
+        let proxy_seq = 100;
+        let mut vm_seq = 200;
+
+        // Configure the mock host to only accept 10 bytes, forcing a partial write.
+        let mock_stream = proxy
+            .host_connections
+            .get_mut(&token)
+            .unwrap()
+            .stream_mut()
+            .as_any_mut()
+            .downcast_mut::<MockHostStream>()
+            .unwrap();
+        *mock_stream.write_capacity.lock().unwrap() = Some(10);
+
+        // --- 1. VM sends Packet A (25 bytes) ---
+        info!("Step 1: VM sends Packet A (25 bytes). Host can only accept 10 bytes.");
+        let packet_a_payload = b"0123456789abcdefghijklmno"; // 25 bytes
+        let packet_a = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            vm_seq,
+            proxy_seq,
+            Some(packet_a_payload),
+            Some(TcpFlags::ACK | TcpFlags::PSH),
+        );
+
+        proxy.handle_packet_from_vm(&packet_a).unwrap();
+
+        // --- 2. Assert state after partial write ---
+        // The first 10 bytes should be written, the next 15 should be buffered.
+        assert_eq!(&host_write_buffer.lock().unwrap()[..], b"0123456789");
+        if let AnyConnection::Established(conn) = proxy.host_connections.get(&token).unwrap() {
+            assert_eq!(
+                conn.write_buffer.front().unwrap().as_ref(),
+                b"abcdefghijklmno"
+            );
+        } else {
+            panic!("Connection not in established state");
+        }
+
+        // With the BUG, the proxy sends an ACK for all 25 bytes.
+        // A correct implementation would only ACK the 10 bytes it actually wrote.
+        let ack_packet = proxy.to_vm_control_queue.pop_front().unwrap();
+        assert_packet(
+            &ack_packet,
+            host_ip.into(),
+            vm_ip.into(),
+            host_port,
+            vm_port,
+            TcpFlags::ACK,
+            proxy_seq,
+            vm_seq + 25, // This is the bug. A correct implementation would ACK vm_seq + 10.
+        );
+        vm_seq += packet_a_payload.len() as u32;
+
+        // --- 3. VM sends Packet B ---
+        info!("Step 2: VM sends Packet B, which the buggy proxy will ignore.");
+        let packet_b_payload = b"this will be ignored";
+        let packet_b = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            vm_seq, // This is the correct next sequence number.
+            proxy_seq,
+            Some(packet_b_payload),
+            Some(TcpFlags::ACK | TcpFlags::PSH),
+        );
+        proxy.handle_packet_from_vm(&packet_b).unwrap();
+
+        // --- 4. Assert that Packet B was dropped ---
+        // The buggy proxy, having already ACKed past this sequence, will see Packet B as
+        // a retransmission and will not write its data to the host buffer.
+        // We assert that the host buffer *still* only contains the initial 10 bytes.
+        assert_eq!(
+            host_write_buffer.lock().unwrap().len(),
+            10,
+            "BUG DETECTED: New data from Packet B was ignored, indicating a stall."
+        );
+
+        info!("If test reaches here, the buggy logic has been confirmed.");
     }
 }
