@@ -6,10 +6,14 @@ use crate::Error as DeviceError;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use net_proxy::gvproxy::Gvproxy;
+use pnet::packet::Packet;
 
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use net_proxy::backend::{NetBackend, ReadError, WriteError};
 
+use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -54,6 +58,7 @@ pub struct NetWorker {
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
+    
 }
 
 const VIRTQ_TX_TOKEN: Token = Token(0); // Packets from guest
@@ -83,7 +88,7 @@ impl NetWorker {
             VirtioNetBackend::DirectProxy(listeners) => {
                 let waker = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
                 let backend = Box::new(
-                    net_proxy::proxy::NetProxy::new(
+                    net_proxy::simple_proxy::NetProxy::new(
                         waker.clone(),
                         poll.registry()
                             .try_clone()
@@ -118,6 +123,7 @@ impl NetWorker {
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            
         }
     }
 
@@ -167,19 +173,34 @@ impl NetWorker {
                 match event.token() {
                     VIRTQ_RX_TOKEN => {
                         self.process_rx_queue_event();
-                        // self.backend.resume_reading();
+                        // When guest provides new RX buffers, allow backend to resume reading
+                        self.backend.resume_reading();
                     }
                     VIRTQ_TX_TOKEN => {
                         self.process_tx_queue_event();
                     }
                     BACKEND_WAKER_TOKEN => {
                         if event.is_readable() {
+                            // Fully drain the waker EventFd to prevent spurious wakeups
                             if let Some(waker) = &self.waker {
-                                _ = waker.read(); // Correctly reset the waker
+                                loop {
+                                    match waker.read() {
+                                        Ok(_) => continue, // Keep draining
+                                        Err(_) => break,   // EAGAIN means drained
+                                    }
+                                }
                             }
-                            // This call is now budgeted and will not get stuck.
-                            self.process_backend_socket_readable();
-                            // self.backend.resume_reading();
+                            
+                            // Process packets and check if we made progress
+                            let packets_processed = self.process_backend_socket_readable();
+                            
+                            // Only resume reading if we successfully processed packets
+                            if packets_processed {
+                                self.backend.resume_reading();
+                            } else {
+                                // No packets were processed - this is fine, just don't call resume_reading
+                                log::trace!("NetWorker: No packets processed, backend may be idle");
+                            }
                         }
                         if event.is_writable() {
                             // The `if` is important
@@ -206,8 +227,14 @@ impl NetWorker {
         if let Err(e) = self.queues[RX_INDEX].disable_notification(&self.mem) {
             error!("error disabling queue notifications: {:?}", e);
         }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
+        match self.process_rx() {
+            Ok(_packets_processed) => {
+                // Always resume when guest provides new buffers, regardless of current processing
+                // This ensures paused connections can be resumed when space becomes available
+            }
+            Err(e) => {
+                log::error!("Failed to process rx: {e:?} (triggered by queue event)")
+            }
         };
         if let Err(e) = self.queues[RX_INDEX].enable_notification(&self.mem) {
             error!("error disabling queue notifications: {:?}", e);
@@ -223,16 +250,21 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_backend_socket_readable(&mut self) {
+    pub(crate) fn process_backend_socket_readable(&mut self) -> bool {
         if let Err(e) = self.queues[RX_INDEX].enable_notification(&self.mem) {
             error!("error disabling queue notifications: {:?}", e);
         }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
+        let packets_processed = match self.process_rx() {
+            Ok(packets_processed) => packets_processed,
+            Err(e) => {
+                log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
+                false
+            }
         };
         if let Err(e) = self.queues[RX_INDEX].disable_notification(&self.mem) {
             error!("error disabling queue notifications: {:?}", e);
         }
+        packets_processed
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
@@ -251,56 +283,82 @@ impl NetWorker {
         }
     }
 
-    fn process_rx(&mut self) -> result::Result<(), RxError> {
+    fn process_rx(&mut self) -> result::Result<bool, RxError> {
         let mut signal_queue = false;
+        let mut packets_processed = false;
+        
+        // Process up to PACKET_BUDGET packets per wakeup to balance throughput and fairness
+        const PACKET_BUDGET: usize = 8;
+        let mut packets_in_batch = 0;
 
-        // --- START: FINAL CORRECTED LOGIC ---
-        // This single loop will now handle everything resiliently.
         loop {
+            // Respect packet budget to prevent busy loops
+            if packets_in_batch >= PACKET_BUDGET {
+                log::trace!("NetWorker: Reached packet budget ({}), yielding to event loop", PACKET_BUDGET);
+                break;
+            }
+
             // Step 1: Handle a previously failed/deferred frame first.
             if self.rx_has_deferred_frame {
+                log::trace!(
+                    "NetWorker: Processing deferred frame of {} bytes",
+                    self.rx_frame_buf_len
+                );
                 if self.write_frame_to_guest() {
                     // Success! We sent the deferred frame.
+                    log::trace!("NetWorker: Successfully delivered deferred frame to guest");
                     self.rx_has_deferred_frame = false;
                     signal_queue = true;
+                    packets_processed = true;
+                    packets_in_batch += 1;
                 } else {
-                    // Guest is still full. We can't do anything more on this connection.
-                    // Drop the frame to prevent getting stuck, and break the loop
-                    // to wait for a new event (like the guest freeing buffers).
-                    log::warn!(
-                        "Guest RX queue still full. Dropping deferred frame to prevent deadlock."
-                    );
-                    self.rx_has_deferred_frame = false;
+                    // Guest is still full. Keep the deferred frame and stop processing.
+                    // This provides backpressure to NetProxy by not reading more packets.
+                    log::trace!("NetWorker: Guest queue still full, maintaining backpressure");
                     break;
                 }
-            }
+            } else {
+                // Step 2: Try to read a new frame from the proxy.
+                match self.read_into_rx_frame_buf_from_backend() {
+                    Ok(()) => {
+                        // We got a new frame. Now try to write it to the guest.
+                        log::trace!(
+                            "NetWorker: Read packet of {} bytes from backend",
+                            self.rx_frame_buf_len
+                        );
 
-            // Step 2: Try to read a new frame from the proxy.
-            match self.read_into_rx_frame_buf_from_backend() {
-                Ok(()) => {
-                    // We got a new frame. Now try to write it to the guest.
-                    if self.write_frame_to_guest() {
-                        signal_queue = true;
-                    } else {
-                        // Guest RX queue just became full. Defer this frame and break.
-                        self.rx_has_deferred_frame = true;
-                        log::warn!("Guest RX queue became full. Deferring frame.");
+                        // Log TCP sequence number if this is a TCP packet
+                        self.log_packet_sequence_info();
+
+                        if self.write_frame_to_guest() {
+                            log::trace!("NetWorker: Successfully delivered packet to guest");
+                            signal_queue = true;
+                            packets_processed = true;
+                            packets_in_batch += 1;
+                        } else {
+                            // Guest RX queue just became full. Defer this frame and break.
+                            // This provides backpressure by stopping the read loop.
+                            log::trace!("NetWorker: Guest queue full, deferring packet and applying backpressure");
+                            self.rx_has_deferred_frame = true;
+                            break;
+                        }
+                    }
+                    // If the proxy's queue is empty, we are done.
+                    Err(ReadError::NothingRead) => {
+                        log::trace!("NetWorker: No more packets available from backend");
                         break;
                     }
+                    // Handle any real errors.
+                    Err(e) => return Err(RxError::Backend(e)),
                 }
-                // If the proxy's queue is empty, we are done.
-                Err(ReadError::NothingRead) => break,
-                // Handle any real errors.
-                Err(e) => return Err(RxError::Backend(e)),
             }
         }
-        // --- END: FINAL CORRECTED LOGIC ---
 
         if signal_queue {
             self.signal_used_queue().map_err(RxError::DeviceError)?;
         }
 
-        Ok(())
+        Ok(packets_processed)
     }
 
     fn process_tx_loop(&mut self) {
@@ -510,4 +568,34 @@ impl NetWorker {
         self.rx_frame_buf_len = len;
         Ok(())
     }
+
+    /// Log TCP sequence information for debugging
+    fn log_packet_sequence_info(&self) {
+        // Skip virtio header to get to ethernet frame
+        let eth_frame = &self.rx_frame_buf[vnet_hdr_len()..self.rx_frame_buf_len];
+
+        if let Some(eth_packet) = EthernetPacket::new(eth_frame) {
+            if eth_packet.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4 {
+                if let Some(ip_packet) = Ipv4Packet::new(eth_packet.payload()) {
+                    if ip_packet.get_next_level_protocol()
+                        == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+                    {
+                        if let Some(tcp_packet) = TcpPacket::new(ip_packet.payload()) {
+                            log::trace!(
+                                "NetWorker TCP: {}:{} -> {}:{} seq={} ack={} len={}",
+                                ip_packet.get_source(),
+                                tcp_packet.get_source(),
+                                ip_packet.get_destination(),
+                                tcp_packet.get_destination(),
+                                tcp_packet.get_sequence(),
+                                tcp_packet.get_acknowledgement(),
+                                tcp_packet.payload().len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
 }
