@@ -387,6 +387,10 @@ fn build_ipv6_udp_packet(
 
 // --- Packet Logging ---
 pub fn log_packet(data: &[u8], direction: &str) {
+    // Only do expensive packet parsing when trace logging is enabled
+    if !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
     if let Some(eth) = EthernetPacket::new(data) {
         if let Some(ip) = IpPacket::new(eth.payload()) {
             match ip.next_header() {

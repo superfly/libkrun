@@ -17,6 +17,7 @@ use pnet::packet::tcp::TcpPacket;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::{cmp, mem, result};
 use std::{io, thread};
@@ -54,6 +55,11 @@ pub struct NetWorker {
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
+
+    // Token-specific processing state
+    ready_tokens: VecDeque<Token>,
+    blocked_tokens: HashSet<Token>,
+    current_deferred_token: Option<Token>,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
@@ -119,6 +125,11 @@ impl NetWorker {
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
+
+            // Initialize token-specific processing state
+            ready_tokens: VecDeque::new(),
+            blocked_tokens: HashSet::new(),
+            current_deferred_token: None,
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
@@ -191,14 +202,21 @@ impl NetWorker {
                                 }
                             }
                             
-                            // Process packets and check if we made progress
-                            let packets_processed = self.process_backend_socket_readable();
+                            // Discover ready tokens from backend
+                            let tokens_before = self.ready_tokens.len();
+                            self.discover_ready_tokens();
+                            let tokens_after = self.ready_tokens.len();
+                            if tokens_after > tokens_before {
+                                log::trace!("🔍 NetWorker: Discovered {} new ready tokens (total: {})", tokens_after - tokens_before, tokens_after);
+                            }
                             
-                            // Only resume reading if we successfully processed packets
+                            // Process packets using token-specific logic
+                            let packets_processed = self.process_backend_socket_readable_with_tokens();
+                            
+                            // Resume reading for specific tokens if we processed packets
                             if packets_processed {
-                                self.backend.resume_reading();
+                                self.backend.resume_tokens(&self.blocked_tokens);
                             } else {
-                                // No packets were processed - this is fine, just don't call resume_reading
                                 log::trace!("NetWorker: No packets processed, backend may be idle");
                             }
                         }
@@ -227,10 +245,18 @@ impl NetWorker {
         if let Err(e) = self.queues[RX_INDEX].disable_notification(&self.mem) {
             error!("error disabling queue notifications: {:?}", e);
         }
-        match self.process_rx() {
+        
+        // Guest provided new RX buffers - unblock all tokens
+        let previously_blocked: HashSet<Token> = self.blocked_tokens.drain().collect();
+        self.rx_has_deferred_frame = false;
+        self.current_deferred_token = None;
+        
+        log::trace!("NetWorker: Guest provided new RX buffers, unblocked {} tokens", previously_blocked.len());
+        
+        match self.process_rx_with_tokens() {
             Ok(_packets_processed) => {
-                // Always resume when guest provides new buffers, regardless of current processing
-                // This ensures paused connections can be resumed when space becomes available
+                // Resume reading for previously blocked tokens
+                self.backend.resume_tokens(&previously_blocked);
             }
             Err(e) => {
                 log::error!("Failed to process rx: {e:?} (triggered by queue event)")
@@ -287,14 +313,27 @@ impl NetWorker {
         let mut signal_queue = false;
         let mut packets_processed = false;
         
-        // Process up to PACKET_BUDGET packets per wakeup to balance throughput and fairness
-        const PACKET_BUDGET: usize = 8;
+        // Dynamic packet budget based on backend queue depth
+        // Scale budget with queue size but maintain reasonable bounds
+        let queue_len = self.backend.get_rx_queue_len();
+        let base_budget = 8;
+        let max_budget = 64;
+        
+        // Scale budget proportionally to queue depth: more packets queued = higher budget
+        // This allows catching up when behind while preventing unlimited processing
+        let packet_budget = if queue_len <= base_budget {
+            base_budget
+        } else {
+            std::cmp::min(queue_len, max_budget)
+        };
+        
+        log::trace!("NetWorker: Dynamic packet budget {} (queue_len: {})", packet_budget, queue_len);
         let mut packets_in_batch = 0;
 
         loop {
             // Respect packet budget to prevent busy loops
-            if packets_in_batch >= PACKET_BUDGET {
-                log::trace!("NetWorker: Reached packet budget ({}), yielding to event loop", PACKET_BUDGET);
+            if packets_in_batch >= packet_budget {
+                log::trace!("NetWorker: Reached packet budget ({}), yielding to event loop", packet_budget);
                 break;
             }
 
@@ -352,6 +391,145 @@ impl NetWorker {
                     Err(e) => return Err(RxError::Backend(e)),
                 }
             }
+        }
+
+        if signal_queue {
+            self.signal_used_queue().map_err(RxError::DeviceError)?;
+        }
+
+        Ok(packets_processed)
+    }
+
+    fn discover_ready_tokens(&mut self) {
+        // Get all ready tokens from backend
+        let new_ready_tokens = self.backend.get_ready_tokens();
+        
+        // Add new tokens to our ready queue, excluding blocked ones
+        for token in new_ready_tokens {
+            if !self.blocked_tokens.contains(&token) && !self.ready_tokens.contains(&token) {
+                self.ready_tokens.push_back(token);
+                log::trace!("🔍 NetWorker: Added token {:?} to ready queue (queue size: {})", token, self.ready_tokens.len());
+            } else if self.blocked_tokens.contains(&token) {
+                log::trace!("🚫 NetWorker: Skipping blocked token {:?}", token);
+            } else if self.ready_tokens.contains(&token) {
+                log::trace!("♻️ NetWorker: Token {:?} already in ready queue", token);
+            }
+        }
+    }
+
+    fn process_backend_socket_readable_with_tokens(&mut self) -> bool {
+        if let Err(e) = self.queues[RX_INDEX].enable_notification(&self.mem) {
+            error!("error enabling queue notifications: {:?}", e);
+        }
+        
+        let packets_processed = match self.process_rx_with_tokens() {
+            Ok(packets_processed) => packets_processed,
+            Err(e) => {
+                log::error!("Failed to process rx with tokens: {e:?} (triggered by backend socket readable)");
+                false
+            }
+        };
+        
+        if let Err(e) = self.queues[RX_INDEX].disable_notification(&self.mem) {
+            error!("error disabling queue notifications: {:?}", e);
+        }
+        
+        packets_processed
+    }
+
+    fn process_rx_with_tokens(&mut self) -> result::Result<bool, RxError> {
+        let mut signal_queue = false;
+        let mut packets_processed = false;
+        
+        // Per-token packet budget - each token gets a fixed budget when processed
+        // This ensures fair processing regardless of number of active connections
+        const PACKETS_PER_TOKEN: usize = 8;
+        const MAX_TOTAL_PACKETS: usize = 64; // Global limit to prevent excessive processing
+        
+        log::trace!("NetWorker: Per-token packet budget {} (max total: {})", PACKETS_PER_TOKEN, MAX_TOTAL_PACKETS);
+
+        let mut total_packets_processed = 0;
+        
+        // First: Handle any deferred frame
+        if self.rx_has_deferred_frame {
+            if let Some(deferred_token) = self.current_deferred_token {
+                log::trace!("NetWorker: Processing deferred frame for token {:?} ({} bytes)", 
+                           deferred_token, self.rx_frame_buf_len);
+                           
+                if self.write_frame_to_guest() {
+                    log::trace!("NetWorker: Successfully delivered deferred frame for token {:?}", deferred_token);
+                    self.rx_has_deferred_frame = false;
+                    self.current_deferred_token = None;
+                    self.blocked_tokens.remove(&deferred_token);
+                    signal_queue = true;
+                    packets_processed = true;
+                    total_packets_processed += 1;
+                } else {
+                    log::trace!("NetWorker: Guest queue still full, keeping frame deferred for token {:?}", deferred_token);
+                    return Ok(packets_processed);
+                }
+            }
+        }
+
+        // Process tokens from ready queue with per-token budgets
+        while total_packets_processed < MAX_TOTAL_PACKETS {
+            if let Some(token) = self.ready_tokens.pop_front() {
+                log::trace!("🎯 NetWorker: Processing token {:?} from ready queue (remaining: {})", token, self.ready_tokens.len());
+                if self.blocked_tokens.contains(&token) {
+                    continue; // Skip blocked tokens
+                }
+                
+                // Process up to PACKETS_PER_TOKEN for this specific token
+                let mut token_packets = 0;
+                while token_packets < PACKETS_PER_TOKEN && total_packets_processed < MAX_TOTAL_PACKETS {
+                    match self.backend.read_frame_for_token(token, &mut self.rx_frame_buf[vnet_hdr_len()..]) {
+                        Ok(frame_len) => {
+                            self.rx_frame_buf_len = vnet_hdr_len() + frame_len;
+                            write_virtio_net_hdr(&mut self.rx_frame_buf);
+                            
+                            log::trace!("NetWorker: Read packet from token {:?} ({} bytes) [{}/{}]", 
+                                       token, frame_len, token_packets + 1, PACKETS_PER_TOKEN);
+                            
+                            // Log TCP sequence info
+                            self.log_packet_sequence_info();
+                            
+                            if self.write_frame_to_guest() {
+                                log::trace!("NetWorker: Successfully delivered packet from token {:?}", token);
+                                signal_queue = true;
+                                packets_processed = true;
+                                token_packets += 1;
+                                total_packets_processed += 1;
+                            } else {
+                                // Guest queue full - defer this specific token
+                                log::trace!("NetWorker: Guest queue full, blocking token {:?}", token);
+                                self.blocked_tokens.insert(token);
+                                self.rx_has_deferred_frame = true;
+                                self.current_deferred_token = Some(token);
+                                return Ok(packets_processed);
+                            }
+                        }
+                        Err(ReadError::NothingRead) => {
+                            log::trace!("NetWorker: No more data available for token {:?} after {} packets", token, token_packets);
+                            break; // No more data for this token
+                        }
+                        Err(e) => return Err(RxError::Backend(e)),
+                    }
+                }
+                
+                // Check if this token has more data and should be re-queued
+                if self.backend.has_more_data_for_token(token) {
+                    log::trace!("NetWorker: Re-queueing token {:?} (processed {}/{} packets)", 
+                               token, token_packets, PACKETS_PER_TOKEN);
+                    self.ready_tokens.push_back(token); // Re-queue for next round
+                }
+            } else {
+                // No more ready tokens
+                break;
+            }
+        }
+        
+        if total_packets_processed >= MAX_TOTAL_PACKETS {
+            log::trace!("NetWorker: Reached maximum total packets ({}), yielding to event loop", MAX_TOTAL_PACKETS);
         }
 
         if signal_queue {
@@ -571,6 +749,11 @@ impl NetWorker {
 
     /// Log TCP sequence information for debugging
     fn log_packet_sequence_info(&self) {
+        // Only do expensive packet parsing when trace logging is enabled
+        if !log::log_enabled!(log::Level::Trace) {
+            return;
+        }
+        
         // Skip virtio header to get to ethernet frame
         let eth_frame = &self.rx_frame_buf[vnet_hdr_len()..self.rx_frame_buf_len];
 

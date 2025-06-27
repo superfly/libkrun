@@ -51,4 +51,25 @@ pub trait NetBackend {
         0
     }
     fn resume_reading(&mut self) {}
+    
+    // Token-specific reading interface
+    fn get_ready_tokens(&self) -> Vec<mio::Token> {
+        // Default implementation returns empty - only advanced backends implement this
+        Vec::new()
+    }
+    
+    fn has_more_data_for_token(&self, _token: mio::Token) -> bool {
+        // Default implementation returns false
+        false
+    }
+    
+    fn read_frame_for_token(&mut self, _token: mio::Token, buf: &mut [u8]) -> Result<usize, ReadError> {
+        // Default implementation falls back to regular read_frame for backward compatibility
+        self.read_frame(buf)
+    }
+    
+    fn resume_tokens(&mut self, _tokens: &std::collections::HashSet<mio::Token>) {
+        // Default implementation falls back to regular resume_reading
+        self.resume_reading();
+    }
 }

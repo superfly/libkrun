@@ -50,6 +50,7 @@ pub struct TcpConnection<State> {
     tx_ack: u32,
     write_buffer: VecDeque<Bytes>,
     to_vm_buffer: VecDeque<Bytes>,
+    to_vm_control_buffer: VecDeque<Bytes>, // Per-connection control packets (ACK, SYN, FIN)
     #[allow(dead_code)]
     state: State,
 }
@@ -96,6 +97,24 @@ impl AnyConnection {
             AnyConnection::Closing(conn) => &mut conn.to_vm_buffer,
         }
     }
+
+    fn to_vm_control_buffer(&self) -> &VecDeque<Bytes> {
+        match self {
+            AnyConnection::EgressConnecting(conn) => &conn.to_vm_control_buffer,
+            AnyConnection::IngressConnecting(conn) => &conn.to_vm_control_buffer,
+            AnyConnection::Established(conn) => &conn.to_vm_control_buffer,
+            AnyConnection::Closing(conn) => &conn.to_vm_control_buffer,
+        }
+    }
+
+    fn to_vm_control_buffer_mut(&mut self) -> &mut VecDeque<Bytes> {
+        match self {
+            AnyConnection::EgressConnecting(conn) => &mut conn.to_vm_control_buffer,
+            AnyConnection::IngressConnecting(conn) => &mut conn.to_vm_control_buffer,
+            AnyConnection::Established(conn) => &mut conn.to_vm_control_buffer,
+            AnyConnection::Closing(conn) => &mut conn.to_vm_control_buffer,
+        }
+    }
     
     fn tx_seq(&self) -> u32 {
         match self {
@@ -129,6 +148,7 @@ impl<S: ConnectingState> TcpConnection<S> {
             tx_ack: self.tx_ack,
             write_buffer: self.write_buffer,
             to_vm_buffer: self.to_vm_buffer,
+            to_vm_control_buffer: self.to_vm_control_buffer,
             state: Established,
         }
     }
@@ -144,6 +164,7 @@ impl TcpConnection<Established> {
             tx_ack: self.tx_ack,
             write_buffer: self.write_buffer,
             to_vm_buffer: self.to_vm_buffer,
+            to_vm_control_buffer: self.to_vm_control_buffer,
             state: Closing,
         }
     }
@@ -186,8 +207,9 @@ type BoxedHostStream = Box<dyn HostStream>;
 
 type NatKey = (IpAddr, u16, IpAddr, u16);
 
-const HOST_READ_BUDGET: usize = 32;
+const HOST_READ_BUDGET: usize = 4; // Conservative but not too slow
 const MAX_PROXY_QUEUE_SIZE: usize = 2048;
+const MAX_CONTROL_QUEUE_SIZE: usize = 256; // Limit control packets to prevent memory issues
 
 fn calculate_window_size(buffer_len: usize) -> u16 {
     // Calculate buffer utilization as a percentage
@@ -229,7 +251,7 @@ pub struct NetProxy {
     last_stall_check: Instant,
 
     packet_buf: BytesMut,
-    read_buf: [u8; 16384],
+    read_buf: [u8; 8192], // Bigger buffer for better performance while avoiding huge packets
 
     to_vm_control_queue: VecDeque<Bytes>,
     data_run_queue: VecDeque<Token>,
@@ -292,18 +314,34 @@ impl NetProxy {
             last_udp_cleanup: Instant::now(),
             last_stall_check: Instant::now(),
             packet_buf: BytesMut::with_capacity(2048),
-            read_buf: [0u8; 16384],
+            read_buf: [0u8; 8192], // Bigger buffer for better performance
             to_vm_control_queue: Default::default(),
             data_run_queue: Default::default(),
         })
     }
 
     fn read_from_host_socket(&mut self, conn: &mut TcpConnection<Established>, token: Token) -> io::Result<()> {
-        // Reduce read budget if buffer is getting full to prevent host overrun
-        let read_budget = if conn.to_vm_buffer.len() > MAX_PROXY_QUEUE_SIZE / 4 {
-            1 // Very conservative when buffer is 25% full
+        // Implement aggressive backpressure by checking buffer state
+        let buffer_len = conn.to_vm_buffer.len();
+        
+        // Very conservative backpressure to prevent deadlocks like the Token(20) scenario
+        if buffer_len > 8 {  // Stop reading when we have 8+ packets buffered
+            trace!(?token, buffer_len, "Applying aggressive backpressure - pausing connection to prevent sequence gaps");
+            
+            // Mark connection as paused so MIO registration logic works correctly
+            if !self.paused_reads.contains(&token) {
+                self.paused_reads.insert(token);
+                warn!(?token, buffer_len, "⏸️  PAUSING HOST READS - Aggressive backpressure at 8+ packets");
+            }
+            
+            return Ok(());
+        }
+        
+        // Limit read frequency based on buffer utilization
+        let read_budget = if buffer_len > 4 {
+            1 // Single read when buffer has 4+ packets
         } else {
-            HOST_READ_BUDGET
+            HOST_READ_BUDGET // Normal budget when buffer is low
         };
         
         'read_loop: for _ in 0..read_budget {
@@ -315,31 +353,41 @@ impl NetProxy {
                 Ok(n) => {
                     if let Some(&nat_key) = self.reverse_tcp_nat.get(&token) {
                         let was_empty = conn.to_vm_buffer.is_empty();
-                        let mut current_seq = conn.tx_seq; // Track sequence number for this batch
-                        for chunk in self.read_buf[..n].chunks(MAX_SEGMENT_SIZE) {
+                        
+                        // Process ALL data read from socket to avoid data loss
+                        // The backpressure logic above prevents us from reading too much
+                        let mut offset = 0;
+                        while offset < n {
+                            let chunk_size = std::cmp::min(n - offset, MAX_SEGMENT_SIZE);
+                            let chunk = &self.read_buf[offset..offset + chunk_size];
+                            
                             let window_size = calculate_window_size(conn.to_vm_buffer.len());
-                            trace!(?token, buffer_len = conn.to_vm_buffer.len(), window_size = window_size, chunk_len = chunk.len(), current_seq, "Sending data packet to VM");
+                            trace!(?token, buffer_len = conn.to_vm_buffer.len(), window_size = window_size, chunk_len = chunk.len(), current_seq = conn.tx_seq, offset, total_read = n, "Sending data packet to VM");
                             let packet = build_tcp_packet(
                                 &mut self.packet_buf,
                                 nat_key,
-                                current_seq, // Use the current sequence for this packet
+                                conn.tx_seq,
                                 conn.tx_ack,
                                 Some(chunk),
                                 Some(TcpFlags::ACK | TcpFlags::PSH),
                                 window_size,
                             );
                             conn.to_vm_buffer.push_back(packet);
-                            // Update sequence for next packet in this batch
-                            current_seq = current_seq.wrapping_add(chunk.len() as u32);
+                            
+                            // Update sequence for this chunk
+                            let old_seq = conn.tx_seq;
+                            conn.tx_seq = conn.tx_seq.wrapping_add(chunk_size as u32);
+                            trace!(?token, old_seq, new_seq = conn.tx_seq, bytes_buffered = chunk_size, "Updated tx_seq after buffering chunk");
+                            
+                            offset += chunk_size;
                         }
-                        // Update connection's tx_seq to the next sequence number
-                        let old_seq = conn.tx_seq;
-                        conn.tx_seq = current_seq;
-                        trace!(?token, old_seq, new_seq = current_seq, bytes_buffered = n, "Updated tx_seq after buffering data");
-                        if was_empty && !conn.to_vm_buffer.is_empty() {
-                            self.data_run_queue.push_back(token);
+                        
+                        trace!(?token, buffer_size = conn.to_vm_buffer.len(), total_bytes_processed = n, "Added all data to VM buffer");
+                        
+                        // Signal NetWorker that new data is available
+                        if let Err(e) = self.waker.write(1) {
+                            error!("Failed to signal NetWorker after reading from host: {}", e);
                         }
-                        trace!(?token, buffer_size = conn.to_vm_buffer.len(), "Added packets to VM buffer");
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -377,7 +425,12 @@ impl NetProxy {
                 debug!("Responding to ARP request for {}", PROXY_IP);
                 let reply = build_arp_reply(&mut self.packet_buf, &arp);
                 // queue the packet
-                self.to_vm_control_queue.push_back(reply);
+                // Add bounds checking for control queue
+            if self.to_vm_control_queue.len() >= MAX_CONTROL_QUEUE_SIZE {
+                warn!("Control queue at capacity ({}), dropping ARP reply", MAX_CONTROL_QUEUE_SIZE);
+                self.to_vm_control_queue.pop_front(); // Drop oldest packet
+            }
+            self.to_vm_control_queue.push_back(reply);
                 return Ok(());
             }
         }
@@ -511,7 +564,12 @@ impl NetProxy {
                                 Some(TcpFlags::ACK),
                                 window_size,
                             );
-                            self.to_vm_control_queue.push_back(ack_packet);
+                            // Add ACK packet to per-connection control buffer
+                            if established_conn.to_vm_control_buffer.len() >= MAX_CONTROL_QUEUE_SIZE {
+                                warn!("Connection control queue at capacity ({}) for token {:?}, dropping oldest ACK", MAX_CONTROL_QUEUE_SIZE, token);
+                                established_conn.to_vm_control_buffer.pop_front();
+                            }
+                            established_conn.to_vm_control_buffer.push_back(ack_packet);
                             AnyConnection::Established(established_conn)
                         } else {
                             AnyConnection::IngressConnecting(conn)
@@ -547,6 +605,9 @@ impl NetProxy {
                             if is_ack_only {
                                 let ack_num = tcp_packet.get_acknowledgement();
                                 trace!(?token, ack_num, vm_seq = incoming_seq, proxy_next_seq = conn.tx_seq, "VM sent ACK-only packet");
+                                
+                                // Add detailed sequence tracking logs
+                                trace!(?token, vm_ack = ack_num, proxy_tx_seq = conn.tx_seq, buffer_packets = conn.to_vm_buffer.len(), "🔍 SEQUENCE STATE: VM ack vs proxy tx_seq");
                                 
                                 // CRITICAL: Process the ACK to remove acknowledged packets from our buffer
                                 // When VM ACKs sequence X, it means it received all data up to X-1
@@ -617,9 +678,9 @@ impl NetProxy {
                                 // ACK-only packets indicate VM has consumed data, so we should check if we can
                                 // read more data from the host and potentially resume if we were paused
                                 if self.paused_reads.contains(&token) {
-                                    let resume_threshold = MAX_PROXY_QUEUE_SIZE / 32; // Resume at 3% full (64 packets)
+                                    let resume_threshold = 4; // Aggressive backpressure: resume when buffer drops to 4 packets
                                     if conn.to_vm_buffer.len() <= resume_threshold {
-                                        warn!(?token, buffer_len = conn.to_vm_buffer.len(), resume_threshold, "▶️  RESUMING HOST READS - Buffer dropped to safe level");
+                                        warn!(?token, buffer_len = conn.to_vm_buffer.len(), resume_threshold, total_paused = self.paused_reads.len(), "▶️  RESUMING HOST READS - Buffer dropped to safe level");
                                         self.paused_reads.remove(&token);
                                         // Re-register with read interest to resume data flow
                                         if let Err(e) = self.registry.reregister(
@@ -653,7 +714,8 @@ impl NetProxy {
                                             if after_buffer_len > before_buffer_len {
                                                 trace!(?token, before_len = before_buffer_len, after_len = after_buffer_len, "Successfully read more data from host after VM ACK");
                                             } else if seq_gap > 1000 {
-                                                warn!(?token, buffer_len = conn.to_vm_buffer.len(), vm_ack = ack_num, proxy_seq = conn.tx_seq, seq_gap, "No new data from host + sequence gap - may indicate retransmission needed");
+                                                warn!(?token, buffer_len = conn.to_vm_buffer.len(), vm_ack = ack_num, proxy_seq = conn.tx_seq, seq_gap, "⚠️ POTENTIAL ISSUE: No new data from host + sequence gap - may indicate retransmission needed");
+                                                warn!(?token, "🔍 DIAGNOSIS: This might be normal if packets were sent faster than VM could ACK them");
                                             } else {
                                                 trace!(?token, "No new data available from host (normal)");
                                             }
@@ -748,7 +810,12 @@ impl NetProxy {
                                         Some(TcpFlags::ACK),
                                         window_size,
                                     );
-                                    self.to_vm_control_queue.push_back(ack_packet);
+                                    // Add ACK packet to per-connection control buffer
+                                    if conn.to_vm_control_buffer.len() >= MAX_CONTROL_QUEUE_SIZE {
+                                        warn!("Connection control queue at capacity ({}) for token {:?}, dropping oldest ACK", MAX_CONTROL_QUEUE_SIZE, token);
+                                        conn.to_vm_control_buffer.pop_front(); // Drop oldest packet
+                                    }
+                                    conn.to_vm_control_buffer.push_back(ack_packet);
                                 }
                             }
 
@@ -798,7 +865,12 @@ impl NetProxy {
                                 Some(TcpFlags::ACK),
                                 window_size,
                             );
-                            self.to_vm_control_queue.push_back(ack_packet);
+                            // Add ACK packet to per-connection control buffer
+                            if conn.to_vm_control_buffer.len() >= MAX_CONTROL_QUEUE_SIZE {
+                                warn!("Connection control queue at capacity ({}) for token {:?}, dropping oldest ACK", MAX_CONTROL_QUEUE_SIZE, token);
+                                conn.to_vm_control_buffer.pop_front();
+                            }
+                            conn.to_vm_control_buffer.push_back(ack_packet);
                         }
 
                         // Keep the connection in the closing state until it's marked for full removal.
@@ -858,6 +930,7 @@ impl NetProxy {
                 state: EgressConnecting,
                 write_buffer: VecDeque::new(),
                 to_vm_buffer: VecDeque::new(),
+                to_vm_control_buffer: VecDeque::new(),
             };
 
             self.tcp_nat_table.insert(nat_key, token);
@@ -938,7 +1011,15 @@ impl NetProxy {
 
 impl NetBackend for NetProxy {
     fn get_rx_queue_len(&self) -> usize {
-        self.to_vm_control_queue.len() + self.data_run_queue.len()
+        let global_control_packets = self.to_vm_control_queue.len(); // For ARP and legacy packets
+        let data_packets: usize = self.host_connections.values()
+            .map(|conn| conn.to_vm_buffer().len())
+            .sum();
+        let per_connection_control_packets: usize = self.host_connections.values()
+            .map(|conn| conn.to_vm_control_buffer().len())
+            .sum();
+        
+        global_control_packets + data_packets + per_connection_control_packets
     }
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, crate::backend::ReadError> {
         if let Some(popped) = self.to_vm_control_queue.pop_front() {
@@ -977,7 +1058,14 @@ impl NetBackend for NetProxy {
         buf: &mut [u8],
     ) -> Result<(), crate::backend::WriteError> {
         self.handle_packet_from_vm(&buf[hdr_len..])?;
-        if !self.to_vm_control_queue.is_empty() || !self.data_run_queue.is_empty() {
+        
+        // Check if we have any packets to deliver: global control, data, or per-connection control packets
+        let has_global_control = !self.to_vm_control_queue.is_empty();
+        let has_data = !self.data_run_queue.is_empty();
+        let has_connection_control = self.host_connections.values()
+            .any(|conn| !conn.to_vm_control_buffer().is_empty());
+            
+        if has_global_control || has_data || has_connection_control {
             if let Err(e) = self.waker.write(1) {
                 error!("Failed to write to backend waker: {}", e);
             }
@@ -1016,6 +1104,7 @@ impl NetBackend for NetProxy {
                             state: IngressConnecting,
                             write_buffer: VecDeque::new(),
                             to_vm_buffer: VecDeque::new(),
+                            to_vm_control_buffer: VecDeque::new(),
                         };
 
                         let syn_packet = build_tcp_packet(
@@ -1027,7 +1116,7 @@ impl NetBackend for NetProxy {
                             Some(TcpFlags::SYN),
                             u16::MAX,
                         );
-                        self.to_vm_control_queue.push_back(syn_packet);
+                        conn.to_vm_control_buffer.push_back(syn_packet);
                         conn.tx_seq = conn.tx_seq.wrapping_add(1);
                         self.tcp_nat_table.insert(nat_key, token);
                         self.reverse_tcp_nat.insert(token, nat_key);
@@ -1057,7 +1146,7 @@ impl NetBackend for NetProxy {
                                     Some(TcpFlags::SYN | TcpFlags::ACK),
                                     u16::MAX,
                                 );
-                                self.to_vm_control_queue.push_back(syn_ack_packet);
+                                conn.to_vm_control_buffer.push_back(syn_ack_packet);
 
                                 conn.tx_seq = conn.tx_seq.wrapping_add(1);
                                 let mut established_conn = TcpConnection {
@@ -1066,6 +1155,7 @@ impl NetBackend for NetProxy {
                                     tx_ack: conn.tx_ack,
                                     write_buffer: conn.write_buffer,
                                     to_vm_buffer: VecDeque::new(),
+                                    to_vm_control_buffer: conn.to_vm_control_buffer,
                                     state: Established,
                                 };
                                 let mut write_error = false;
@@ -1103,6 +1193,7 @@ impl NetBackend for NetProxy {
                                         tx_ack: established_conn.tx_ack,
                                         write_buffer: established_conn.write_buffer,
                                         to_vm_buffer: established_conn.to_vm_buffer,
+                                        to_vm_control_buffer: established_conn.to_vm_control_buffer,
                                         state: Closing,
                                     })
                                 } else {
@@ -1187,7 +1278,7 @@ impl NetBackend for NetProxy {
                                         Some(TcpFlags::RST | TcpFlags::ACK),
                                         0,
                                     );
-                                    self.to_vm_control_queue.push_back(rst_packet);
+                                    conn.to_vm_control_buffer.push_back(rst_packet);
                                 }
                                 self.connections_to_remove.push(token);
                                 // Return the connection so it can be re-inserted and then immediately cleaned up.
@@ -1205,16 +1296,16 @@ impl NetBackend for NetProxy {
                                         0,
                                     );
                                     closing_conn.tx_seq = closing_conn.tx_seq.wrapping_add(1);
-                                    self.to_vm_control_queue.push_back(fin_packet);
+                                    closing_conn.to_vm_control_buffer.push_back(fin_packet);
                                 }
                                 AnyConnection::Closing(closing_conn)
                             } else {
-                                // Pause reads much earlier to prevent overwhelming NetWorker
-                                let pause_threshold = MAX_PROXY_QUEUE_SIZE / 4; // Pause at 25% full
+                                // Balanced pause threshold - prevent overwhelming but allow reasonable buffering
+                                let pause_threshold = MAX_PROXY_QUEUE_SIZE / 8; // Pause at 12.5% full (256 packets)
                                 
                                 if conn.to_vm_buffer.len() >= pause_threshold {
                                     if !self.paused_reads.contains(&token) {
-                                        warn!(?token, buffer_len = conn.to_vm_buffer.len(), pause_threshold, "⏸️  PAUSING HOST READS - Buffer reached 25% to prevent NetWorker overwhelm");
+                                        warn!(?token, buffer_len = conn.to_vm_buffer.len(), pause_threshold, "⏸️  PAUSING HOST READS - Buffer reached 12.5% to prevent VM overwhelm");
                                         self.paused_reads.insert(token);
                                     }
                                 }
@@ -1363,6 +1454,17 @@ impl NetBackend for NetProxy {
         // Periodic stall detection for TCP connections
         if self.last_stall_check.elapsed() > Duration::from_secs(5) {
             let now = Instant::now();
+            
+            // Log overall proxy state every 5 seconds for monitoring
+            let total_connections = self.host_connections.len();
+            let paused_connections = self.paused_reads.len();
+            let active_connections = total_connections - paused_connections;
+            let total_buffered_packets: usize = self.host_connections.values()
+                .map(|conn| conn.to_vm_buffer().len() + conn.to_vm_control_buffer().len())
+                .sum();
+            
+            debug!("📊 PROXY STATE: {} total connections ({} active, {} paused), {} total buffered packets", 
+                   total_connections, active_connections, paused_connections, total_buffered_packets);
             for (&token, connection) in &mut self.host_connections {
                 if let AnyConnection::Established(conn) = connection {
                     // Check if connection has pending data to VM that hasn't been consumed
@@ -1385,7 +1487,7 @@ impl NetBackend for NetProxy {
                                 Some(TcpFlags::ACK),
                                 window_size,
                             );
-                            self.to_vm_control_queue.push_back(keepalive_packet);
+                            conn.to_vm_control_buffer.push_back(keepalive_packet);
                         }
                     }
                 }
@@ -1393,7 +1495,13 @@ impl NetBackend for NetProxy {
             self.last_stall_check = now;
         }
 
-        if !self.to_vm_control_queue.is_empty() || !self.data_run_queue.is_empty() {
+        // Check if we have any packets to deliver: global control, data, or per-connection control packets
+        let has_global_control = !self.to_vm_control_queue.is_empty();
+        let has_data = !self.data_run_queue.is_empty();
+        let has_connection_control = self.host_connections.values()
+            .any(|conn| !conn.to_vm_control_buffer().is_empty());
+            
+        if has_global_control || has_data || has_connection_control {
             if let Err(e) = self.waker.write(1) {
                 error!("Failed to write to backend waker: {}", e);
             }
@@ -1426,7 +1534,7 @@ impl NetBackend for NetProxy {
             // First check buffer length with immutable reference
             let should_resume = if let Some(conn) = self.host_connections.get(&token) {
                 let buffer_len = conn.to_vm_buffer().len();
-                let resume_threshold = MAX_PROXY_QUEUE_SIZE / 32; // Resume at 3% full (64 packets)
+                let resume_threshold = 4; // Aggressive backpressure: resume when buffer drops to 4 packets
                 
                 if buffer_len <= resume_threshold {
                     log::trace!("NetProxy: Resuming reading for paused connection {:?} (buffer: {}/{})", token, buffer_len, MAX_PROXY_QUEUE_SIZE);
@@ -1452,6 +1560,149 @@ impl NetBackend for NetProxy {
                         error!("Failed to reregister resumed connection: {}", e);
                     } else {
                         trace!(?token, "reregistered with R+W interest");
+                    }
+                }
+            }
+        }
+    }
+
+    // Token-specific reading implementation
+    fn get_ready_tokens(&self) -> Vec<mio::Token> {
+        let mut ready_tokens = Vec::new();
+        
+        // Always include control packets as "virtual token 0" if any exist
+        if !self.to_vm_control_queue.is_empty() {
+            ready_tokens.push(mio::Token(0)); // Special control token for ARP/legacy
+        }
+        
+        // Add connections that have data for the VM, regardless of pause state
+        // Backpressure should only pause host reads, not VM delivery
+        for (&token, conn) in &self.host_connections {
+            let has_vm_data = !conn.to_vm_buffer().is_empty() || !conn.to_vm_control_buffer().is_empty();
+            
+            match conn {
+                AnyConnection::Established(_) => {
+                    // Always include established connections with buffered VM data
+                    // Also include non-paused established connections for potential host reads
+                    if has_vm_data || !self.paused_reads.contains(&token) {
+                        if !ready_tokens.contains(&token) {
+                            ready_tokens.push(token);
+                        }
+                    }
+                }
+                AnyConnection::EgressConnecting(_) | 
+                AnyConnection::IngressConnecting(_) | 
+                AnyConnection::Closing(_) => {
+                    // Include non-established connections only if they have VM data
+                    if has_vm_data && !ready_tokens.contains(&token) {
+                        ready_tokens.push(token);
+                    }
+                }
+            }
+        }
+        
+        ready_tokens
+    }
+    
+    fn has_more_data_for_token(&self, token: mio::Token) -> bool {
+        if token == mio::Token(0) {
+            // Control token - check global control queue
+            !self.to_vm_control_queue.is_empty()
+        } else {
+            // Connection token - check both data and control buffers
+            self.host_connections.get(&token)
+                .map(|conn| !conn.to_vm_buffer().is_empty() || !conn.to_vm_control_buffer().is_empty())
+                .unwrap_or(false)
+        }
+    }
+    
+    fn read_frame_for_token(&mut self, token: mio::Token, buf: &mut [u8]) -> Result<usize, crate::backend::ReadError> {
+        if token == mio::Token(0) {
+            // Global control token - read from global control queue (ARP, legacy)
+            if let Some(packet) = self.to_vm_control_queue.pop_front() {
+                let packet_len = packet.len();
+                buf[..packet_len].copy_from_slice(&packet);
+                trace!("NetProxy: Read global control packet (len: {})", packet_len);
+                return Ok(packet_len);
+            }
+        } else {
+            // Connection token - prioritize control packets over data packets
+            if let Some(conn) = self.host_connections.get_mut(&token) {
+                // First, check for control packets (ACK, SYN, FIN) - higher priority
+                if let Some(packet) = conn.to_vm_control_buffer_mut().pop_front() {
+                    let packet_len = packet.len();
+                    buf[..packet_len].copy_from_slice(&packet);
+                    trace!(?token, "NetProxy: Read connection control packet (len: {})", packet_len);
+                    return Ok(packet_len);
+                }
+                
+                // Then, check for data packets
+                if let Some(packet) = conn.to_vm_buffer_mut().pop_front() {
+                    let packet_len = packet.len();
+                    buf[..packet_len].copy_from_slice(&packet);
+                    trace!(?token, "NetProxy: Read data packet (len: {})", packet_len);
+                    
+                    // Note: No need to manage data_run_queue since get_ready_tokens now includes all established connections
+                    
+                    return Ok(packet_len);
+                }
+            }
+        }
+        
+        // Check if we should signal continuation - if any connection has buffered data
+        // This handles the case where NetWorker hits packet budget and yields, but we still have data
+        let has_any_buffered_data = self.host_connections.values().any(|conn| {
+            !conn.to_vm_buffer().is_empty() || !conn.to_vm_control_buffer().is_empty()
+        }) || !self.to_vm_control_queue.is_empty();
+        
+        if has_any_buffered_data {
+            trace!("NetProxy: NothingRead but still have buffered data, signaling waker for continuation");
+            if let Err(e) = self.waker.write(1) {
+                error!("NetProxy: Failed to signal waker: {}", e);
+            }
+        }
+        
+        Err(crate::backend::ReadError::NothingRead)
+    }
+    
+    fn resume_tokens(&mut self, tokens: &std::collections::HashSet<mio::Token>) {
+        trace!("NetProxy: Resume reading called for specific tokens, checking paused connections");
+        
+        // Resume specific tokens if they are paused and have low buffer usage
+        for &token in tokens {
+            if token == mio::Token(0) {
+                continue; // Skip control token
+            }
+            
+            if self.paused_reads.contains(&token) {
+                let should_resume = if let Some(conn) = self.host_connections.get(&token) {
+                    let buffer_len = conn.to_vm_buffer().len();
+                    let resume_threshold = 4; // Aggressive backpressure: resume when buffer drops to 4 packets
+                    
+                    if buffer_len <= resume_threshold {
+                        trace!("NetProxy: Resuming reading for paused token {:?} (buffer: {}/{})", token, buffer_len, resume_threshold);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                
+                if should_resume {
+                    if let Some(conn) = self.host_connections.get_mut(&token) {
+                        self.paused_reads.remove(&token);
+                        
+                        // Re-register with read interest
+                        if let Err(e) = self.registry.reregister(
+                            conn.stream_mut(),
+                            token,
+                            Interest::READABLE | Interest::WRITABLE,
+                        ) {
+                            error!("Failed to reregister resumed token {:?}: {}", token, e);
+                        } else {
+                            trace!(?token, "reregistered with R+W interest");
+                        }
                     }
                 }
             }
@@ -1572,7 +1823,7 @@ fn build_tcp_packet(
             return Bytes::new();
         }
     };
-    packet_dumper::log_packet_out(&packet);
+    trace!("{}", packet_dumper::log_packet_out(&packet));
     packet
 }
 
@@ -1800,83 +2051,79 @@ mod packet_dumper {
         }
         s
     }
-    pub fn log_packet_in(data: &[u8]) {
-        log_packet(data, "IN");
+    pub fn log_packet_in(data: &[u8]) -> PacketDumper {
+        PacketDumper { data, direction: "IN" }
     }
-    pub fn log_packet_out(data: &[u8]) {
-        log_packet(data, "OUT");
+    pub fn log_packet_out(data: &[u8]) -> PacketDumper {
+        PacketDumper { data, direction: "OUT" }
     }
-    fn log_packet(data: &[u8], direction: &str) {
-        if let Some(eth) = EthernetPacket::new(data) {
-            match eth.get_ethertype() {
-                EtherTypes::Ipv4 => {
-                    if let Some(ipv4) = Ipv4Packet::new(eth.payload()) {
-                        let src = ipv4.get_source();
-                        let dst = ipv4.get_destination();
-                        match ipv4.get_next_level_protocol() {
-                            IpNextHeaderProtocols::Tcp => {
-                                if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
-                                    trace!("[{}] IP {}.{} > {}.{}: Flags [{}], seq {}, ack {}, win {}, len {}",
-                                            direction, src, tcp.get_source(), dst, tcp.get_destination(),
-                                            format_tcp_flags(tcp.get_flags()), tcp.get_sequence(),
-                                            tcp.get_acknowledgement(), tcp.get_window(), tcp.payload().len());
+
+    pub struct PacketDumper<'a> {
+        data: &'a [u8],
+        direction: &'static str,
+    }
+
+    impl<'a> std::fmt::Display for PacketDumper<'a> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let Some(eth) = EthernetPacket::new(self.data) {
+                match eth.get_ethertype() {
+                    EtherTypes::Ipv4 => {
+                        if let Some(ipv4) = Ipv4Packet::new(eth.payload()) {
+                            let src = ipv4.get_source();
+                            let dst = ipv4.get_destination();
+                            match ipv4.get_next_level_protocol() {
+                                IpNextHeaderProtocols::Tcp => {
+                                    if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                                        write!(f, "[{}] IP {}.{} > {}.{}: Flags [{}], seq {}, ack {}, win {}, len {}",
+                                                self.direction, src, tcp.get_source(), dst, tcp.get_destination(),
+                                                format_tcp_flags(tcp.get_flags()), tcp.get_sequence(),
+                                                tcp.get_acknowledgement(), tcp.get_window(), tcp.payload().len())
+                                    } else {
+                                        write!(f, "[{}] IP {} > {}: TCP (parse failed)", self.direction, src, dst)
+                                    }
                                 }
+                                _ => write!(f, "[{}] IPv4 {} > {}: proto {}", self.direction, src, dst, ipv4.get_next_level_protocol()),
                             }
-                            _ => trace!(
-                                "[{}] IPv4 {} > {}: proto {}",
-                                direction,
-                                src,
-                                dst,
-                                ipv4.get_next_level_protocol()
-                            ),
+                        } else {
+                            write!(f, "[{}] IPv4 packet (parse failed)", self.direction)
                         }
                     }
-                }
-                EtherTypes::Ipv6 => {
-                    if let Some(ipv6) = Ipv6Packet::new(eth.payload()) {
-                        let src = ipv6.get_source();
-                        let dst = ipv6.get_destination();
-                        match ipv6.get_next_header() {
-                            IpNextHeaderProtocols::Tcp => {
-                                if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
-                                    trace!(
-                                            "[{}] IP6 [{}]:{} > [{}]:{}: Flags [{}], seq {}, ack {}, win {}, len {}",
-                                            direction, src, tcp.get_source(), dst, tcp.get_destination(),
-                                            format_tcp_flags(tcp.get_flags()), tcp.get_sequence(),
-                                            tcp.get_acknowledgement(), tcp.get_window(), tcp.payload().len()
-                                        );
+                    EtherTypes::Ipv6 => {
+                        if let Some(ipv6) = Ipv6Packet::new(eth.payload()) {
+                            let src = ipv6.get_source();
+                            let dst = ipv6.get_destination();
+                            match ipv6.get_next_header() {
+                                IpNextHeaderProtocols::Tcp => {
+                                    if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
+                                        write!(f, "[{}] IP6 [{}]:{} > [{}]:{}: Flags [{}], seq {}, ack {}, win {}, len {}",
+                                                self.direction, src, tcp.get_source(), dst, tcp.get_destination(),
+                                                format_tcp_flags(tcp.get_flags()), tcp.get_sequence(),
+                                                tcp.get_acknowledgement(), tcp.get_window(), tcp.payload().len())
+                                    } else {
+                                        write!(f, "[{}] IP6 {} > {}: TCP (parse failed)", self.direction, src, dst)
+                                    }
                                 }
+                                _ => write!(f, "[{}] IPv6 {} > {}: proto {}", self.direction, src, dst, ipv6.get_next_header()),
                             }
-                            _ => trace!(
-                                "[{}] IPv6 {} > {}: proto {}",
-                                direction,
-                                src,
-                                dst,
-                                ipv6.get_next_header()
-                            ),
+                        } else {
+                            write!(f, "[{}] IPv6 packet (parse failed)", self.direction)
                         }
                     }
-                }
-                EtherTypes::Arp => {
-                    if let Some(arp) = ArpPacket::new(eth.payload()) {
-                        trace!(
-                            "[{}] ARP, {}, who has {}? Tell {}",
-                            direction,
-                            if arp.get_operation() == ArpOperations::Request {
-                                "request"
-                            } else {
-                                "reply"
-                            },
-                            arp.get_target_proto_addr(),
-                            arp.get_sender_proto_addr()
-                        );
+                    EtherTypes::Arp => {
+                        if let Some(arp) = ArpPacket::new(eth.payload()) {
+                            write!(f, "[{}] ARP, {}, who has {}? Tell {}",
+                                    self.direction,
+                                    if arp.get_operation() == ArpOperations::Request { "request" } else { "reply" },
+                                    arp.get_target_proto_addr(),
+                                    arp.get_sender_proto_addr())
+                        } else {
+                            write!(f, "[{}] ARP packet (parse failed)", self.direction)
+                        }
                     }
+                    _ => write!(f, "[{}] Unknown L3 protocol: {}", self.direction, eth.get_ethertype()),
                 }
-                _ => trace!(
-                    "[{}] Unknown L3 protocol: {}",
-                    direction,
-                    eth.get_ethertype()
-                ),
+            } else {
+                write!(f, "[{}] Ethernet packet (parse failed)", self.direction)
             }
         }
     }
@@ -2021,6 +2268,7 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
+            to_vm_control_buffer: VecDeque::new(),
         };
 
         proxy
