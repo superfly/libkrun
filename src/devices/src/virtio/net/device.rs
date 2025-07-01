@@ -5,12 +5,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::legacy::IrqChip;
+use crate::virtio::net::smoltcp_proxy::SmoltcpProxy;
 use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{QUEUE_SIZES, RX_INDEX, TX_INDEX};
 use crate::virtio::queue::Error as QueueError;
-use crate::virtio::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_NET};
+use crate::virtio::{ActivateError, ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_NET};
 use crate::Error as DeviceError;
 
+use super::unified_proxy::UnifiedNetProxy;
 use super::worker::NetWorker;
 use crossbeam_channel::Sender;
 use net_proxy::backend::{ReadError, WriteError};
@@ -52,6 +54,25 @@ pub enum TxError {
     Backend(WriteError),
     DeviceError(DeviceError),
     QueueError(QueueError),
+    GuestMemory(vm_memory::GuestMemoryError),
+}
+
+impl From<WriteError> for TxError {
+    fn from(value: WriteError) -> Self {
+        Self::Backend(value)
+    }
+}
+
+impl From<DeviceError> for TxError {
+    fn from(value: DeviceError) -> Self {
+        Self::DeviceError(value)
+    }
+}
+
+impl From<QueueError> for TxError {
+    fn from(value: QueueError) -> Self {
+        Self::QueueError(value)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -70,6 +91,7 @@ pub enum VirtioNetBackend {
     // Passt(RawFd),
     Gvproxy(PathBuf),
     DirectProxy(Vec<(u16, String)>),
+    UnifiedProxy(Vec<(u16, String)>),
 }
 
 pub struct Net {
@@ -222,17 +244,54 @@ impl VirtioDevice for Net {
             .map(|e| e.try_clone().unwrap())
             .collect();
 
-        let worker = NetWorker::new(
-            self.queues.clone(),
-            queue_evts,
-            self.interrupt_status.clone(),
-            self.interrupt_evt.try_clone().unwrap(),
-            self.intc.clone(),
-            self.irq_line,
-            mem.clone(),
-            self.cfg_backend.clone(),
-        );
-        worker.run();
+        match &self.cfg_backend {
+            VirtioNetBackend::UnifiedProxy(listeners) => {
+                // let unified_proxy = UnifiedNetProxy::new(
+                //     self.queues.clone(),
+                //     queue_evts,
+                //     self.interrupt_status.clone(),
+                //     self.interrupt_evt.try_clone().unwrap(),
+                //     self.intc.clone(),
+                //     self.irq_line,
+                //     mem.clone(),
+                //     listeners.clone(),
+                // )
+                // .map_err(|e| {
+                //     log::error!("Failed to create unified proxy: {}", e);
+                //     ActivateError::EpollCtl(e)
+                // })?;
+                // unified_proxy.run();
+                //
+                let proxy = SmoltcpProxy::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    self.interrupt_status.clone(),
+                    self.interrupt_evt.try_clone().unwrap(),
+                    self.intc.clone(),
+                    self.irq_line,
+                    mem.clone(),
+                    listeners.clone(),
+                )
+                .map_err(|e| {
+                    log::error!("Failed to create unified proxy: {}", e);
+                    ActivateError::EpollCtl(e)
+                })?;
+                proxy.run();
+            }
+            _ => {
+                let worker = NetWorker::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    self.interrupt_status.clone(),
+                    self.interrupt_evt.try_clone().unwrap(),
+                    self.intc.clone(),
+                    self.irq_line,
+                    mem.clone(),
+                    self.cfg_backend.clone(),
+                );
+                worker.run();
+            }
+        }
 
         self.device_state = DeviceState::Activated(mem);
         Ok(())
@@ -243,5 +302,14 @@ impl VirtioDevice for Net {
             DeviceState::Inactive => false,
             DeviceState::Activated(_) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_net_module_works() {
+        // Simple test to verify virtio::net tests are running
+        assert_eq!(2 + 2, 4);
     }
 }

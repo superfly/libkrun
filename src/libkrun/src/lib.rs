@@ -1516,7 +1516,7 @@ pub fn krun_start_enter(ctx_id: u32) -> i32 {
         NetworkConfig::DirectProxy(ref listeners) => {
             #[cfg(feature = "net")]
             {
-                let backend = VirtioNetBackend::DirectProxy(listeners.clone());
+                let backend = VirtioNetBackend::UnifiedProxy(listeners.clone());
                 create_virtio_net(&mut ctx_cfg, backend);
             }
         }

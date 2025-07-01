@@ -12,22 +12,22 @@ pub enum ConnectError {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ReadError {
-    /// Nothing was written
+    /// Nothing was read from the backend.
     NothingRead,
-    /// Another internal error occurred
+    /// Another internal error occurred.
     Internal(io::Error),
 }
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum WriteError {
-    /// Nothing was written, you can drop the frame or try to resend it later
+    /// Nothing was written; the frame can be dropped or resent later.
     NothingWritten,
-    /// Part of the buffer was written, the write has to be finished using try_finish_write
+    /// A partial write occurred; the write must be completed with `try_finish_write`.
     PartialWrite,
-    /// Passt doesnt seem to be running (received EPIPE)
+    /// The backend process does not seem to be running (e.g., received EPIPE).
     ProcessNotRunning,
-    /// Another internal error occurred
+    /// Another internal error occurred.
     Internal(io::Error),
 }
 
@@ -37,39 +37,37 @@ impl From<io::Error> for WriteError {
     }
 }
 
+/// A simplified trait for a network backend.
+///
+/// This version removes all token-based scheduling and flow control logic,
+/// delegating the responsibility of fairness and packet prioritization to the
+/// implementation itself. The `NetWorker` will treat any implementation of this
+
+/// trait as a simple source of packets.
 pub trait NetBackend {
+    /// Reads a single frame from the backend into the provided buffer.
+    /// The implementation is responsible for fairly selecting which connection's
+    /// frame to provide if multiple are available.
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError>;
+
+    /// Writes a single frame from the buffer to the backend.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
+
+    /// Checks if a previous write operation was incomplete.
     fn has_unfinished_write(&self) -> bool;
+
+    /// Attempts to complete an unfinished partial write.
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+
+    /// Returns the raw file descriptor for the backend's main event source.
+    /// This is typically a waker `EventFd` that is triggered when the backend
+    /// has packets ready for reading.
     fn raw_socket_fd(&self) -> RawFd;
 
+    /// Handles a mio event for a registered connection token.
+    /// This is called by the worker when a `mio::event::Event` is received
+    /// for a token other than the primary queue/backend tokens.
     fn handle_event(&mut self, _token: mio::Token, _is_readable: bool, _is_writable: bool) {
-        // do nothing
-    }
-    fn get_rx_queue_len(&self) -> usize {
-        0
-    }
-    fn resume_reading(&mut self) {}
-    
-    // Token-specific reading interface
-    fn get_ready_tokens(&self) -> Vec<mio::Token> {
-        // Default implementation returns empty - only advanced backends implement this
-        Vec::new()
-    }
-    
-    fn has_more_data_for_token(&self, _token: mio::Token) -> bool {
-        // Default implementation returns false
-        false
-    }
-    
-    fn read_frame_for_token(&mut self, _token: mio::Token, buf: &mut [u8]) -> Result<usize, ReadError> {
-        // Default implementation falls back to regular read_frame for backward compatibility
-        self.read_frame(buf)
-    }
-    
-    fn resume_tokens(&mut self, _tokens: &std::collections::HashSet<mio::Token>) {
-        // Default implementation falls back to regular resume_reading
-        self.resume_reading();
+        // Default implementation does nothing.
     }
 }

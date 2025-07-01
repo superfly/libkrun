@@ -13,6 +13,8 @@ pub const TX_INDEX: usize = 1;
 
 pub mod device;
 // mod passt;
+pub mod smoltcp_proxy;
+pub mod unified_proxy;
 mod worker;
 
 pub use self::device::Net;

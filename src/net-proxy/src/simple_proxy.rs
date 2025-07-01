@@ -583,15 +583,12 @@ impl NetProxy {
                         // - Data segments must have sequence number that exactly matches expected
                         // - ACK-only packets (no payload) may have same sequence as previous data segment
                         let payload = tcp_packet.payload();
-                        let flags = tcp_packet.get_flags();
-                        // ACK-only packets have no payload, only ACK flag, and no other control flags
-                        let is_ack_only = payload.is_empty() && 
-                                        (flags & TcpFlags::ACK) != 0 && 
-                                        (flags & (TcpFlags::SYN | TcpFlags::FIN | TcpFlags::RST)) == 0;
+                        let is_ack_only = payload.is_empty() && (tcp_packet.get_flags() & TcpFlags::ACK) != 0;
                         let is_valid_packet = incoming_seq == conn.tx_ack || 
                                             (is_ack_only && incoming_seq == conn.tx_ack.wrapping_sub(1));
                         
                         if is_valid_packet {
+                            let flags = tcp_packet.get_flags();
 
                             // An RST packet immediately terminates the connection.
                             if (flags & TcpFlags::RST) != 0 {
@@ -1025,48 +1022,12 @@ impl NetBackend for NetProxy {
         global_control_packets + data_packets + per_connection_control_packets
     }
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, crate::backend::ReadError> {
-        // Priority 1: Global control packets (ARP, DHCP, etc.)
         if let Some(popped) = self.to_vm_control_queue.pop_front() {
             let packet_len = popped.len();
             buf[..packet_len].copy_from_slice(&popped);
             return Ok(packet_len);
         }
 
-        // Priority 2: Per-connection control packets (TCP control like SYN, FIN, RST, ACK)
-        for (_token, conn) in self.host_connections.iter_mut() {
-            match conn {
-                AnyConnection::EgressConnecting(c) => {
-                    if let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                        let packet_len = packet.len();
-                        buf[..packet_len].copy_from_slice(&packet);
-                        return Ok(packet_len);
-                    }
-                }
-                AnyConnection::IngressConnecting(c) => {
-                    if let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                        let packet_len = packet.len();
-                        buf[..packet_len].copy_from_slice(&packet);
-                        return Ok(packet_len);
-                    }
-                }
-                AnyConnection::Established(c) => {
-                    if let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                        let packet_len = packet.len();
-                        buf[..packet_len].copy_from_slice(&packet);
-                        return Ok(packet_len);
-                    }
-                }
-                AnyConnection::Closing(c) => {
-                    if let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                        let packet_len = packet.len();
-                        buf[..packet_len].copy_from_slice(&packet);
-                        return Ok(packet_len);
-                    }
-                }
-            }
-        }
-
-        // Priority 3: Data packets
         if let Some(token) = self.data_run_queue.pop_front() {
             if let Some(conn) = self.host_connections.get_mut(&token) {
                 if let Some(packet) = conn.to_vm_buffer_mut().pop_front() {
@@ -1462,29 +1423,6 @@ impl NetBackend for NetProxy {
             for token in self.connections_to_remove.drain(..) {
                 info!(?token, "Cleaning up fully closed connection.");
                 if let Some(mut conn) = self.host_connections.remove(&token) {
-                    // Move any remaining control packets to the global queue before cleanup
-                    match &mut conn {
-                        AnyConnection::EgressConnecting(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                self.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::IngressConnecting(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                self.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::Established(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                self.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::Closing(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                self.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                    }
                     let _ = self.registry.deregister(conn.stream_mut());
                 }
                 if let Some(key) = self.reverse_tcp_nat.remove(&token) {
@@ -1839,7 +1777,7 @@ fn build_arp_reply(packet_buf: &mut BytesMut, request: &ArpPacket) -> Bytes {
     packet_buf.clone().freeze()
 }
 
-pub fn build_tcp_packet(
+fn build_tcp_packet(
     packet_buf: &mut BytesMut,
     nat_key: NatKey,
     tx_seq: u32,
@@ -1986,7 +1924,7 @@ fn build_ipv6_tcp_packet(
     packet_buf.clone().freeze()
 }
 
-pub fn build_udp_packet(packet_buf: &mut BytesMut, nat_key: NatKey, payload: &[u8]) -> Bytes {
+fn build_udp_packet(packet_buf: &mut BytesMut, nat_key: NatKey, payload: &[u8]) -> Bytes {
     let (key_src_ip, key_src_port, key_dst_ip, key_dst_port) = nat_key;
     let (packet_src_ip, packet_src_port, packet_dst_ip, packet_dst_port) =
         (key_dst_ip, key_dst_port, key_src_ip, key_src_port); // Always a reply
@@ -2196,7 +2134,7 @@ mod tests {
     use mio::Poll;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     /// An enhanced mock HostStream for precise control over test scenarios.
     #[derive(Default, Debug)]
@@ -2343,14 +2281,6 @@ mod tests {
     }
 
     /// A helper function to provide detailed assertions on a captured packet.
-    fn read_next_packet(proxy: &mut NetProxy) -> Option<Bytes> {
-        let mut packet_buf = [0u8; 1500];
-        match proxy.read_frame(&mut packet_buf) {
-            Ok(packet_len) => Some(Bytes::copy_from_slice(&packet_buf[..packet_len])),
-            Err(_) => None,
-        }
-    }
-
     fn assert_packet(
         packet_bytes: &Bytes,
         expected_src_ip: IpAddr,
@@ -2425,7 +2355,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy
             .host_connections
@@ -2548,7 +2477,8 @@ mod tests {
         let token = *proxy.tcp_nat_table.get(&nat_key).unwrap();
         proxy.handle_event(token, false, true);
 
-        let packet_to_vm = read_next_packet(&mut proxy).expect("Should have a SYN-ACK packet");
+        assert_eq!(proxy.to_vm_control_queue.len(), 1);
+        let packet_to_vm = proxy.to_vm_control_queue.pop_front().unwrap();
 
         let proxy_initial_seq =
             if let AnyConnection::Established(conn) = proxy.host_connections.get(&token).unwrap() {
@@ -2598,7 +2528,8 @@ mod tests {
 
         assert_eq!(*host_write_buffer.lock().unwrap(), b"0123456789");
 
-        let packet_to_vm = read_next_packet(&mut proxy).expect("Should have a control packet");
+        assert_eq!(proxy.to_vm_control_queue.len(), 1);
+        let packet_to_vm = proxy.to_vm_control_queue.pop_front().unwrap();
 
         assert_packet(
             &packet_to_vm,
@@ -2637,10 +2568,8 @@ mod tests {
         }
         proxy.handle_event(token, true, false);
 
-        // Use read_frame to get the FIN packet (now served from per-connection control buffers)
-        let mut packet_buf = [0u8; 1500];
-        let packet_len = proxy.read_frame(&mut packet_buf).expect("Should have a FIN packet");
-        let packet_to_vm = Bytes::copy_from_slice(&packet_buf[..packet_len]);
+        assert_eq!(proxy.to_vm_control_queue.len(), 1);
+        let packet_to_vm = proxy.to_vm_control_queue.pop_front().unwrap();
 
         assert_packet(
             &packet_to_vm,
@@ -2718,7 +2647,7 @@ mod tests {
             proxy.host_connections.get(&token).unwrap(),
             AnyConnection::Established(_)
         ));
-        let _syn_ack_packet = read_next_packet(&mut proxy).expect("Should have SYN-ACK packet");
+        assert_eq!(proxy.to_vm_control_queue.len(), 1);
     }
 
     #[test]
@@ -2769,8 +2698,9 @@ mod tests {
             proxy.host_connections.get(&token).unwrap(),
             AnyConnection::Closing(_)
         ));
-        let packet_bytes = read_next_packet(&mut proxy).expect("Should have FIN packet");
-        let eth_packet = EthernetPacket::new(&packet_bytes).unwrap();
+        assert_eq!(proxy.to_vm_control_queue.len(), 1);
+        let packet_bytes = proxy.to_vm_control_queue.front().unwrap();
+        let eth_packet = EthernetPacket::new(packet_bytes).unwrap();
         let ipv4_packet = Ipv4Packet::new(eth_packet.payload()).unwrap();
         let tcp_packet = TcpPacket::new(ipv4_packet.payload()).unwrap();
         assert_eq!(tcp_packet.get_flags() & TcpFlags::FIN, TcpFlags::FIN);
@@ -2807,7 +2737,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy.tcp_nat_table.insert(nat_key, token);
         proxy.reverse_tcp_nat.insert(token, nat_key);
@@ -2848,10 +2777,10 @@ mod tests {
                 .len()
         };
 
-        // With aggressive backpressure, connection pauses at 8+ packets instead of 2048
-        assert!(
-            get_buffer_len(&proxy) > 8,
-            "Connection's to_vm_buffer should have triggered aggressive backpressure (8+ packets)"
+        assert_eq!(
+            get_buffer_len(&proxy),
+            MAX_PROXY_QUEUE_SIZE,
+            "Connection's to_vm_buffer should be full"
         );
 
         // *** NEW/ADJUSTED PART OF THE TEST ***
@@ -2860,10 +2789,10 @@ mod tests {
         proxy.handle_event(token, true, false);
 
         // Assert that the buffer size has NOT increased, proving the read was skipped.
-        let buffer_len_after_ignored_read = get_buffer_len(&proxy);
-        assert!(
-            buffer_len_after_ignored_read > 8,
-            "Buffer size should remain above aggressive backpressure threshold when read is paused"
+        assert_eq!(
+            get_buffer_len(&proxy),
+            MAX_PROXY_QUEUE_SIZE,
+            "Buffer size should not increase when a read is paused"
         );
 
         // WHEN: an ACK is received from the VM, the connection should un-pause
@@ -2916,7 +2845,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy
             .host_connections
@@ -3015,7 +2943,12 @@ mod tests {
             "Connection should be in the IngressConnecting state"
         );
 
-        let syn_to_vm = read_next_packet(&mut proxy).expect("Proxy should have one packet to send to the VM");
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            1,
+            "Proxy should have one packet to send to the VM"
+        );
+        let syn_to_vm = proxy.to_vm_control_queue.pop_front().unwrap();
 
         // *** FIX START: Un-chain the method calls to extend lifetimes ***
         let eth_syn = EthernetPacket::new(&syn_to_vm).expect("Failed to parse SYN Ethernet frame");
@@ -3061,7 +2994,13 @@ mod tests {
         );
 
         info!("Verifying proxy sent final ACK of 3-way handshake");
-        let final_ack_to_vm = read_next_packet(&mut proxy).expect("Proxy should have sent the final ACK packet to the VM");
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            1,
+            "Proxy should have sent the final ACK packet to the VM"
+        );
+
+        let final_ack_to_vm = proxy.to_vm_control_queue.pop_front().unwrap();
 
         // *** FIX START: Un-chain the method calls to extend lifetimes ***
         let eth_ack = EthernetPacket::new(&final_ack_to_vm)
@@ -3120,7 +3059,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy
             .host_connections
@@ -3135,8 +3073,13 @@ mod tests {
         // 3. ASSERTIONS
         info!("Verifying proxy sent RST to VM and is cleaning up");
         // Assert that a RST packet was sent to the VM.
-        let rst_packet = read_next_packet(&mut proxy).expect("Proxy should send one packet to VM");
-        let eth = EthernetPacket::new(&rst_packet).unwrap();
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            1,
+            "Proxy should send one packet to VM"
+        );
+        let rst_packet = proxy.to_vm_control_queue.front().unwrap();
+        let eth = EthernetPacket::new(rst_packet).unwrap();
         let ip = Ipv4Packet::new(eth.payload()).unwrap();
         let tcp = TcpPacket::new(ip.payload()).unwrap();
         assert_eq!(
@@ -3175,7 +3118,6 @@ mod tests {
                 state: Established,
                 write_buffer: VecDeque::new(),
                 to_vm_buffer: VecDeque::new(),
-                to_vm_control_buffer: VecDeque::new(),
             };
             // When the proxy sends a FIN, its sequence number is incremented.
             let mut conn_after_fin = est_conn.close();
@@ -3241,7 +3183,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy
             .host_connections
@@ -3334,7 +3275,6 @@ mod tests {
             state: Established,
             write_buffer: VecDeque::new(),
             to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
         };
         proxy
             .host_connections
@@ -3360,9 +3300,14 @@ mod tests {
 
         // 3. ASSERTIONS
         info!("Step 3: Verifying proxy's responses");
-        
+        assert_eq!(
+            proxy.to_vm_control_queue.len(),
+            2,
+            "Proxy should have sent two packets to the VM"
+        );
+
         // Check Packet 1: The proxy's FIN
-        let proxy_fin_packet = read_next_packet(&mut proxy).expect("Proxy should have sent FIN packet");
+        let proxy_fin_packet = proxy.to_vm_control_queue.pop_front().unwrap();
         // *** FIX START: Un-chain method calls to extend lifetimes ***
         let eth_fin =
             EthernetPacket::new(&proxy_fin_packet).expect("Failed to parse FIN Ethernet frame");
@@ -3381,7 +3326,7 @@ mod tests {
         );
 
         // Check Packet 2: The proxy's ACK of the VM's FIN
-        let proxy_ack_packet = read_next_packet(&mut proxy).expect("Proxy should have sent ACK packet");
+        let proxy_ack_packet = proxy.to_vm_control_queue.pop_front().unwrap();
         // *** FIX START: Un-chain method calls to extend lifetimes ***
         let eth_ack =
             EthernetPacket::new(&proxy_ack_packet).expect("Failed to parse ACK Ethernet frame");
@@ -3414,23 +3359,25 @@ mod tests {
         info!("Simultaneous close test passed.");
     }
 
-    /// Test that verifies realistic pause/unpause behavior based on buffer drainage
+    /// Test that verifies interest registration during pause/unpause cycles
     #[test]
-    fn test_realistic_pause_unpause_behavior() {
+    fn test_interest_registration_during_pause_unpause() {
         _ = tracing_subscriber::fmt::try_init();
         let poll = Poll::new().unwrap();
         let registry = poll.registry().try_clone().unwrap();
-        let (mut proxy, token, nat_key, _, _) = setup_proxy_with_established_conn(registry);
+        let (mut proxy, token, nat_key, write_buffer, _) = setup_proxy_with_established_conn(registry);
 
-        // Step 1: Fill buffer to trigger aggressive backpressure pausing (8+ packets)
+        // Fill up the buffer to trigger pausing
         if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            for i in 0..10 {
+            // Fill the to_vm_buffer to MAX_PROXY_QUEUE_SIZE
+            for i in 0..MAX_PROXY_QUEUE_SIZE {
+                let data = format!("packet_{}", i);
                 let packet = build_tcp_packet(
                     &mut BytesMut::new(),
                     nat_key,
                     1000 + i as u32,
                     2000,
-                    Some(b"test_data"),
+                    Some(data.as_bytes()),
                     Some(TcpFlags::ACK | TcpFlags::PSH),
                     65535,
                 );
@@ -3438,84 +3385,142 @@ mod tests {
             }
         }
 
-        // Step 2: Trigger pausing via handle_event 
+        // Simulate readable event that should trigger pausing
         proxy.handle_event(token, true, false);
-        assert!(proxy.paused_reads.contains(&token), "Connection should be paused due to buffer size");
 
-        // Step 3: Simulate VM reading most packets (partial drainage to below resume threshold)
+        // Verify the connection is paused
+        assert!(proxy.paused_reads.contains(&token), "Connection should be paused");
+
+        // Now simulate VM sending an ACK packet to unpause
+        let ack_packet = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            2000,
+            1001, // Acknowledge 1 byte
+            None,
+            Some(TcpFlags::ACK),
+            65535,
+        );
+
+        // This should unpause the connection
+        proxy.handle_packet_from_vm(&ack_packet).unwrap();
+
+        // Verify the connection is unpaused
+        assert!(!proxy.paused_reads.contains(&token), "Connection should be unpaused");
+
+        // Now simulate the problematic scenario: buffer fills again
         if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            // Remove 7 packets, leaving 3 (below the 4-packet resume threshold)
-            for _ in 0..7 {
-                conn.to_vm_buffer.pop_front();
+            // Fill the buffer again, but clear the old packets first
+            conn.to_vm_buffer.clear();
+            for i in 0..MAX_PROXY_QUEUE_SIZE {
+                let data = format!("packet2_{}", i);
+                let packet = build_tcp_packet(
+                    &mut BytesMut::new(),
+                    nat_key,
+                    2000 + i as u32,
+                    2000,
+                    Some(data.as_bytes()),
+                    Some(TcpFlags::ACK | TcpFlags::PSH),
+                    65535,
+                );
+                conn.to_vm_buffer.push_back(packet);
             }
         }
 
-        // Step 4: Manually trigger the unpause logic since we can't easily simulate the full event flow
+        // Trigger pausing again
+        proxy.handle_event(token, true, false);
+        assert!(proxy.paused_reads.contains(&token), "Connection should be paused again");
+
+        // Verify the connection still exists and is in correct state
+        assert!(matches!(
+            proxy.host_connections.get(&token).unwrap(),
+            AnyConnection::Established(_)
+        ), "Connection should still be established");
+
+        // Now test the critical unpause scenario with completely drained buffer
         if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            let resume_threshold = 4; // Aggressive backpressure resume threshold from implementation
-            if conn.to_vm_buffer.len() <= resume_threshold && proxy.paused_reads.contains(&token) {
-                proxy.paused_reads.remove(&token);
-                println!("✅ Connection unpaused: buffer={} <= threshold={}", conn.to_vm_buffer.len(), resume_threshold);
-            }
+            // Completely drain the buffer to simulate VM reading all packets
+            conn.to_vm_buffer.clear();
         }
 
-        // Step 5: Verify connection is now unpaused
-        assert!(!proxy.paused_reads.contains(&token), "Connection should be unpaused after buffer drainage");
-        assert!(proxy.host_connections.contains_key(&token), "Connection should still exist");
+        // Send another ACK that should unpause and re-register for reads
+        let ack_packet2 = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            2000,
+            1002, // Acknowledge another byte
+            None,
+            Some(TcpFlags::ACK),
+            65535,
+        );
 
-        println!("Realistic pause/unpause test passed!");
+        proxy.handle_packet_from_vm(&ack_packet2).unwrap();
+
+        // Verify successful unpause
+        assert!(!proxy.paused_reads.contains(&token), "Connection should be unpaused after drain");
+
+        // Connection should still be properly registered and ready for new events
+        assert!(matches!(
+            proxy.host_connections.get(&token).unwrap(),
+            AnyConnection::Established(_)
+        ), "Connection should remain established and properly registered");
+
+        println!("Interest registration test passed!");
     }
 
-    /// Test basic backpressure pause/unpause without complex ACK logic
+    /// Test specifically for the deregistration scenario
     #[test] 
-    fn test_simple_backpressure_pause_unpause() {
+    fn test_deregistration_and_reregistration() {
         _ = tracing_subscriber::fmt::try_init();
         let poll = Poll::new().unwrap();
         let registry = poll.registry().try_clone().unwrap();
         let (mut proxy, token, nat_key, _, _) = setup_proxy_with_established_conn(registry);
 
-        // Verify connection starts unpaused
-        assert!(!proxy.paused_reads.contains(&token), "Connection should start unpaused");
-
-        // Step 1: Fill buffer to cause aggressive backpressure pausing
+        // Step 1: Fill buffer to cause pausing
         if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            for i in 0..12 {  // Fill well above the 8-packet aggressive threshold
+            for i in 0..MAX_PROXY_QUEUE_SIZE {
                 let packet = build_tcp_packet(
                     &mut BytesMut::new(),
                     nat_key,
                     1000 + i as u32,
                     2000,
-                    Some(b"test"),
+                    Some(b"data"),
                     Some(TcpFlags::ACK | TcpFlags::PSH),
                     65535,
                 );
                 conn.to_vm_buffer.push_back(packet);
             }
+            // Clear write buffer to simulate no pending writes
+            conn.write_buffer.clear();
         }
 
-        // Step 2: Trigger pause via handle_event
+        // Step 2: Handle event that should cause deregistration (paused + no writes)
         proxy.handle_event(token, true, false);
-        assert!(proxy.paused_reads.contains(&token), "Connection should be paused after buffer fill");
+        assert!(proxy.paused_reads.contains(&token));
 
-        // Step 3: Simulate VM consuming packets (drain buffer completely)
+        // Step 3: Clear the buffer completely
         if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            conn.to_vm_buffer.clear(); // VM reads all packets
+            conn.to_vm_buffer.clear();
         }
 
-        // Step 4: Manually trigger unpause check (simulates what would happen in real flow)
-        if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            let resume_threshold = 4;
-            if conn.to_vm_buffer.len() <= resume_threshold && proxy.paused_reads.contains(&token) {
-                proxy.paused_reads.remove(&token);
-                println!("✅ Connection unpaused: buffer drained to {} packets", conn.to_vm_buffer.len());
-            }
-        }
+        // Step 4: Send ACK to trigger unpause - this tests the critical reregistration path
+        let ack_packet = build_tcp_packet(
+            &mut BytesMut::new(),
+            nat_key,
+            2000,
+            1001,
+            None,
+            Some(TcpFlags::ACK),
+            65535,
+        );
 
-        // Step 5: Verify unpause worked
-        assert!(!proxy.paused_reads.contains(&token), "Connection should be unpaused after drain");
+        // This should successfully reregister the deregistered stream
+        proxy.handle_packet_from_vm(&ack_packet).unwrap();
+        
+        assert!(!proxy.paused_reads.contains(&token), "Should be unpaused");
         assert!(proxy.host_connections.contains_key(&token), "Connection should still exist");
 
-        println!("Simple backpressure test passed!");
+        println!("Deregistration/reregistration test passed!");
     }
 
     #[test]
@@ -3773,1283 +3778,5 @@ mod tests {
         assert_eq!(tcp_packet2.get_flags(), TcpFlags::RST, "Wrong flags for RST packet");
 
         println!("Edge cases test passed!");
-    }
-
-    // Tests for performance improvements and regression prevention
-    #[test]
-    fn test_get_ready_tokens_includes_paused_connections_with_buffered_data() {
-        // Test that paused connections with buffered VM data are included in ready tokens
-        // This prevents the deadlock where paused connections can't drain their buffers
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        let token = Token(10);
-        let mut mock_stream = MockHostStream::default();
-        
-        // Create an established connection with buffered data
-        let conn = TcpConnection {
-            stream: Box::new(mock_stream),
-            tx_seq: 1000,
-            tx_ack: 2000,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: {
-                let mut buffer = VecDeque::new();
-                buffer.push_back(Bytes::from_static(b"buffered_data1"));
-                buffer.push_back(Bytes::from_static(b"buffered_data2"));
-                buffer
-            },
-            to_vm_control_buffer: VecDeque::new(),
-            state: Established,
-        };
-        
-        proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        
-        // Pause the connection due to backpressure
-        proxy.paused_reads.insert(token);
-        
-        // get_ready_tokens should include the paused connection because it has buffered VM data
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(ready_tokens.contains(&token), 
-               "Paused connection with buffered VM data should be included in ready tokens");
-    }
-
-    #[test]
-    fn test_get_ready_tokens_excludes_paused_connections_without_buffered_data() {
-        // Test that paused connections without buffered VM data are NOT included in ready tokens
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        let token = Token(10);
-        let mock_stream = MockHostStream::default();
-        
-        // Create an established connection without buffered data
-        let conn = TcpConnection {
-            stream: Box::new(mock_stream),
-            tx_seq: 1000,
-            tx_ack: 2000,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: VecDeque::new(), // Empty buffer
-            to_vm_control_buffer: VecDeque::new(), // Empty control buffer
-            state: Established,
-        };
-        
-        proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        
-        // Pause the connection due to backpressure
-        proxy.paused_reads.insert(token);
-        
-        // get_ready_tokens should NOT include the paused connection since it has no buffered VM data
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(!ready_tokens.contains(&token), 
-               "Paused connection without buffered VM data should NOT be included in ready tokens");
-    }
-
-    #[test]
-    fn test_has_more_data_for_token_tracks_both_buffers() {
-        // Test that has_more_data_for_token correctly checks both data and control buffers
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        let token = Token(10);
-        
-        // Test with empty buffers
-        assert!(!proxy.has_more_data_for_token(token), "Should return false for non-existent token");
-        
-        // Add the mock backend tests here to verify has_more_data_for_token behavior
-        // This would require refactoring to make the method testable with mock connections
-    }
-
-    #[test]
-    fn test_netproxy_signaling_on_buffered_data() {
-        // Test that NetProxy signals the waker when read_frame_for_token returns NothingRead
-        // but the connection still has buffered data for the VM
-        
-        // This test verifies the fix that prevents stalling when NetWorker hits packet budget
-        // but NetProxy still has data to deliver
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        let token = Token(10);
-        let mock_stream = MockHostStream::default();
-        
-        // Create connection with buffered data
-        let conn = TcpConnection {
-            stream: Box::new(mock_stream),
-            tx_seq: 1000,
-            tx_ack: 2000,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: {
-                let mut buffer = VecDeque::new();
-                buffer.push_back(Bytes::from_static(b"data1"));
-                buffer.push_back(Bytes::from_static(b"data2"));
-                buffer
-            },
-            to_vm_control_buffer: VecDeque::new(),
-            state: Established,
-        };
-        
-        proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        
-        // Simulate the case where NetWorker reads one packet and hits budget
-        let mut buf = vec![0u8; 1000];
-        let result1 = proxy.read_frame_for_token(token, &mut buf);
-        assert!(result1.is_ok(), "First read should succeed");
-        
-        // Second read should return NothingRead when no more budget, but should signal waker
-        // because there's still buffered data
-        
-        // In the real implementation, this would trigger waker.write(1) in the 
-        // "NothingRead but still have buffered data" logic
-        let has_more_data = proxy.has_more_data_for_token(token);
-        assert!(has_more_data, "Should still have buffered data after first read");
-    }
-
-    #[test]
-    fn test_backpressure_preserves_vm_delivery() {
-        // Test that aggressive backpressure pauses host reads but preserves VM delivery
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        let token = Token(10);
-        let mock_stream = MockHostStream::default();
-        
-        // Create connection with many buffered packets (trigger backpressure)
-        let conn = TcpConnection {
-            stream: Box::new(mock_stream),
-            tx_seq: 1000,
-            tx_ack: 2000,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: {
-                let mut buffer = VecDeque::new();
-                // Add more packets than resume threshold (4) to trigger backpressure
-                for i in 0..10 {
-                    buffer.push_back(Bytes::from(format!("packet_{}", i)));
-                }
-                buffer
-            },
-            to_vm_control_buffer: VecDeque::new(),
-            state: Established,
-        };
-        
-        proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        
-        let buffer_len = proxy.host_connections.get(&token).unwrap().to_vm_buffer().len();
-        let resume_threshold = 4;
-        
-        // Host reads should be paused due to backpressure
-        let should_pause_host_reads = buffer_len > resume_threshold;
-        assert!(should_pause_host_reads, "Host reads should be paused when buffer is full");
-        
-        // But VM delivery should continue - token should be in ready tokens
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(ready_tokens.contains(&token), 
-               "Token should be ready for VM delivery despite backpressure");
-    }
-
-    #[test]
-    fn test_per_token_budget_fairness() {
-        // Test that multiple connections get fair processing with per-token budgets
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        // Create multiple connections with different amounts of buffered data
-        for token_id in 10..13 {
-            let token = Token(token_id);
-            let mock_stream = MockHostStream::default();
-            
-            let packet_count = if token_id == 10 { 15 } else if token_id == 11 { 5 } else { 8 };
-            
-            let conn = TcpConnection {
-                stream: Box::new(mock_stream),
-                tx_seq: 1000,
-                tx_ack: 2000,
-                write_buffer: VecDeque::new(),
-                to_vm_buffer: {
-                    let mut buffer = VecDeque::new();
-                    for i in 0..packet_count {
-                        buffer.push_back(Bytes::from(format!("token_{}_packet_{}", token_id, i)));
-                    }
-                    buffer
-                },
-                to_vm_control_buffer: VecDeque::new(),
-                state: Established,
-            };
-            
-            proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        }
-        
-        // All tokens should be ready regardless of their buffer sizes
-        let ready_tokens = proxy.get_ready_tokens();
-        assert_eq!(ready_tokens.len(), 3, "All connections should be ready");
-        assert!(ready_tokens.contains(&Token(10)), "Token 10 should be ready");
-        assert!(ready_tokens.contains(&Token(11)), "Token 11 should be ready");
-        assert!(ready_tokens.contains(&Token(12)), "Token 12 should be ready");
-        
-        // Each token should be able to deliver its packets according to per-token budget
-        // Token 10: 15 packets -> should get 8 in first round, 7 in second round
-        // Token 11: 5 packets -> should get all 5 in first round
-        // Token 12: 8 packets -> should get all 8 in first round
-        
-        for &token in &ready_tokens {
-            assert!(proxy.has_more_data_for_token(token), 
-                   "Token {:?} should have data for processing", token);
-        }
-    }
-
-    #[test]
-    fn test_no_regression_in_waker_signaling() {
-        // Test that the waker signaling improvements don't break existing functionality
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(Arc::new(EventFd::new(0).unwrap()), registry, 10, vec![]).unwrap();
-        
-        // Test case 1: No connections -> no signaling needed
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(ready_tokens.is_empty(), "Should have no ready tokens with no connections");
-        
-        // Test case 2: Connections with no buffered data -> no signaling needed
-        let token = Token(10);
-        let mock_stream = MockHostStream::default();
-        
-        let conn = TcpConnection {
-            stream: Box::new(mock_stream),
-            tx_seq: 1000,
-            tx_ack: 2000,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
-            state: Established,
-        };
-        
-        proxy.host_connections.insert(token, AnyConnection::Established(conn));
-        
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(ready_tokens.contains(&token), "Established connection should be ready for potential reads");
-        assert!(!proxy.has_more_data_for_token(token), "Should have no buffered data");
-        
-        // Test case 3: Only control queue has data
-        proxy.to_vm_control_queue.push_back(Bytes::from_static(b"control_packet"));
-        let ready_tokens = proxy.get_ready_tokens();
-        assert!(ready_tokens.contains(&Token(0)), "Control token should be ready");
-    }
-
-    /// Test for memory leaks in connection creation and cleanup
-    #[test]
-    fn test_memory_leak_connection_cleanup() {
-        _ = tracing_subscriber::fmt::try_init();
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let (mut proxy, _, _, _, _) = setup_proxy_with_established_conn(registry);
-
-        let initial_connection_count = proxy.host_connections.len();
-        let initial_tcp_nat_count = proxy.tcp_nat_table.len();
-        let initial_reverse_nat_count = proxy.reverse_tcp_nat.len();
-        
-        // Create and cleanup many connections to check for leaks
-        for i in 0..100 {
-            let nat_key = (
-                IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-                (60000 + i) as u16, // Use higher port range to avoid collisions with existing test setup
-                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                (443 + i) as u16, // Also vary destination port to ensure unique keys
-            );
-            let token = Token(1000 + i); // Use higher token range to avoid collisions
-            
-            // Add connection to NAT tables and connections map
-            proxy.tcp_nat_table.insert(nat_key, token);
-            proxy.reverse_tcp_nat.insert(token, nat_key);
-            
-            let mock_stream = MockHostStream::default();
-            let conn = TcpConnection {
-                stream: Box::new(mock_stream),
-                tx_seq: 1000,
-                tx_ack: 2000,
-                write_buffer: VecDeque::new(),
-                to_vm_buffer: VecDeque::new(),
-                to_vm_control_buffer: VecDeque::new(),
-                state: Established,
-            };
-            proxy.host_connections.insert(token, AnyConnection::Established(conn));
-            
-            // Add some data to buffers to simulate real usage
-            if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-                for j in 0..5 {
-                    let packet = build_tcp_packet(
-                        &mut BytesMut::new(),
-                        nat_key,
-                        1000 + j * 10,
-                        2000,
-                        Some(b"test_data"),
-                        Some(TcpFlags::ACK | TcpFlags::PSH),
-                        65535,
-                    );
-                    conn.to_vm_buffer.push_back(packet);
-                }
-            }
-            
-            // Mark for removal (simulating connection close)
-            proxy.connections_to_remove.push(token);
-        }
-        
-        // Verify connections were created
-        assert_eq!(proxy.host_connections.len(), initial_connection_count + 100);
-        assert_eq!(proxy.tcp_nat_table.len(), initial_tcp_nat_count + 100);
-        assert_eq!(proxy.reverse_tcp_nat.len(), initial_reverse_nat_count + 100);
-        assert_eq!(proxy.connections_to_remove.len(), 100);
-        
-        // Process cleanup (this is normally done at the end of event loop)
-        // Manually execute the cleanup logic
-        if !proxy.connections_to_remove.is_empty() {
-            for token in proxy.connections_to_remove.drain(..) {
-                if let Some(mut conn) = proxy.host_connections.remove(&token) {
-                    // Move any remaining control packets to the global queue before cleanup
-                    match &mut conn {
-                        AnyConnection::EgressConnecting(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                proxy.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::IngressConnecting(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                proxy.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::Established(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                proxy.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        AnyConnection::Closing(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                proxy.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                    }
-                    
-                    // Remove from registry if needed
-                    let _ = proxy.registry.deregister(conn.stream_mut());
-                }
-                
-                // Remove from NAT tables
-                if let Some(nat_key) = proxy.reverse_tcp_nat.remove(&token) {
-                    proxy.tcp_nat_table.remove(&nat_key);
-                }
-                
-                // Remove from paused reads
-                proxy.paused_reads.remove(&token);
-            }
-        }
-        
-        // Verify all connections and mappings were properly cleaned up
-        assert_eq!(proxy.host_connections.len(), initial_connection_count, 
-                  "Host connections should be cleaned up, found {} extra", 
-                  proxy.host_connections.len() - initial_connection_count);
-        assert_eq!(proxy.tcp_nat_table.len(), initial_tcp_nat_count,
-                  "TCP NAT table should be cleaned up, found {} extra entries",
-                  proxy.tcp_nat_table.len() - initial_tcp_nat_count);
-        assert_eq!(proxy.reverse_tcp_nat.len(), initial_reverse_nat_count,
-                  "Reverse NAT table should be cleaned up, found {} extra entries", 
-                  proxy.reverse_tcp_nat.len() - initial_reverse_nat_count);
-        assert_eq!(proxy.connections_to_remove.len(), 0,
-                  "Connections to remove list should be empty");
-        
-        // Verify no stale paused connections remain
-        assert!(proxy.paused_reads.is_empty(), "No connections should remain paused after cleanup");
-        
-        println!("Memory leak test passed - all {} connections properly cleaned up!", 100);
-    }
-
-    /// Test handling of malformed packets
-    #[test]
-    fn test_malformed_packet_handling() {
-        _ = tracing_subscriber::fmt::try_init();
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let (mut proxy, _, _, _, _) = setup_proxy_with_established_conn(registry);
-
-        // Test 1: Packet too small to contain Ethernet header
-        let tiny_packet = vec![0u8; 10];
-        let result = proxy.handle_packet_from_vm(&tiny_packet);
-        assert!(result.is_err(), "Should reject packet too small for Ethernet header");
-
-        // Test 2: Invalid Ethernet type
-        let mut bad_eth_packet = vec![0u8; 60];
-        // Set MACs
-        bad_eth_packet[0..6].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]); // dst
-        bad_eth_packet[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x01, 0x02, 0x03]); // src
-        // Set invalid ethertype (not IPv4/IPv6/ARP)
-        bad_eth_packet[12..14].copy_from_slice(&[0x12, 0x34]);
-        let result = proxy.handle_packet_from_vm(&bad_eth_packet);
-        // This should be handled gracefully (not cause panic)
-        assert!(result.is_ok() || result.is_err(), "Should handle invalid ethertype gracefully");
-
-        // Test 3: IPv4 packet with invalid header length
-        let mut bad_ip_packet = vec![0u8; 60];
-        // Ethernet header
-        bad_ip_packet[0..6].copy_from_slice(&[0x02, 0x00, 0x00, 0x01, 0x02, 0x03]); // dst
-        bad_ip_packet[6..12].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]); // src
-        bad_ip_packet[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
-        // IPv4 header with invalid IHL (header length)
-        bad_ip_packet[14] = 0x41; // Version 4, IHL 1 (invalid - minimum is 5)
-        let result = proxy.handle_packet_from_vm(&bad_ip_packet);
-        // Should not panic - packet parsing should fail gracefully
-        assert!(result.is_ok() || result.is_err(), "Should handle invalid IP header length gracefully");
-
-        // Test 4: TCP packet with data offset smaller than minimum
-        let nat_key = (
-            IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-            50000,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            443,
-        );
-        let good_tcp_packet = build_tcp_packet(
-            &mut BytesMut::new(),
-            nat_key,
-            1000,
-            2000,
-            Some(b"data"),
-            Some(TcpFlags::ACK),
-            65535,
-        );
-        
-        // Create a mutable copy to corrupt the TCP data offset field
-        let mut bad_tcp_packet = good_tcp_packet.to_vec();
-        if let Some(_eth_packet) = EthernetPacket::new(&bad_tcp_packet) {
-            if let Some(_ip_packet) = Ipv4Packet::new(&bad_tcp_packet[14..]) {
-                // TCP header starts at IP payload offset 12 (flags and data offset)
-                let tcp_offset = 14 + 20; // Ethernet + IP headers
-                if tcp_offset + 12 < bad_tcp_packet.len() {
-                    bad_tcp_packet[tcp_offset + 12] = 0x10; // Data offset = 1 (invalid, min is 5)
-                }
-            }
-        }
-        
-        let result = proxy.handle_packet_from_vm(&bad_tcp_packet);
-        assert!(result.is_ok() || result.is_err(), "Should handle invalid TCP data offset gracefully");
-
-        println!("Malformed packet handling test passed!");
-    }
-
-    /// Test buffer overflow and resource exhaustion scenarios
-    #[test]
-    fn test_buffer_overflow_resource_exhaustion() {
-        _ = tracing_subscriber::fmt::try_init();
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let (mut proxy, token, nat_key, _, _) = setup_proxy_with_established_conn(registry);
-
-        // Test 1: Fill buffer beyond MAX_PROXY_QUEUE_SIZE and verify it's properly bounded
-        if let Some(AnyConnection::Established(conn)) = proxy.host_connections.get_mut(&token) {
-            // Try to add way more packets than the maximum allowed
-            let excessive_packets = MAX_PROXY_QUEUE_SIZE + 1000;
-            for i in 0..excessive_packets {
-                let packet = build_tcp_packet(
-                    &mut BytesMut::new(),
-                    nat_key,
-                    1000 + i as u32,
-                    2000,
-                    Some(b"overflow_test_data"),
-                    Some(TcpFlags::ACK | TcpFlags::PSH),
-                    65535,
-                );
-                conn.to_vm_buffer.push_back(packet);
-            }
-            
-            // Verify buffer size - this reveals a real bug! 
-            println!("Buffer size after overflow attempt: {}", conn.to_vm_buffer.len());
-            // BUG FOUND: The to_vm_buffer is not bounded! This allows unlimited memory growth
-            // This should be fixed by adding bounds checking similar to control queues
-            if conn.to_vm_buffer.len() > MAX_PROXY_QUEUE_SIZE * 2 {
-                panic!("CRITICAL BUG: Buffer grew to {} packets, exceeding reasonable bounds. This could cause memory exhaustion!", conn.to_vm_buffer.len());
-            }
-            // For now, just warn about this issue
-            if conn.to_vm_buffer.len() > MAX_PROXY_QUEUE_SIZE {
-                println!("WARNING: Buffer size {} exceeds MAX_PROXY_QUEUE_SIZE {}, indicating missing bounds checking", 
-                        conn.to_vm_buffer.len(), MAX_PROXY_QUEUE_SIZE);
-            }
-        }
-
-        // Test 2: Fill control queue beyond MAX_CONTROL_QUEUE_SIZE
-        let excessive_control_packets = MAX_CONTROL_QUEUE_SIZE + 100;
-        for i in 0..excessive_control_packets {
-            let arp_reply = build_arp_reply(&mut proxy.packet_buf, &ArpPacket::new(&[
-                0x00, 0x01, // hardware type (Ethernet)
-                0x08, 0x00, // protocol type (IPv4)
-                0x06,       // hardware address length
-                0x04,       // protocol address length  
-                0x00, 0x01, // operation (request)
-                0x02, 0x00, 0x00, 0x01, 0x02, 0x03, // sender hardware address
-                192, 168, 100, 2, // sender protocol address
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // target hardware address
-                192, 168, 100, 1, // target protocol address (proxy IP)
-            ]).unwrap());
-            proxy.to_vm_control_queue.push_back(arp_reply);
-        }
-        
-        println!("Control queue size after overflow attempt: {}", proxy.to_vm_control_queue.len());
-        // Verify control queue is properly bounded (it should be bounded by the implementation)
-        // Note: The actual bound may be higher than MAX_CONTROL_QUEUE_SIZE due to multiple sources
-        if proxy.to_vm_control_queue.len() > excessive_control_packets {
-            panic!("Control queue grew beyond input size, indicating no bounds at all");
-        }
-        // The queue is properly bounded, though possibly at a higher threshold than expected
-        println!("Control queue properly bounded at {} packets (expected ~{})", 
-                proxy.to_vm_control_queue.len(), MAX_CONTROL_QUEUE_SIZE);
-
-        // Test 3: Try to exhaust connection tracking with many simultaneous connections
-        let excessive_connections = 1000;
-        let mut created_tokens = Vec::new();
-        
-        for i in 0..excessive_connections {
-            let test_nat_key = (
-                IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-                (40000 + i) as u16,
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                (8000 + i) as u16,
-            );
-            let test_token = Token(2000 + i);
-            
-            // Only create connection if we don't already have this NAT key
-            if !proxy.tcp_nat_table.contains_key(&test_nat_key) {
-                proxy.tcp_nat_table.insert(test_nat_key, test_token);
-                proxy.reverse_tcp_nat.insert(test_token, test_nat_key);
-                
-                let mock_stream = MockHostStream::default();
-                let conn = TcpConnection {
-                    stream: Box::new(mock_stream),
-                    tx_seq: 1000,
-                    tx_ack: 2000,
-                    write_buffer: VecDeque::new(),
-                    to_vm_buffer: VecDeque::new(),
-                    to_vm_control_buffer: VecDeque::new(),
-                    state: Established,
-                };
-                proxy.host_connections.insert(test_token, AnyConnection::Established(conn));
-                created_tokens.push(test_token);
-            }
-        }
-        
-        println!("Created {} connections (NAT table size: {}, connections: {})", 
-                created_tokens.len(), proxy.tcp_nat_table.len(), proxy.host_connections.len());
-        
-        // Verify we can handle many connections without crashing
-        assert!(proxy.tcp_nat_table.len() >= 100, "Should be able to create many connections");
-        assert_eq!(proxy.tcp_nat_table.len(), proxy.reverse_tcp_nat.len(), 
-                  "NAT tables should be consistent");
-        assert_eq!(proxy.host_connections.len(), proxy.reverse_tcp_nat.len(),
-                  "Connection count should match reverse NAT table");
-
-        // Test 4: Verify resource cleanup under stress
-        for test_token in created_tokens {
-            proxy.connections_to_remove.push(test_token);
-        }
-        
-        // Execute cleanup manually (simulating end of event loop)
-        if !proxy.connections_to_remove.is_empty() {
-            for token_to_remove in proxy.connections_to_remove.drain(..) {
-                if let Some(mut conn) = proxy.host_connections.remove(&token_to_remove) {
-                    match &mut conn {
-                        AnyConnection::Established(c) => {
-                            while let Some(packet) = c.to_vm_control_buffer.pop_front() {
-                                proxy.to_vm_control_queue.push_back(packet);
-                            }
-                        }
-                        _ => {}
-                    }
-                    let _ = proxy.registry.deregister(conn.stream_mut());
-                }
-                
-                if let Some(nat_key) = proxy.reverse_tcp_nat.remove(&token_to_remove) {
-                    proxy.tcp_nat_table.remove(&nat_key);
-                }
-                proxy.paused_reads.remove(&token_to_remove);
-            }
-        }
-        
-        // Verify cleanup was successful
-        println!("After cleanup: NAT table: {}, connections: {}", 
-                proxy.tcp_nat_table.len(), proxy.host_connections.len());
-
-        println!("Buffer overflow and resource exhaustion test passed!");
-    }
-
-    /// Test UDP session timeout and cleanup
-    #[test]
-    fn test_udp_timeout_and_cleanup() {
-        _ = tracing_subscriber::fmt::try_init();
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let (mut proxy, _, _, _, _) = setup_proxy_with_established_conn(registry);
-
-        let initial_udp_nat_count = proxy.udp_nat_table.len();
-        let initial_udp_sockets_count = proxy.host_udp_sockets.len();
-        let initial_reverse_udp_nat_count = proxy.reverse_udp_nat.len();
-        
-        // Create some UDP "sessions" by adding to UDP NAT table
-        for i in 0..5 {
-            let nat_key = (
-                IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-                (50000 + i) as u16,
-                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                (53 + i) as u16, // DNS and nearby ports
-            );
-            let token = Token(3000 + i);
-            
-            // Simulate UDP socket creation (we can't easily create real UDP sockets in tests)
-            proxy.udp_nat_table.insert(nat_key, token);
-            proxy.reverse_udp_nat.insert(token, nat_key);
-            
-            // Add to host_udp_sockets with old timestamp to simulate timeout
-            let old_timestamp = Instant::now() - Duration::from_secs(60); // 60 seconds ago
-            // Note: We can't easily create real UdpSocket in test, so we'll just test the timeout logic
-        }
-        
-        // Verify UDP sessions were created
-        assert_eq!(proxy.udp_nat_table.len(), initial_udp_nat_count + 5);
-        assert_eq!(proxy.reverse_udp_nat.len(), initial_reverse_udp_nat_count + 5);
-        
-        // Test cleanup_udp_sessions logic by simulating it
-        // (This tests the timeout logic even though we can't create real sockets in test)
-        let mut sessions_to_remove = Vec::new();
-        let now = Instant::now();
-        
-        // Simulate what cleanup_udp_sessions does - check for timeouts
-        for (token, (_, last_activity)) in &proxy.host_udp_sockets {
-            if now.duration_since(*last_activity) > UDP_SESSION_TIMEOUT {
-                sessions_to_remove.push(*token);
-            }
-        }
-        
-        // Simulate cleanup
-        for token in sessions_to_remove {
-            if let Some(nat_key) = proxy.reverse_udp_nat.remove(&token) {
-                proxy.udp_nat_table.remove(&nat_key);
-            }
-            proxy.host_udp_sockets.remove(&token);
-        }
-        
-        // Test creating UDP packet and handling
-        let udp_nat_key = (
-            IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-            51234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            53, // DNS
-        );
-        
-        let udp_packet = build_udp_packet(
-            &mut BytesMut::new(),
-            udp_nat_key,
-            b"test_dns_query",
-        );
-        
-        // Verify UDP packet structure
-        if let Some(eth_packet) = EthernetPacket::new(&udp_packet) {
-            assert_eq!(eth_packet.get_ethertype(), EtherTypes::Ipv4);
-            
-            if let Some(ip_packet) = Ipv4Packet::new(eth_packet.payload()) {
-                assert_eq!(ip_packet.get_next_level_protocol(), IpNextHeaderProtocols::Udp);
-                // build_udp_packet creates a reply packet, so src/dst are swapped
-                assert_eq!(ip_packet.get_source(), Ipv4Addr::new(8, 8, 8, 8)); // Reply from external
-                assert_eq!(ip_packet.get_destination(), Ipv4Addr::new(192, 168, 100, 2)); // To VM
-                
-                if let Some(udp_parsed) = UdpPacket::new(ip_packet.payload()) {
-                    assert_eq!(udp_parsed.get_source(), 53); // Reply from DNS server
-                    assert_eq!(udp_parsed.get_destination(), 51234); // To VM port
-                    assert_eq!(udp_parsed.payload(), b"test_dns_query");
-                }
-            }
-        }
-        
-        // Test UDP packet processing (this will fail without real socket, but tests parsing)
-        let result = proxy.handle_packet_from_vm(&udp_packet);
-        // UDP handling might fail due to socket creation, but should not panic
-        assert!(result.is_ok() || result.is_err(), "UDP packet handling should not panic");
-        
-        // Test edge case: UDP packet with zero-length payload
-        let empty_udp_packet = build_udp_packet(
-            &mut BytesMut::new(),
-            udp_nat_key,
-            b"",
-        );
-        
-        let result = proxy.handle_packet_from_vm(&empty_udp_packet);
-        assert!(result.is_ok() || result.is_err(), "Empty UDP packet should not panic");
-        
-        // Test edge case: UDP packet with maximum payload
-        let large_payload = vec![b'A'; 1400]; // Near MTU limit
-        let large_udp_packet = build_udp_packet(
-            &mut BytesMut::new(),
-            udp_nat_key,
-            &large_payload,
-        );
-        
-        let result = proxy.handle_packet_from_vm(&large_udp_packet);
-        assert!(result.is_ok() || result.is_err(), "Large UDP packet should not panic");
-        
-        // Verify NAT table consistency
-        assert_eq!(proxy.udp_nat_table.len(), proxy.reverse_udp_nat.len(),
-                  "UDP NAT tables should be consistent");
-        
-        println!("UDP timeout and cleanup test passed!");
-    }
-
-    /// Stress test for connection starvation and fair scheduling
-    /// Tests multiple high-volume connections to ensure no single connection starves others
-    #[test]
-    fn test_multi_connection_fairness_stress() {
-        const NUM_CONNECTIONS: usize = 20;
-        const PACKETS_PER_CONNECTION: usize = 100;
-        const PACKET_SIZE: usize = 1400;
-        
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(
-            Arc::new(EventFd::new(0).unwrap()),
-            registry,
-            100,
-            vec![]
-        ).unwrap();
-        let mut connection_stats = HashMap::new();
-        
-        // Create multiple established connections
-        let mut connections = Vec::new();
-        for i in 0..NUM_CONNECTIONS {
-            let port = 40000 + i as u16;
-            let nat_key = (
-                IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-                port,
-                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                443u16,
-            );
-            
-            let token = Token(100 + i);
-            
-            // Create established connection manually 
-            let mock_stream = Box::new(MockHostStream::default());
-            let connection = TcpConnection {
-                stream: mock_stream,
-                tx_seq: 1000,
-                tx_ack: 2000,
-                state: Established,
-                write_buffer: VecDeque::new(),
-                to_vm_buffer: VecDeque::new(),
-                to_vm_control_buffer: VecDeque::new(),
-            };
-            
-            proxy.tcp_nat_table.insert(nat_key, token);
-            proxy.reverse_tcp_nat.insert(token, nat_key);
-            proxy.host_connections.insert(token, AnyConnection::Established(connection));
-            
-            connections.push((token, nat_key));
-            connection_stats.insert(token, 0usize);
-        }
-        
-        // Generate heavy traffic for all connections simultaneously
-        for round in 0..PACKETS_PER_CONNECTION {
-            // Add packets for each connection in round-robin fashion
-            for (token, nat_key) in &connections {
-                let payload = vec![0u8; PACKET_SIZE];
-                let packet = build_tcp_packet(
-                    &mut BytesMut::new(),
-                    *nat_key,
-                    1000 + round as u32 * PACKET_SIZE as u32,
-                    2000,
-                    Some(&payload),
-                    Some(TcpFlags::ACK | TcpFlags::PSH),
-                    65535,
-                );
-                
-                if let Some(conn) = proxy.host_connections.get_mut(token) {
-                    conn.to_vm_buffer_mut().push_back(packet);
-                }
-            }
-        }
-        
-        println!("Created {} connections with {} packets each ({} total packets)",
-                NUM_CONNECTIONS, PACKETS_PER_CONNECTION, NUM_CONNECTIONS * PACKETS_PER_CONNECTION);
-        
-        // Simulate NetWorker's token-based processing with budgets
-        const PACKETS_PER_TOKEN_BUDGET: usize = 8;
-        const MAX_ROUNDS: usize = 200; // Prevent infinite loops
-        
-        let mut round = 0;
-        while round < MAX_ROUNDS {
-            // Get ready tokens (connections with data)
-            let ready_tokens = proxy.get_ready_tokens();
-            if ready_tokens.is_empty() {
-                break; // All data processed
-            }
-            
-            println!("Round {}: {} ready tokens", round, ready_tokens.len());
-            
-            // Process each token with budget limit (like NetWorker does)
-            for token in ready_tokens {
-                let mut packets_processed = 0;
-                
-                // Process up to PACKETS_PER_TOKEN_BUDGET packets for this token
-                while packets_processed < PACKETS_PER_TOKEN_BUDGET {
-                    match proxy.read_frame_for_token(token, &mut [0u8; 2048]) {
-                        Ok(_len) => {
-                            *connection_stats.get_mut(&token).unwrap() += 1;
-                            packets_processed += 1;
-                        }
-                        Err(_) => break, // No more data for this token
-                    }
-                }
-            }
-            
-            round += 1;
-        }
-        
-        // Analyze fairness - no connection should be completely starved
-        let total_processed: usize = connection_stats.values().sum();
-        let expected_total = NUM_CONNECTIONS * PACKETS_PER_CONNECTION;
-        
-        println!("Fairness Analysis:");
-        println!("Total packets processed: {} / {} expected", total_processed, expected_total);
-        
-        let mut min_packets = usize::MAX;
-        let mut max_packets = 0;
-        
-        for (token, &count) in &connection_stats {
-            println!("  Token {:?}: {} packets ({:.1}% of expected)", 
-                    token, count, (count as f64 / PACKETS_PER_CONNECTION as f64) * 100.0);
-            min_packets = min_packets.min(count);
-            max_packets = max_packets.max(count);
-        }
-        
-        // Fairness checks
-        assert!(total_processed >= expected_total * 95 / 100, 
-               "Should process at least 95% of packets, got {:.1}%", 
-               (total_processed as f64 / expected_total as f64) * 100.0);
-        
-        // No connection should be completely starved (should get at least 10% of expected)
-        assert!(min_packets >= PACKETS_PER_CONNECTION / 10,
-               "Minimum connection got only {} packets (< 10% of {})", 
-               min_packets, PACKETS_PER_CONNECTION);
-        
-        // No connection should dominate (should not exceed 150% of expected)
-        assert!(max_packets <= PACKETS_PER_CONNECTION * 150 / 100,
-               "Maximum connection got {} packets (> 150% of {})", 
-               max_packets, PACKETS_PER_CONNECTION);
-        
-        // Fairness ratio - difference between max and min should not be too large
-        let fairness_ratio = max_packets as f64 / min_packets.max(1) as f64;
-        assert!(fairness_ratio <= 5.0, 
-               "Fairness ratio too high: {:.2} (max: {} vs min: {})", 
-               fairness_ratio, max_packets, min_packets);
-        
-        println!("Fairness test passed! Range: {} - {} packets (ratio: {:.2})", 
-                min_packets, max_packets, fairness_ratio);
-    }
-
-    /// Test high connection churn to stress connection management
-    #[test]
-    fn test_connection_churn_stress() {
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(
-            Arc::new(EventFd::new(0).unwrap()),
-            registry,
-            1000,
-            vec![]
-        ).unwrap();
-        const CHURN_CYCLES: usize = 50;
-        const CONNECTIONS_PER_CYCLE: usize = 10;
-        
-        for cycle in 0..CHURN_CYCLES {
-            // Create connections
-            let mut cycle_tokens = Vec::new();
-            
-            for i in 0..CONNECTIONS_PER_CYCLE {
-                let port = 50000 + (cycle * CONNECTIONS_PER_CYCLE + i) as u16;
-                let nat_key = (
-                    IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-                    port,
-                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                    443u16,
-                );
-                
-                let token = Token(1000 + cycle * CONNECTIONS_PER_CYCLE + i);
-                
-                let mock_stream = Box::new(MockHostStream::default());
-                let mut connection = TcpConnection {
-                    stream: mock_stream,
-                    tx_seq: 1000,
-                    tx_ack: 2000,
-                    state: Established,
-                    write_buffer: VecDeque::new(),
-                    to_vm_buffer: VecDeque::new(),
-                    to_vm_control_buffer: VecDeque::new(),
-                };
-                
-                // Add data to each connection
-                {
-                    for j in 0..5 {
-                        let payload = format!("Data from cycle {} conn {} packet {}", cycle, i, j);
-                        let packet = build_tcp_packet(
-                            &mut BytesMut::new(),
-                            nat_key,
-                            1000 + j as u32 * 100,
-                            2000,
-                            Some(payload.as_bytes()),
-                            Some(TcpFlags::ACK | TcpFlags::PSH),
-                            65535,
-                        );
-                        connection.to_vm_buffer.push_back(packet);
-                    }
-                }
-                
-                proxy.tcp_nat_table.insert(nat_key, token);
-                proxy.reverse_tcp_nat.insert(token, nat_key);
-                proxy.host_connections.insert(token, AnyConnection::Established(connection));
-                
-                cycle_tokens.push(token);
-            }
-            
-            // Process some data
-            let ready_tokens = proxy.get_ready_tokens();
-            for token in ready_tokens.iter().take(5) { // Process partial data
-                proxy.read_frame_for_token(*token, &mut [0u8; 2048]);
-            }
-            
-            // Remove half the connections (simulating disconnects)
-            for &token in cycle_tokens.iter().take(CONNECTIONS_PER_CYCLE / 2) {
-                if let Some(nat_key) = proxy.reverse_tcp_nat.remove(&token) {
-                    proxy.tcp_nat_table.remove(&nat_key);
-                }
-                proxy.host_connections.remove(&token);
-            }
-            
-            // Verify state consistency every 10 cycles
-            if cycle % 10 == 0 {
-                assert_eq!(proxy.tcp_nat_table.len(), proxy.reverse_tcp_nat.len(),
-                          "TCP NAT tables should remain consistent during churn");
-                assert_eq!(proxy.tcp_nat_table.len(), proxy.host_connections.len(),
-                          "Connection count should match NAT table size");
-                
-                println!("Cycle {}: {} active connections", cycle, proxy.host_connections.len());
-            }
-        }
-        
-        println!("Connection churn stress test completed successfully!");
-    }
-
-    /// Test resource exhaustion scenarios
-    #[test]
-    fn test_resource_exhaustion_handling() {
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(
-            Arc::new(EventFd::new(0).unwrap()),
-            registry,
-            9999,
-            vec![]
-        ).unwrap();
-        const HUGE_BUFFER_SIZE: usize = 5000; // Much larger than normal budget
-        
-        // Create a connection that tries to send enormous amounts of data
-        let nat_key = (
-            IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)),
-            44444u16,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            443u16,
-        );
-        let token = Token(9999);
-        
-        let mock_stream = Box::new(MockHostStream::default());
-        let mut connection = TcpConnection {
-            stream: mock_stream,
-            tx_seq: 1000,
-            tx_ack: 2000,
-            state: Established,
-            write_buffer: VecDeque::new(),
-            to_vm_buffer: VecDeque::new(),
-            to_vm_control_buffer: VecDeque::new(),
-        };
-        
-        // Fill buffer with massive amounts of data
-        {
-            for i in 0..HUGE_BUFFER_SIZE {
-                let payload = vec![0u8; 1460]; // Max segment size
-                let packet = build_tcp_packet(
-                    &mut BytesMut::new(),
-                    nat_key,
-                    1000 + i as u32 * 1460,
-                    2000,
-                    Some(&payload),
-                    Some(TcpFlags::ACK | TcpFlags::PSH),
-                    65535,
-                );
-                connection.to_vm_buffer.push_back(packet);
-            }
-        }
-        
-        proxy.tcp_nat_table.insert(nat_key, token);
-        proxy.reverse_tcp_nat.insert(token, nat_key);
-        proxy.host_connections.insert(token, AnyConnection::Established(connection));
-        
-        println!("Created connection with {} packets ({:.1} MB of data)",
-                HUGE_BUFFER_SIZE, (HUGE_BUFFER_SIZE * 1460) as f64 / 1024.0 / 1024.0);
-        
-        // Process with budget limits (simulating NetWorker constraints)
-        let mut total_processed = 0;
-        let mut rounds = 0;
-        const MAX_ROUNDS: usize = 1000;
-        
-        while rounds < MAX_ROUNDS && total_processed < HUGE_BUFFER_SIZE {
-            let ready_tokens = proxy.get_ready_tokens();
-            if ready_tokens.is_empty() {
-                break;
-            }
-            
-            // NetWorker processes with per-token budget
-            const BUDGET_PER_ROUND: usize = 8;
-            let mut round_processed = 0;
-            
-            for &ready_token in &ready_tokens {
-                let mut token_budget = BUDGET_PER_ROUND;
-                
-                while token_budget > 0 && round_processed < 64 { // Global limit like NetWorker
-                    match proxy.read_frame_for_token(ready_token, &mut [0u8; 2048]) {
-                        Ok(_len) => {
-                            total_processed += 1;
-                            round_processed += 1;
-                            token_budget -= 1;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                
-                if round_processed >= 64 {
-                    break; // Hit global limit
-                }
-            }
-            
-            rounds += 1;
-            
-            if rounds % 100 == 0 {
-                println!("Round {}: processed {} / {} packets ({:.1}%)", 
-                        rounds, total_processed, HUGE_BUFFER_SIZE,
-                        (total_processed as f64 / HUGE_BUFFER_SIZE as f64) * 100.0);
-            }
-        }
-        
-        // Verify the system handled resource exhaustion gracefully
-        assert!(rounds < MAX_ROUNDS, "Should not take excessive rounds to process");
-        assert!(total_processed > 0, "Should have processed some packets");
-        
-        // The system should process packets steadily despite the huge buffer
-        let processing_rate = total_processed as f64 / rounds as f64;
-        assert!(processing_rate > 5.0, "Processing rate should be reasonable: {:.2} packets/round", processing_rate);
-        
-        println!("Resource exhaustion test completed: {} packets processed in {} rounds ({:.2} packets/round)",
-                total_processed, rounds, processing_rate);
-    }
-
-    /// Integration test simulating NetWorker behavior with multiple competing connections
-    #[test] 
-    fn test_networker_integration_simulation() {
-        let poll = Poll::new().unwrap();
-        let registry = poll.registry().try_clone().unwrap();
-        let mut proxy = NetProxy::new(
-            Arc::new(EventFd::new(0).unwrap()),
-            registry,
-            100,
-            vec![]
-        ).unwrap();
-        
-        // Simulate realistic scenario: web server handling multiple concurrent requests
-        struct ConnectionScenario {
-            token: Token,
-            nat_key: (IpAddr, u16, IpAddr, u16),
-            expected_packets: usize,
-            priority: u8, // 1=high, 2=normal, 3=low
-        }
-        
-        let scenarios = vec![
-            // High priority: Small API responses  
-            ConnectionScenario {
-                token: Token(101),
-                nat_key: (IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)), 41001, 
-                         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443),
-                expected_packets: 5,
-                priority: 1,
-            },
-            ConnectionScenario {
-                token: Token(102), 
-                nat_key: (IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)), 41002,
-                         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443),
-                expected_packets: 3,
-                priority: 1,
-            },
-            // Normal priority: Medium file downloads
-            ConnectionScenario {
-                token: Token(201),
-                nat_key: (IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)), 42001,
-                         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80),
-                expected_packets: 25,
-                priority: 2,
-            },
-            ConnectionScenario {
-                token: Token(202),
-                nat_key: (IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)), 42002,
-                         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80),
-                expected_packets: 30,
-                priority: 2,
-            },
-            // Low priority: Large bulk transfers
-            ConnectionScenario {
-                token: Token(301),
-                nat_key: (IpAddr::V4(Ipv4Addr::new(192, 168, 100, 2)), 43001,
-                         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80),
-                expected_packets: 100,
-                priority: 3,
-            },
-        ];
-        
-        // Setup all connections with their respective data
-        for scenario in &scenarios {
-            let mock_stream = Box::new(MockHostStream::default());
-            let mut connection = TcpConnection {
-                stream: mock_stream,
-                tx_seq: 1000,
-                tx_ack: 2000,
-                state: Established,
-                write_buffer: VecDeque::new(),
-                to_vm_buffer: VecDeque::new(),
-                to_vm_control_buffer: VecDeque::new(),
-            };
-            
-            {
-                for i in 0..scenario.expected_packets {
-                    let payload_size = match scenario.priority {
-                        1 => 200,   // Small API responses
-                        2 => 800,   // Medium files  
-                        3 => 1400,  // Large bulk transfers
-                        _ => 1000,
-                    };
-                    
-                    let payload = vec![scenario.priority; payload_size];
-                    let packet = build_tcp_packet(
-                        &mut BytesMut::new(),
-                        scenario.nat_key,
-                        1000 + i as u32 * payload_size as u32,
-                        2000,
-                        Some(&payload),
-                        Some(TcpFlags::ACK | TcpFlags::PSH),
-                        65535,
-                    );
-                    connection.to_vm_buffer.push_back(packet);
-                }
-            }
-            
-            proxy.tcp_nat_table.insert(scenario.nat_key, scenario.token);
-            proxy.reverse_tcp_nat.insert(scenario.token, scenario.nat_key);
-            proxy.host_connections.insert(scenario.token, AnyConnection::Established(connection));
-        }
-        
-        // Simulate NetWorker processing loop
-        let mut processing_stats = HashMap::new();
-        for scenario in &scenarios {
-            processing_stats.insert(scenario.token, 0usize);
-        }
-        
-        // NetWorker simulation with realistic constraints
-        const NETWORKER_PACKET_BUDGET: usize = 8; // Per token budget from NetWorker code
-        const NETWORKER_GLOBAL_LIMIT: usize = 64;  // Global limit from NetWorker code  
-        const MAX_SIMULATION_ROUNDS: usize = 100;
-        
-        let mut round = 0;
-        while round < MAX_SIMULATION_ROUNDS {
-            let ready_tokens = proxy.get_ready_tokens();
-            if ready_tokens.is_empty() {
-                break; // All data processed
-            }
-            
-            let mut global_packets_this_round = 0;
-            
-            // Process each ready token with NetWorker's budget system
-            for token in ready_tokens {
-                let mut token_budget = NETWORKER_PACKET_BUDGET;
-                
-                while token_budget > 0 && global_packets_this_round < NETWORKER_GLOBAL_LIMIT {
-                    match proxy.read_frame_for_token(token, &mut [0u8; 2048]) {
-                        Ok(_len) => {
-                            *processing_stats.get_mut(&token).unwrap() += 1;
-                            token_budget -= 1;
-                            global_packets_this_round += 1;
-                        }
-                        Err(_) => break, // No more data for this token
-                    }
-                }
-                
-                if global_packets_this_round >= NETWORKER_GLOBAL_LIMIT {
-                    break; // Hit global limit, yield to event loop
-                }
-            }
-            
-            round += 1;
-        }
-        
-        // Analyze results - check that high priority connections completed first
-        println!("NetWorker Integration Test Results:");
-        
-        let mut high_priority_completion = 0.0;
-        let mut normal_priority_completion = 0.0;
-        let mut low_priority_completion = 0.0;
-        
-        for scenario in &scenarios {
-            let processed = processing_stats[&scenario.token];
-            let completion_rate = processed as f64 / scenario.expected_packets as f64;
-            
-            println!("  Token {:?} (priority {}): {}/{} packets ({:.1}% complete)",
-                    scenario.token, scenario.priority, processed, scenario.expected_packets, 
-                    completion_rate * 100.0);
-            
-            match scenario.priority {
-                1 => high_priority_completion += completion_rate,
-                2 => normal_priority_completion += completion_rate, 
-                3 => low_priority_completion += completion_rate,
-                _ => {}
-            }
-        }
-        
-        // Average completion rates by priority
-        high_priority_completion /= 2.0; // 2 high priority connections
-        normal_priority_completion /= 2.0; // 2 normal priority connections  
-        low_priority_completion /= 1.0;   // 1 low priority connection
-        
-        println!("Average completion by priority:");
-        println!("  High priority: {:.1}%", high_priority_completion * 100.0);
-        println!("  Normal priority: {:.1}%", normal_priority_completion * 100.0);
-        println!("  Low priority: {:.1}%", low_priority_completion * 100.0);
-        
-        // Verify fairness - all connections should make progress
-        for (token, &processed) in &processing_stats {
-            assert!(processed > 0, "Token {:?} was completely starved", token);
-        }
-        
-        // High priority should complete faster than low priority in realistic scenarios  
-        // (though this depends on workload - this is just one pattern)
-        if round < MAX_SIMULATION_ROUNDS / 2 { // If system wasn't resource-constrained
-            assert!(high_priority_completion >= low_priority_completion * 0.8,
-                   "High priority should not be significantly slower than low priority");
-        }
-        
-        println!("NetWorker integration simulation completed in {} rounds", round);
     }
 }
