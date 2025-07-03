@@ -33,7 +33,6 @@ use event::Event;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
-use net_proxy::backend::NetBackend;
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
@@ -132,9 +131,9 @@ struct TsiConfig {
 
 enum NetworkConfig {
     Tsi(TsiConfig),
-    // VirtioNetPasst(RawFd),
+    VirtioNetPasst(RawFd),
     VirtioNetGvproxy(PathBuf),
-    DirectProxy(Vec<(u16, String)>),
+    VirtioNetProxy(Vec<(u16, String)>),
 }
 
 impl Default for NetworkConfig {
@@ -277,9 +276,9 @@ impl ContextConfig {
                 tsi_config.port_map.replace(new_port_map);
                 Ok(())
             }
-            // NetworkConfig::VirtioNetPasst(_) => Err(()),
+            NetworkConfig::VirtioNetPasst(_) => Err(()),
             NetworkConfig::VirtioNetGvproxy(_) => Err(()),
-            NetworkConfig::DirectProxy(_) => Err(()),
+            NetworkConfig::VirtioNetProxy(_) => Err(()),
         }
     }
 
@@ -689,7 +688,7 @@ pub fn krun_set_direct_proxy(ctx_id: u32, listeners: &[(u16, &str)]) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            cfg.set_net_cfg(NetworkConfig::DirectProxy(
+            cfg.set_net_cfg(NetworkConfig::VirtioNetProxy(
                 listeners
                     .iter()
                     .map(|(vm_port, path)| (*vm_port, (*path).to_owned()))
@@ -1499,13 +1498,13 @@ pub fn krun_start_enter(ctx_id: u32) -> i32 {
             vsock_config.host_port_map = tsi_cfg.port_map;
             vsock_set = true;
         }
-        // NetworkConfig::VirtioNetPasst(_fd) => {
-        //     #[cfg(feature = "net")]
-        //     {
-        //         let backend = VirtioNetBackend::Passt(_fd);
-        //         create_virtio_net(&mut ctx_cfg, backend);
-        //     }
-        // }
+        NetworkConfig::VirtioNetPasst(_fd) => {
+            #[cfg(feature = "net")]
+            {
+                let backend = VirtioNetBackend::Passt(_fd);
+                create_virtio_net(&mut ctx_cfg, backend);
+            }
+        }
         NetworkConfig::VirtioNetGvproxy(ref _path) => {
             #[cfg(feature = "net")]
             {
@@ -1513,10 +1512,10 @@ pub fn krun_start_enter(ctx_id: u32) -> i32 {
                 create_virtio_net(&mut ctx_cfg, backend);
             }
         }
-        NetworkConfig::DirectProxy(ref listeners) => {
+        NetworkConfig::VirtioNetProxy(ref listeners) => {
             #[cfg(feature = "net")]
             {
-                let backend = VirtioNetBackend::UnifiedProxy(listeners.clone());
+                let backend = VirtioNetBackend::Proxy(listeners.clone());
                 create_virtio_net(&mut ctx_cfg, backend);
             }
         }

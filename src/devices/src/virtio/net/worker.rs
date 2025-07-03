@@ -1,14 +1,12 @@
 use crate::legacy::IrqChip;
-// use crate::virtio::net::passt::Passt;
+use crate::virtio::net::gvproxy::Gvproxy;
+use crate::virtio::net::passt::Passt;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, RX_INDEX, TX_INDEX};
 use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
 use crate::Error as DeviceError;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
-use net_proxy::gvproxy::Gvproxy;
 
+use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
-use net_proxy::backend::{NetBackend, ReadError, WriteError};
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicUsize;
@@ -16,7 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::{cmp, mem, result};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -43,9 +42,6 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
-    poll: Poll,
-    waker: Option<Arc<EventFd>>,
-
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
@@ -54,13 +50,6 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
 }
-
-const VIRTQ_TX_TOKEN: Token = Token(0); // Packets from guest
-const VIRTQ_RX_TOKEN: Token = Token(1); // Notifies that guest has provided new RX buffers
-const BACKEND_WAKER_TOKEN: Token = Token(2);
-const PROXY_START_TOKEN: usize = 3;
-
-const VM_READ_BUDGET: u8 = 32;
 
 impl NetWorker {
     #[allow(clippy::too_many_arguments)]
@@ -74,29 +63,12 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         cfg_backend: VirtioNetBackend,
     ) -> Self {
-        let poll = Poll::new().unwrap();
-        let (backend, waker) = match cfg_backend {
-            // VirtioNetBackend::Passt(fd) => Box::new(Passt::new(fd)) as Box<dyn NetBackend + Send>,
-            VirtioNetBackend::Gvproxy(path) => (
-                Box::new(Gvproxy::new(path).unwrap()) as Box<dyn NetBackend + Send>,
-                None,
-            ),
-            VirtioNetBackend::DirectProxy(listeners) => {
-                let waker = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
-                let backend = Box::new(
-                    net_proxy::proxy::NetProxy::new(
-                        waker.clone(),
-                        poll.registry()
-                            .try_clone()
-                            .expect("could not clone mio registry"),
-                        PROXY_START_TOKEN,
-                        listeners,
-                    )
-                    .expect("could not create direct proxy"),
-                );
-                (backend as Box<dyn NetBackend + Send>, Some(waker))
+        let backend = match cfg_backend {
+            VirtioNetBackend::Passt(fd) => Box::new(Passt::new(fd)) as Box<dyn NetBackend + Send>,
+            VirtioNetBackend::Gvproxy(path) => {
+                Box::new(Gvproxy::new(path).unwrap()) as Box<dyn NetBackend + Send>
             }
-            VirtioNetBackend::UnifiedProxy(_) => unreachable!(),
+            _ => unimplemented!(),
         };
 
         Self {
@@ -109,9 +81,6 @@ impl NetWorker {
 
             mem,
             backend,
-
-            poll,
-            waker,
 
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
@@ -131,71 +100,73 @@ impl NetWorker {
     }
 
     fn work(mut self) {
-        let mut events = Events::with_capacity(1024);
-
-        self.poll
-            .registry()
-            .register(
-                &mut SourceFd(&self.queue_evts[TX_INDEX].as_raw_fd()),
-                VIRTQ_TX_TOKEN,
-                Interest::READABLE,
-            )
-            .expect("could not register VIRTQ_TX_TOKEN");
-        self.poll
-            .registry()
-            .register(
-                &mut SourceFd(&self.queue_evts[RX_INDEX].as_raw_fd()),
-                VIRTQ_RX_TOKEN,
-                Interest::READABLE,
-            )
-            .expect("could not register VIRTQ_RX_TOKEN");
-
+        let virtq_rx_ev_fd = self.queue_evts[RX_INDEX].as_raw_fd();
+        let virtq_tx_ev_fd = self.queue_evts[TX_INDEX].as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
-        self.poll
-            .registry()
-            .register(
-                &mut SourceFd(&backend_socket.as_raw_fd()),
-                BACKEND_WAKER_TOKEN,
-                Interest::READABLE | Interest::WRITABLE,
-            )
-            .expect("could not register BACKEND_WAKER_TOKEN");
+
+        let epoll = Epoll::new().unwrap();
+
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            virtq_rx_ev_fd,
+            &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            virtq_tx_ev_fd,
+            &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            backend_socket,
+            &EpollEvent::new(
+                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+                backend_socket as u64,
+            ),
+        );
 
         loop {
-            self.poll
-                .poll(&mut events, None)
-                .expect("could not poll mio events");
-
-            for event in events.iter() {
-                match event.token() {
-                    VIRTQ_RX_TOKEN => {
-                        self.process_rx_queue_event();
-                        // self.backend.resume_reading();
-                    }
-                    VIRTQ_TX_TOKEN => {
-                        self.process_tx_queue_event();
-                    }
-                    BACKEND_WAKER_TOKEN => {
-                        if event.is_readable() {
-                            if let Some(waker) = &self.waker {
-                                _ = waker.read(); // Correctly reset the waker
+            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+                Ok(ev_cnt) => {
+                    for event in &epoll_events[0..ev_cnt] {
+                        let source = event.fd();
+                        let event_set = event.event_set();
+                        match event_set {
+                            EventSet::IN if source == virtq_rx_ev_fd => {
+                                self.process_rx_queue_event();
                             }
-                            // This call is now budgeted and will not get stuck.
-                            self.process_backend_socket_readable();
-                            // self.backend.resume_reading();
-                        }
-                        if event.is_writable() {
-                            // The `if` is important
-                            self.process_backend_socket_writeable();
+                            EventSet::IN if source == virtq_tx_ev_fd => {
+                                self.process_tx_queue_event();
+                            }
+                            _ if source == backend_socket => {
+                                if event_set.contains(EventSet::HANG_UP)
+                                    || event_set.contains(EventSet::READ_HANG_UP)
+                                {
+                                    log::error!("Got {event_set:?} on backend fd, virtio-net will stop working");
+                                    eprintln!("LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!");
+                                } else {
+                                    if event_set.contains(EventSet::IN) {
+                                        self.process_backend_socket_readable()
+                                    }
+
+                                    if event_set.contains(EventSet::OUT) {
+                                        self.process_backend_socket_writeable()
+                                    }
+                                }
+                            }
+                            _ => {
+                                log::warn!(
+                                    "Received unknown event: {:?} from fd: {:?}",
+                                    event_set,
+                                    source
+                                );
+                            }
                         }
                     }
-                    _token => {
-                        // log::trace!("passing through token to backend: {token:?}");
-                        self.backend.handle_event(
-                            event.token(),
-                            event.is_readable(),
-                            event.is_writable(),
-                        );
-                    }
+                }
+                Err(e) => {
+                    debug!("vsock: failed to consume muxer epoll event: {}", e);
                 }
             }
         }
@@ -254,53 +225,41 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
-        let mut signal_queue = false;
-
-        // This single loop will now handle everything resiliently.
-        for _ in 0..VM_READ_BUDGET {
-            // Step 1: Handle a previously failed/deferred frame first.
-            if self.rx_has_deferred_frame {
-                if self.write_frame_to_guest() {
-                    // Success! We sent the deferred frame.
-                    self.rx_has_deferred_frame = false;
-                    signal_queue = true;
-                } else {
-                    // Guest is still full. We can't do anything more on this connection.
-                    // Drop the frame to prevent getting stuck, and break the loop
-                    // to wait for a new event (like the guest freeing buffers).
-                    log::warn!(
-                        "Guest RX queue still full. Dropping deferred frame to prevent deadlock."
-                    );
-                    self.rx_has_deferred_frame = false;
-                    break;
-                }
-            }
-
-            // Step 2: Try to read a new frame from the proxy.
-            match self.read_into_rx_frame_buf_from_backend() {
-                Ok(()) => {
-                    // We got a new frame. Now try to write it to the guest.
-                    if self.write_frame_to_guest() {
-                        signal_queue = true;
-                    } else {
-                        // Guest RX queue just became full. Defer this frame and break.
-                        self.rx_has_deferred_frame = true;
-                        log::warn!("Guest RX queue became full. Deferring frame.");
-                        break;
-                    }
-                }
-                // If the proxy's queue is empty, we are done.
-                Err(ReadError::NothingRead) => break,
-                // Handle any real errors.
-                Err(e) => return Err(RxError::Backend(e)),
+        // if we have a deferred frame we try to process it first,
+        // if that is not possible, we don't continue processing other frames
+        if self.rx_has_deferred_frame {
+            if self.write_frame_to_guest() {
+                self.rx_has_deferred_frame = false;
+            } else {
+                return Ok(());
             }
         }
 
+        let mut signal_queue = false;
+
+        // Read as many frames as possible.
+        let result = loop {
+            match self.read_into_rx_frame_buf_from_backend() {
+                Ok(()) => {
+                    if self.write_frame_to_guest() {
+                        signal_queue = true;
+                    } else {
+                        self.rx_has_deferred_frame = true;
+                        break Ok(());
+                    }
+                }
+                Err(ReadError::NothingRead) => break Ok(()),
+                Err(e @ ReadError::Internal(_)) => break Err(RxError::Backend(e)),
+            }
+        };
+
+        // At this point we processed as many Rx frames as possible.
+        // We have to wake the guest if at least one descriptor chain has been used.
         if signal_queue {
             self.signal_used_queue().map_err(RxError::DeviceError)?;
         }
 
-        Ok(())
+        result
     }
 
     fn process_tx_loop(&mut self) {

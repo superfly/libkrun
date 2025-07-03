@@ -12,10 +12,9 @@ use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{ActivateError, ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_NET};
 use crate::Error as DeviceError;
 
-use super::unified_proxy::UnifiedNetProxy;
+use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 use crossbeam_channel::Sender;
-use net_proxy::backend::{ReadError, WriteError};
 
 use std::cmp;
 use std::io::Write;
@@ -88,10 +87,9 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
-    // Passt(RawFd),
+    Passt(RawFd),
     Gvproxy(PathBuf),
-    DirectProxy(Vec<(u16, String)>),
-    UnifiedProxy(Vec<(u16, String)>),
+    Proxy(Vec<(u16, String)>),
 }
 
 pub struct Net {
@@ -245,7 +243,7 @@ impl VirtioDevice for Net {
             .collect();
 
         match &self.cfg_backend {
-            VirtioNetBackend::UnifiedProxy(listeners) => {
+            VirtioNetBackend::Proxy(listeners) => {
                 // let unified_proxy = UnifiedNetProxy::new(
                 //     self.queues.clone(),
                 //     queue_evts,

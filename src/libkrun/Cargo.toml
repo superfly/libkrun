@@ -28,7 +28,6 @@ polly = { path = "../polly" }
 utils = { path = "../utils" }
 vmm = { path = "../vmm" }
 event = { path = "../event" }
-net-proxy = { path = "../net-proxy" }
 vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

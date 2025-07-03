@@ -11,10 +11,11 @@ pub const RX_INDEX: usize = 0;
 // The index of the tx queue from Net device queues/queues_evts vector.
 pub const TX_INDEX: usize = 1;
 
+pub mod backend;
 pub mod device;
-// mod passt;
+mod gvproxy;
+mod passt;
 pub mod smoltcp_proxy;
-pub mod unified_proxy;
 mod worker;
 
 pub use self::device::Net;

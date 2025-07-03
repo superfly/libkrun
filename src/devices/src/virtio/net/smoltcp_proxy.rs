@@ -2,22 +2,23 @@ use crate::legacy::IrqChip;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, RX_INDEX, TX_INDEX};
 use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
 use crate::Error as DeviceError;
+use bytes::{Bytes, BytesMut};
 use mio::event::{Event, Source};
 use mio::net::UnixListener;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
-use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::{TcpFlags, TcpPacket};
-use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
+use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
+use pnet::packet::{MutablePacket, Packet};
 use smoltcp::iface::{Config, Context, Interface, PollResult, Routes, SocketHandle, SocketSet};
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, TxToken as _};
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
-    EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpVersion, Ipv4Address,
-    Ipv4Cidr,
+    EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion,
+    Ipv4Address, Ipv4Cidr,
 };
 use socket2::{Domain, SockAddr, Socket};
 use std::cmp;
@@ -29,7 +30,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
@@ -49,8 +50,7 @@ const SUBNET_MASK: Ipv4Address = Ipv4Address::new(255, 255, 255, 0);
 /// Represents the virtio-net device as a `smoltcp` PHY device.
 /// This acts as the bridge between the VM's virtio queues and the smoltcp stack.
 struct VirtualDevice {
-    rx_buffer: VecDeque<Vec<u8>>,
-    tx_buffer: VecDeque<Vec<u8>>,
+    rx_buffer: VecDeque<Bytes>,
     mem: GuestMemoryMmap,
     queues: Vec<Queue>,
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
@@ -58,21 +58,24 @@ struct VirtualDevice {
 }
 
 impl VirtualDevice {
-    pub fn receive_raw(&mut self) -> Option<Vec<u8>> {
+    pub fn receive_raw_from_guest(&mut self) -> Option<Bytes> {
         if let Some(head) = self.queues[TX_INDEX].pop(&self.mem) {
             let head_index = head.index;
-            // Use the pre-allocated buffer instead of a new Vec
-            let buffer = &mut self.rx_frame_buf;
             let mut read_count = 0;
             let mut next_desc = Some(head);
 
             while let Some(desc) = next_desc {
                 if !desc.is_write_only() {
-                    let len = cmp::min(buffer.len() - read_count, desc.len as usize);
+                    // Calculate the length to read for this specific descriptor.
+                    let len = cmp::min(self.rx_frame_buf.len() - read_count, desc.len as usize);
+
+                    // Read from guest memory directly into our scratchpad array.
                     if self
                         .mem
-                        // Read into a mutable slice of the pre-allocated array
-                        .read_slice(&mut buffer[read_count..read_count + len], desc.addr)
+                        .read_slice(
+                            &mut self.rx_frame_buf[read_count..read_count + len],
+                            desc.addr,
+                        )
                         .is_ok()
                     {
                         read_count += len;
@@ -85,16 +88,13 @@ impl VirtualDevice {
                 .add_used(&self.mem, head_index, 0)
                 .unwrap();
 
-            if read_count > 0 {
-                let eth_start = std::mem::size_of::<virtio_net_hdr_v1>();
-                if read_count > eth_start {
-                    // This second, smaller allocation is still necessary with the
-                    // current design, but avoiding the first large allocation
-                    // is the big performance win.
-                    let packet_data = buffer[eth_start..read_count].to_vec();
-                    trace!("{}", packet_dumper::log_vm_packet_in(&packet_data));
-                    return Some(packet_data);
-                }
+            let header_len = std::mem::size_of::<virtio_net_hdr_v1>();
+            if read_count > header_len {
+                let packet_payload = &self.rx_frame_buf[header_len..read_count];
+                let packet = Bytes::copy_from_slice(packet_payload);
+
+                trace!("{}", packet_dumper::log_vm_packet_in(&packet));
+                return Some(packet);
             }
         }
         None
@@ -116,18 +116,15 @@ impl Device for VirtualDevice {
         &mut self,
         timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // This function will now consume packets that have been buffered
-        // by the work loop (if they weren't handled as new connections).
-        if let Some(buffer) = self.rx_buffer.pop_front() {
+        self.rx_buffer.pop_front().map(|buffer| {
             let rx_token = RxToken { buffer };
             let tx_token = TxToken {
                 mem: &self.mem,
                 rx_queue: &mut self.queues[RX_INDEX],
                 buf: &mut self.tx_frame_buf,
             };
-            return Some((rx_token, tx_token));
-        }
-        None
+            (rx_token, tx_token)
+        })
     }
 
     /// Transmits a packet to the virtio RX queue (i.e., to the guest).
@@ -159,7 +156,7 @@ impl Device for VirtualDevice {
 
 // A token that holds a received packet.
 struct RxToken {
-    buffer: Vec<u8>,
+    buffer: Bytes,
 }
 
 impl<'a> phy::RxToken for RxToken {
@@ -183,13 +180,28 @@ impl<'a> phy::TxToken for TxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let result = f(&mut self.buf[..len]);
+        const VIRTIO_HEADER_SIZE: usize = std::mem::size_of::<virtio_net_hdr_v1>();
 
-        trace!("{}", packet_dumper::log_vm_packet_out(&self.buf[..len]));
+        // Let smoltcp write the packet *after* the space for the header
+        let result = f(&mut self.buf[VIRTIO_HEADER_SIZE..VIRTIO_HEADER_SIZE + len]);
 
-        // Prepend virtio-net header
-        let mut frame = vec![0u8; std::mem::size_of::<virtio_net_hdr_v1>() + len];
-        frame[std::mem::size_of::<virtio_net_hdr_v1>()..].copy_from_slice(&self.buf[..len]);
+        trace!(
+            "{}",
+            packet_dumper::log_vm_packet_out(
+                &self.buf[VIRTIO_HEADER_SIZE..VIRTIO_HEADER_SIZE + len]
+            )
+        );
+
+        // The virtio-net header is all zeros, which is the default for virtio_net_hdr_v1.
+        // If you needed to set fields, you'd do it here on `&mut self.buf[..VIRTIO_HEADER_SIZE]`.
+
+        // Now, `&self.buf[..VIRTIO_HEADER_SIZE + len]` is the full frame. No new allocation needed.
+        let frame = &self.buf[..VIRTIO_HEADER_SIZE + len];
+
+        trace!(
+            "sending frame with header: {:?}",
+            &self.buf[..VIRTIO_HEADER_SIZE]
+        );
 
         // Write the frame to the guest's RX queue.
         if let Some(head) = self.rx_queue.pop(self.mem) {
@@ -225,6 +237,12 @@ enum HostSocket {
     Unix(mio::net::UnixStream),
 }
 
+struct Conn {
+    socket: HostSocket,
+    handle: SocketHandle,
+    last_activity: Instant,
+}
+
 /// The main proxy structure, now using smoltcp.
 pub struct SmoltcpProxy {
     // Virtio-related fields
@@ -243,11 +261,13 @@ pub struct SmoltcpProxy {
     poll: Poll,
     registry: Registry,
     next_token: usize,
-    host_connections: HashMap<Token, (HostSocket, SocketHandle)>,
+    host_connections: HashMap<Token, Conn>,
     nat_table: HashMap<IpEndpoint, Token>, // (External IP, External Port) -> Token
     reverse_nat_table: HashMap<Token, (IpEndpoint, IpEndpoint)>,
     udp_listeners: HashMap<IpEndpoint, SocketHandle>,
     unix_listeners: HashMap<Token, (UnixListener, u16)>,
+
+    raw_socket_handle: SocketHandle,
 
     next_ephemeral_port: u16,
 }
@@ -269,23 +289,14 @@ impl SmoltcpProxy {
         // Create the virtual device for smoltcp
         let mut virtual_device = VirtualDevice {
             rx_buffer: VecDeque::new(),
-            tx_buffer: VecDeque::new(),
             mem,
             queues,
             rx_frame_buf: [0; MAX_BUFFER_SIZE],
             tx_frame_buf: [0; MAX_BUFFER_SIZE],
         };
 
-        // Configure smoltcp interface
-        // let neighbor_cache = NeighborCache::new(BTreeMap::new());
-        // let mut routes = Routes::new(BTreeMap::new());
-        // let default_gateway_ipv4 = PROXY_IP;
-        // routes.add_default_ipv4_route(default_gateway_ipv4).unwrap();
-
-        // let ip_addrs = [IpCidr::new(IpAddress::from(VM_IP), 24)];
-
         let mut iface = Interface::new(
-            Config::new(smoltcp::wire::HardwareAddress::Ethernet((PROXY_MAC))),
+            Config::new(smoltcp::wire::HardwareAddress::Ethernet(PROXY_MAC)),
             &mut virtual_device,
             smoltcp::time::Instant::now(),
         );
@@ -303,7 +314,24 @@ impl SmoltcpProxy {
             .add_default_ipv4_route(PROXY_IP)
             .expect("could not add default ipv4 route");
 
-        let sockets = SocketSet::new(vec![]);
+        let mut sockets = SocketSet::new(vec![]);
+
+        // Create a raw socket for sending manually crafted IP packets.
+        // This allows smoltcp to handle the L2 framing.
+        let raw_rx_buffer = smoltcp::socket::raw::PacketBuffer::new(
+            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; 1024],
+            vec![0; 1024 * 1500],
+        );
+        let raw_tx_buffer = smoltcp::socket::raw::PacketBuffer::new(
+            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; 1024],
+            vec![0; 1024 * 1500],
+        );
+        let raw_socket_handle = sockets.add(smoltcp::socket::raw::Socket::new(
+            IpVersion::Ipv4,
+            IpProtocol::Udp, // You can make this more generic if needed
+            raw_rx_buffer,
+            raw_tx_buffer,
+        ));
 
         let mut next_token = HOST_SOCKET_START_TOKEN;
         let mut unix_listeners = HashMap::new();
@@ -357,6 +385,7 @@ impl SmoltcpProxy {
             next_ephemeral_port: 49152,
             udp_listeners: HashMap::new(),
             unix_listeners,
+            raw_socket_handle,
         })
     }
 
@@ -388,7 +417,10 @@ impl SmoltcpProxy {
             )
             .unwrap();
 
+        let mut last_changes_at = Instant::now();
         let start_time = Instant::now();
+
+        let mut last_cleanup = Instant::now();
 
         loop {
             // Poll for events from virtio queues and host sockets
@@ -429,7 +461,7 @@ impl SmoltcpProxy {
                 }
             }
 
-            while let Some(data) = self.device.receive_raw() {
+            while let Some(data) = self.device.receive_raw_from_guest() {
                 // A TX buffer was just consumed. Signal the guest.
                 self.signal_used_queue(TX_INDEX).unwrap();
 
@@ -449,9 +481,37 @@ impl SmoltcpProxy {
                 .iface
                 .poll(timestamp, &mut self.device, &mut self.sockets)
             {
-                PollResult::None => {} // This is expected if we only queued a packet
+                PollResult::None => {
+                    let elapsed = last_changes_at.elapsed();
+                    if elapsed > Duration::from_secs(5) {
+                        debug!("no changes since {elapsed:?}");
+                        for (handle, socket) in self.sockets.iter() {
+                            match socket {
+                                smoltcp::socket::Socket::Raw(socket) => {
+                                    trace!(%handle, ip_version = ?socket.ip_version(), ip_protocol = ?socket.ip_protocol(), "raw socket");
+                                }
+                                smoltcp::socket::Socket::Icmp(socket) => {
+                                    trace!(%handle, "icmp socket");
+                                }
+                                smoltcp::socket::Socket::Udp(socket) => {
+                                    trace!(%handle, endpoint = %socket.endpoint(), send_queue = socket.send_queue(), recv_queue = socket.recv_queue(), "udp socket");
+                                }
+                                smoltcp::socket::Socket::Tcp(socket) => {
+                                    trace!(%handle, local_ep = ?socket.local_endpoint(), remote_ep = ?socket.remote_endpoint(), listen_ep = %socket.listen_endpoint(), state = %socket.state(), "tcp socket");
+                                }
+                                smoltcp::socket::Socket::Dhcpv4(socket) => {
+                                    trace!(%handle, "dhcpv4 socket");
+                                }
+                                smoltcp::socket::Socket::Dns(socket) => {
+                                    trace!(%handle, "dns socket");
+                                }
+                            }
+                        }
+                    }
+                }
                 PollResult::SocketStateChanged => {
-                    debug!("socket state changed!");
+                    trace!("socket state changed!");
+                    last_changes_at = Instant::now();
                 }
             }
 
@@ -479,7 +539,16 @@ impl SmoltcpProxy {
                 .enable_notification(&self.device.mem)
                 .unwrap();
 
-            for (token, (stream, handle)) in self.host_connections.iter_mut() {
+            // Check TCP sockets for data to send to the host
+            for (
+                token,
+                Conn {
+                    socket: stream,
+                    handle,
+                    ..
+                },
+            ) in self.host_connections.iter_mut()
+            {
                 let socket = match stream {
                     HostSocket::Tcp(_stream) => {
                         self.sockets.get::<smoltcp::socket::tcp::Socket>(*handle)
@@ -487,7 +556,43 @@ impl SmoltcpProxy {
                     HostSocket::Unix(_stream) => {
                         self.sockets.get::<smoltcp::socket::tcp::Socket>(*handle)
                     }
-                    _ => {
+                    HostSocket::Udp(udp_socket) => {
+                        // let smoltcp_socket = self
+                        //     .sockets
+                        //     .get_mut::<smoltcp::socket::udp::Socket>(*handle);
+
+                        // trace!(?token, %handle, endpoint = %smoltcp_socket.endpoint(), send_queue = smoltcp_socket.send_queue(), recv_queue = smoltcp_socket.recv_queue(), "checking smoltcp udp socket");
+
+                        // if smoltcp_socket.can_recv() {
+                        //     trace!(?token, "udp socket can recv");
+                        //     // `can_recv` means there is data from the guest waiting to be sent to the host.
+                        //     match smoltcp_socket.recv() {
+                        //         Ok((data, metadata)) => {
+                        //             trace!(?token, bytes = data.len(), %metadata, "handling outgoing packet");
+                        //             // The remote_endpoint here is where the guest wants to send the data.
+                        //             // We need the mio socket to send it.
+                        //             // outgoing_udp_packets.push((*token, data.to_vec(), remote_endpoint));
+                        //             if let Some((_, real_dest_endpoint)) =
+                        //                 self.reverse_nat_table.get(&token)
+                        //             {
+                        //                 let dest_addr = SocketAddr::new(
+                        //                     real_dest_endpoint.addr.into(),
+                        //                     real_dest_endpoint.port,
+                        //                 );
+                        //                 trace!(?token, bytes = data.len(), %dest_addr, "Forwarding UDP packet from smoltcp to host");
+                        //                 if let Err(e) = udp_socket.send_to(&data, dest_addr) {
+                        //                     error!(?token, error = %e, "Failed to send UDP packet to host");
+                        //                 }
+                        //             } else {
+                        //                 warn!(?token, %metadata, "could not find UDP socket in reverse nat table!");
+                        //             }
+                        //         }
+                        //         Err(e) => {
+                        //             error!(?token, "could not recv from smotcp socket: {e}");
+                        //         }
+                        //     }
+                        // }
+
                         continue;
                     }
                 };
@@ -513,6 +618,73 @@ impl SmoltcpProxy {
                     }
                 }
             }
+
+            // // First, collect packets to send without holding a mutable borrow on `sockets`.
+            // for (token, conn) in self.host_connections.iter_mut() {
+            //     if let HostSocket::Udp(udp_socket) = &mut conn.socket {
+            //         let smoltcp_socket = self
+            //             .sockets
+            //             .get_mut::<smoltcp::socket::udp::Socket>(conn.handle);
+            //         if smoltcp_socket.can_recv() {
+            //             // `can_recv` means there is data from the guest waiting to be sent to the host.
+            //             match smoltcp_socket.recv() {
+            //                 Ok((data, metadata)) => {
+            //                     trace!(?token, bytes = data.len(), %metadata, "handling outgoing packet");
+            //                     // The remote_endpoint here is where the guest wants to send the data.
+            //                     // We need the mio socket to send it.
+            //                     // outgoing_udp_packets.push((*token, data.to_vec(), remote_endpoint));
+            //                     if let Some((_, real_dest_endpoint)) =
+            //                         self.reverse_nat_table.get(&token)
+            //                     {
+            //                         let dest_addr = SocketAddr::new(
+            //                             real_dest_endpoint.addr.into(),
+            //                             real_dest_endpoint.port,
+            //                         );
+            //                         trace!(?token, bytes = data.len(), %dest_addr, "Forwarding UDP packet from smoltcp to host");
+            //                         if let Err(e) = udp_socket.send_to(&data, dest_addr) {
+            //                             error!(?token, error = %e, "Failed to send UDP packet to host");
+            //                         }
+            //                     }
+            //                 }
+            //                 Err(e) => {
+            //                     error!(?token, "could not recv from smotcp socket: {e}");
+            //                 }
+            //             }
+            //         }
+            //     }
+            // }
+
+            const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+            const UDP_TIMEOUT: Duration = Duration::from_secs(30);
+
+            if last_cleanup.elapsed() > CLEANUP_INTERVAL {
+                trace!("Running periodic cleanup of stale UDP connections...");
+                let now = Instant::now();
+                let mut expired_tokens = Vec::new();
+
+                // Find expired UDP connections
+                for (token, conn) in self.host_connections.iter() {
+                    if let HostSocket::Udp(_) = conn.socket {
+                        if now.duration_since(conn.last_activity) > UDP_TIMEOUT {
+                            expired_tokens.push((*token, conn.handle));
+                        }
+                    }
+                }
+
+                // Now, clean them up
+                for (token, handle) in expired_tokens {
+                    debug!(?token, %handle, "Connection timed out. Removing.");
+                    self.host_connections.remove(&token);
+
+                    // no smoltcp socket to remove for UDP
+
+                    if let Some((guest_ep, _)) = self.reverse_nat_table.remove(&token) {
+                        self.nat_table.remove(&guest_ep);
+                    }
+                }
+
+                last_cleanup = Instant::now();
+            }
         }
     }
 
@@ -526,7 +698,9 @@ impl SmoltcpProxy {
         let socket = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
 
         // If the smoltcp socket is dead, we can't do anything.
-        if !socket.is_active() || socket.state() == smoltcp::socket::tcp::State::Closed {
+        if !(socket.may_send() || socket.may_recv())
+            || socket.state() == smoltcp::socket::tcp::State::Closed
+        {
             return false; // Tells the caller to remove this connection.
         }
 
@@ -570,8 +744,11 @@ impl SmoltcpProxy {
         }
 
         // --- 2. Read from Guest, Write to Host ---
-        if event.is_writable() && socket.can_recv() {
+        if event.is_writable() {
             loop {
+                if !socket.can_recv() {
+                    break;
+                }
                 // Loop to drain the guest-side buffer.
                 let result = socket.recv(|data| {
                     match stream.write(data) {
@@ -633,7 +810,8 @@ impl SmoltcpProxy {
         }
 
         // Return true to keep the connection, false to close it.
-        socket.is_active() && socket.state() != smoltcp::socket::tcp::State::Closed
+        (socket.may_send() || socket.may_recv())
+            && socket.state() != smoltcp::socket::tcp::State::Closed
     }
 
     fn handle_unix_listener_event(&mut self, token: Token) {
@@ -663,9 +841,6 @@ impl SmoltcpProxy {
                 let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65535]);
                 let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65535]);
                 let mut smoltcp_socket = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
-
-                smoltcp_socket.set_ack_delay(None);
-                smoltcp_socket.set_nagle_enabled(false);
 
                 // Set up the connection parameters. The remote endpoint is the guest.
                 let remote_endpoint = IpEndpoint::new(IpAddress::from(VM_IP), guest_port);
@@ -698,8 +873,14 @@ impl SmoltcpProxy {
                     .unwrap();
 
                 // Add the new active connection to our tracking map.
-                self.host_connections
-                    .insert(new_token, (HostSocket::Unix(stream), smoltcp_handle));
+                self.host_connections.insert(
+                    new_token,
+                    Conn {
+                        socket: HostSocket::Unix(stream),
+                        handle: smoltcp_handle,
+                        last_activity: Instant::now(),
+                    },
+                );
 
                 trace!(token = ?new_token, "assigned token to proxy connection");
             }
@@ -765,8 +946,11 @@ impl SmoltcpProxy {
                                 let mut smoltcp_socket =
                                     smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
 
-                                smoltcp_socket.set_ack_delay(None);
-                                smoltcp_socket.set_nagle_enabled(false);
+                                smoltcp_socket
+                                    .set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
+                                // FIXME: It should follow system's setting. 7200 is Linux's default.
+                                smoltcp_socket
+                                    .set_timeout(Some(smoltcp::time::Duration::from_secs(7200)));
 
                                 smoltcp_socket
                                     .listen(IpEndpoint::new(dest_addr, dest_port))
@@ -784,8 +968,14 @@ impl SmoltcpProxy {
                                         Interest::READABLE | Interest::WRITABLE,
                                     )
                                     .unwrap();
-                                self.host_connections
-                                    .insert(token, (HostSocket::Tcp(stream), smoltcp_handle));
+                                self.host_connections.insert(
+                                    token,
+                                    Conn {
+                                        socket: HostSocket::Tcp(stream),
+                                        handle: smoltcp_handle,
+                                        last_activity: Instant::now(),
+                                    },
+                                );
                             }
                         }
                     }
@@ -796,15 +986,46 @@ impl SmoltcpProxy {
                         if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                             let guest_addr = IpAddress::from(src);
                             let guest_port = udp.get_source();
+                            let guest_endpoint: IpEndpoint = (guest_addr, guest_port).into();
 
-                            // Check if this is the first packet for this session.
-                            if !self
-                                .nat_table
-                                .contains_key(&(guest_addr, guest_port).into())
-                            {
-                                self.handle_udp_datagram(src, dst, udp);
+                            // Check if this is part of an existing session.
+                            if let Some(token) = self.nat_table.get(&guest_endpoint).copied() {
+                                // This is an existing flow. Forward the packet directly.
+                                if let Some(conn) = self.host_connections.get_mut(&token) {
+                                    if let HostSocket::Udp(udp_socket) = &conn.socket {
+                                        if let Some((_, real_dest_endpoint)) =
+                                            self.reverse_nat_table.get(&token)
+                                        {
+                                            let dest_addr = SocketAddr::new(
+                                                real_dest_endpoint.addr.into(),
+                                                real_dest_endpoint.port,
+                                            );
+                                            trace!(?token, bytes = udp.payload().len(), %dest_addr, "Forwarding subsequent UDP packet from guest to host");
+                                            if let Err(e) =
+                                                udp_socket.send_to(udp.payload(), dest_addr)
+                                            {
+                                                error!(?token, error = %e, "Failed to send subsequent UDP packet to host");
+                                            }
+                                            conn.last_activity = Instant::now();
+                                        } else {
+                                            warn!(?token, "Could not find reverse NAT entry for existing UDP session");
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        ?token,
+                                        "Could not find connection for existing UDP session"
+                                    );
+                                }
+                                // We handled the packet.
                                 return true;
                             }
+
+                            // This is the FIRST packet for a new UDP session.
+                            // Create the host socket and NAT state.
+                            self.handle_udp_datagram(src, dst, udp);
+                            // We've handled this packet by sending it directly.
+                            return true;
                         }
                     }
                     _ => {}
@@ -822,185 +1043,211 @@ impl SmoltcpProxy {
             writable = event.is_writable(),
             "handling socket event"
         );
-        if let Some((mut stream, handle)) = self.host_connections.remove(&token) {
+        let mut keep_connection = true;
+        if let Some(Conn {
+            socket: mut stream,
+            handle,
+            mut last_activity,
+        }) = self.host_connections.remove(&token)
+        {
+            trace!(?token, %handle, "found connection for token");
             match &mut stream {
                 HostSocket::Tcp(stream) => {
                     trace!(?token, "fowarding tcp stream");
                     if !self.forward_stream(token, event, stream, handle) {
-                        trace!(?token, "tcp stream should not be kept, shutting down");
-                        _ = stream.shutdown(std::net::Shutdown::Both);
-                        return;
+                        keep_connection = false;
                     }
+                    last_activity = Instant::now();
                 }
                 HostSocket::Unix(stream) => {
                     trace!(?token, "fowarding unix stream");
                     if !self.forward_stream(token, event, stream, handle) {
-                        trace!(?token, "unix stream should not be kept, shutting down");
-                        _ = stream.shutdown(std::net::Shutdown::Both);
-                        return;
+                        keep_connection = false;
                     }
+                    last_activity = Instant::now();
                 }
-                // HostSocket::Tcp(stream) => {
-                //     let socket = self
-                //         .sockets
-                //         .get_mut::<smoltcp::socket::tcp::Socket>(*handle);
-
-                //     if event.is_writable() {
-                //         trace!(?token, "socket is writable");
-                //         while socket.can_recv() {
-                //             let result = socket.recv(|data| {
-                //                 // Write the data from smoltcp's send buffer to the host socket.
-                //                 match stream.write(data) {
-                //                     Ok(n) => {
-                //                         trace!(
-                //                             "Wrote {} bytes to host socket token={:?}",
-                //                             n,
-                //                             token
-                //                         );
-                //                         (n, (n, false))
-                //                     }
-                //                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                //                         // Host socket is full, stop for now.
-                //                         (0, (0, false))
-                //                     }
-                //                     Err(e) => {
-                //                         error!("Write error on host socket: {}", e);
-
-                //                         (0, (0, true))
-                //                     }
-                //                 }
-                //             });
-
-                //             match result {
-                //                 Ok((_, true)) => {
-                //                     trace!(
-                //                         ?token,
-                //                         "write error on socket, aborting smoltcp socket!"
-                //                     );
-                //                     socket.abort();
-                //                     // The mio socket is blocked, so break the loop.
-                //                     break;
-                //                 }
-                //                 Ok((0, false)) => {
-                //                     trace!(?token, "no more data to write");
-                //                     break;
-                //                 }
-                //                 Ok(_) => {
-                //                     // keep going
-                //                     trace!(?token, "looping to write more data");
-                //                 }
-                //                 Err(e) => {
-                //                     // An error occurred in smoltcp, close everything.
-                //                     trace!(?token, "error receiving from smoltcp socket: {e}");
-                //                     stream.shutdown(std::net::Shutdown::Both).ok();
-                //                     socket.abort();
-                //                     break;
-                //                 }
-                //             }
-                //         }
-                //         if !socket.can_recv() {
-                //             self.registry
-                //                 .reregister(stream, token, Interest::READABLE)
-                //                 .unwrap();
-                //         }
-                //     }
-
-                //     if event.is_readable() {
-                //         // Create a temporary buffer limited by the smaller of our buffer
-                //         // size or the available capacity in the smoltcp socket.
-                //         let mut read_buf = [0u8; 2048];
-                //         // Loop to drain all data available on the mio socket.
-                //         while socket.can_send() {
-                //             let max_sendable = socket.send_capacity() - socket.send_queue();
-                //             if max_sendable == 0 {
-                //                 // No more space in smoltcp's buffer, stop reading from host
-                //                 break;
-                //             }
-
-                //             // Limit our read to the smaller of our buffer size or what smoltcp can accept
-                //             let read_limit = std::cmp::min(max_sendable, read_buf.len());
-
-                //             match stream.read(&mut read_buf[..read_limit]) {
-                //                 Ok(0) => {
-                //                     // The host closed the connection.
-                //                     trace!(?token, "EOF from a host socket");
-                //                     socket.close();
-                //                     break;
-                //                 }
-                //                 Ok(n) => {
-                //                     // Give the exact data we read to smoltcp. This should not fail
-                //                     // since we sized our read to fit.
-                //                     if let Err(e) = socket.send_slice(&read_buf[..n]) {
-                //                         error!(
-                //                             ?token,
-                //                             "smoltcp send_slice error after sized read: {}", e
-                //                         );
-                //                         socket.abort();
-                //                         break;
-                //                     }
-                //                     trace!(?token, bytes = n, "read from host and sent to smoltcp");
-                //                 }
-                //                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                //                     // The mio socket has no more data to read for now.
-                //                     break;
-                //                 }
-                //                 Err(e) => {
-                //                     error!(?token, "Error reading from host socket: {}", e);
-                //                     socket.abort();
-                //                     break;
-                //                 }
-                //             }
-                //         }
-                //     }
-                // }
                 HostSocket::Udp(stream) => {
-                    if event.is_readable() {
-                        let mut buffer = [0u8; 2048];
-                        // Use recv_from to get the data AND the address of the internet server
-                        match stream.recv_from(&mut buffer) {
-                            Ok((size, source_addr)) => {
-                                trace!(?token, bytes = size, from = %source_addr, "read from a host UDP socket");
+                    // The `handle` is for the shared smoltcp socket used for replies.
+                    // The `stream` is the session-specific mio socket.
 
-                                // Look up the target guest for this connection
-                                if let Some((guest_endpoint, original_dest_endpoint)) =
-                                    self.reverse_nat_table.get(&token)
-                                {
-                                    if let Some(smoltcp_handle) =
-                                        self.udp_listeners.get(original_dest_endpoint)
-                                    {
-                                        let smoltcp_udp_socket =
-                                            self.sockets.get_mut::<smoltcp::socket::udp::Socket>(
-                                                *smoltcp_handle,
+                    if event.is_readable() {
+                        if let Some((guest_endpoint, _)) = self.reverse_nat_table.get(&token) {
+                            let mut buffer = [0u8; 2048];
+                            loop {
+                                match stream.recv_from(&mut buffer) {
+                                    Ok((size, real_source)) => {
+                                        trace!(?token, bytes = size, %real_source, %guest_endpoint, "Received UDP reply from host for guest");
+                                        last_activity = Instant::now(); // Update activity timer
+
+                                        let payload = &buffer[..size];
+
+                                        let raw_socket =
+                                            self.sockets.get_mut::<smoltcp::socket::raw::Socket>(
+                                                self.raw_socket_handle,
                                             );
 
-                                        // Construct the metadata to fake the source address
-                                        let metadata = smoltcp::socket::udp::UdpMetadata {
-                                            endpoint: *guest_endpoint,
-                                            local_address: Some(source_addr.ip().into()),
-                                            meta: Default::default(),
-                                        };
+                                        // Manually construct the IPv4 and UDP headers using pnet, but NOT the Ethernet header.
+                                        // The buffer for this needs to be large enough for an IP packet.
+                                        let mut ip_packet_buf = vec![0u8; 20 + 8 + payload.len()];
 
-                                        if let Err(e) =
-                                            smoltcp_udp_socket.send_slice(&buffer[..size], metadata)
-                                        {
-                                            error!("smoltcp UDP send_slice error: {}", e);
+                                        // Create IPv4 packet view.
+                                        let mut ipv4_packet =
+                                            MutableIpv4Packet::new(&mut ip_packet_buf).unwrap();
+                                        ipv4_packet.set_version(4);
+                                        ipv4_packet.set_header_length(5);
+                                        ipv4_packet
+                                            .set_total_length((20 + 8 + payload.len()) as u16);
+                                        ipv4_packet.set_ttl(64);
+                                        ipv4_packet
+                                            .set_next_level_protocol(IpNextHeaderProtocols::Udp);
+
+                                        // Spoof the source and destination IPs.
+                                        let src_ip: std::net::Ipv4Addr =
+                                            if let IpAddr::V4(addr) = real_source.ip() {
+                                                addr
+                                            } else {
+                                                unimplemented!("IPv6 not supported for UDP NAT yet")
+                                            };
+                                        let dst_ip: std::net::Ipv4Addr =
+                                            if let IpAddress::Ipv4(addr) = guest_endpoint.addr {
+                                                addr
+                                            } else {
+                                                unimplemented!("IPv6 not supported for UDP NAT yet")
+                                            };
+
+                                        ipv4_packet.set_source(src_ip);
+                                        ipv4_packet.set_destination(dst_ip);
+                                        ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(
+                                            &ipv4_packet.to_immutable(),
+                                        ));
+
+                                        // Create UDP packet view.
+                                        let mut udp_packet =
+                                            MutableUdpPacket::new(ipv4_packet.payload_mut())
+                                                .unwrap();
+                                        udp_packet.set_source(real_source.port());
+                                        udp_packet.set_destination(guest_endpoint.port);
+                                        udp_packet.set_length((8 + payload.len()) as u16);
+                                        udp_packet.set_payload(payload);
+                                        udp_packet.set_checksum(pnet::packet::udp::ipv4_checksum(
+                                            &udp_packet.to_immutable(),
+                                            &src_ip,
+                                            &dst_ip,
+                                        ));
+
+                                        // Send the IP packet using the smoltcp raw socket.
+                                        // smoltcp will now wrap it in a proper Ethernet frame and send it.
+                                        if let Err(e) = raw_socket.send_slice(&ip_packet_buf) {
+                                            error!(
+                                                "Failed to send UDP reply via raw socket: {}",
+                                                e
+                                            );
                                         }
+                                    }
+                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                        // No more data to read for now
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        error!(?token, error = %e, "Error reading from host UDP socket");
+                                        break;
                                     }
                                 }
                             }
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
-                            Err(e) => error!("Error reading from host UDP socket: {}", e),
+                        } else {
+                            warn!(?token, "could not find udp socket in reverse_nat_table! this shouldn't happen");
                         }
-                    }
-
-                    if event.is_writable() {
-                        // do nothing
                     }
                 }
             }
-            self.host_connections.insert(token, (stream, handle));
+
+            if keep_connection {
+                self.host_connections.insert(
+                    token,
+                    Conn {
+                        socket: stream,
+                        handle,
+                        last_activity,
+                    },
+                );
+            } else {
+                trace!(
+                    ?token,
+                    ?handle,
+                    "Connection terminated. Removing smoltcp socket."
+                );
+                // Close the OS socket
+                match stream {
+                    HostSocket::Tcp(s) => _ = s.shutdown(std::net::Shutdown::Both),
+                    HostSocket::Unix(s) => _ = s.shutdown(std::net::Shutdown::Both),
+                    _ => {}
+                }
+                self.sockets.remove(handle);
+                // Also remove from NAT tables if applicable
+                if let Some((guest_ep, _)) = self.reverse_nat_table.remove(&token) {
+                    self.nat_table.remove(&guest_ep);
+                }
+            }
         }
     }
+
+    // /// Constructs a UDP packet and sends it directly to the guest VM.
+    // fn send_udp_to_guest(
+    //     &mut self,
+    //     payload: &[u8],
+    //     real_source: SocketAddr,
+    //     guest_dest: IpEndpoint,
+    // ) {
+    //     // Try to get a transmit token from the device. If the guest's RX queue is full, we can't send.
+    //     if let Some(tx_token) = self.device.transmit(SmoltcpInstant::now()) {
+    //         let full_packet_len = 14 + 20 + 8 + payload.len();
+
+    //         tx_token.consume(full_packet_len, |buf| {
+    //             // 1. Create an Ethernet packet view into the buffer provided by the token.
+    //             let mut eth_packet = MutableEthernetPacket::new(buf).unwrap();
+    //             eth_packet.set_destination(VM_MAC.0.into());
+    //             eth_packet.set_source(PROXY_MAC.0.into());
+    //             eth_packet.set_ethertype(EtherTypes::Ipv4);
+
+    //             // 2. Create an IPv4 packet view.
+    //             let mut ipv4_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).unwrap();
+    //             ipv4_packet.set_version(4);
+    //             ipv4_packet.set_header_length(5);
+    //             ipv4_packet.set_total_length((20 + 8 + payload.len()) as u16);
+    //             ipv4_packet.set_ttl(64);
+    //             ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+
+    //             // Spoof the source and destination IPs.
+    //             let src_ip: std::net::Ipv4Addr = if let IpAddr::V4(addr) = real_source.ip() {
+    //                 addr
+    //             } else {
+    //                 unimplemented!("IPv6 not supported for UDP NAT yet")
+    //             };
+    //             let dst_ip: std::net::Ipv4Addr = if let IpAddress::Ipv4(addr) = guest_dest.addr {
+    //                 addr
+    //             } else {
+    //                 unimplemented!("IPv6 not supported for UDP NAT yet")
+    //             };
+    //             ipv4_packet.set_source(src_ip);
+    //             ipv4_packet.set_destination(dst_ip);
+    //             ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(&ipv4_packet.to_immutable()));
+
+    //             // 3. Create a UDP packet view.
+    //             let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
+    //             udp_packet.set_source(real_source.port());
+    //             udp_packet.set_destination(guest_dest.port);
+    //             udp_packet.set_length((8 + payload.len()) as u16);
+    //             udp_packet.set_payload(payload);
+    //             udp_packet.set_checksum(pnet::packet::udp::ipv4_checksum(
+    //                 &udp_packet.to_immutable(),
+    //                 &src_ip,
+    //                 &dst_ip,
+    //             ));
+    //         });
+    //     } else {
+    //         warn!("Guest RX queue full, dropping inbound UDP packet.");
+    //     }
+    // }
 
     fn get_ephemeral_port(&mut self) -> u16 {
         const EPHEMERAL_PORT_MIN: u16 = 49152;
@@ -1049,27 +1296,17 @@ impl SmoltcpProxy {
         let guest_endpoint = IpEndpoint::new(guest_addr, guest_port);
         let dest_endpoint = IpEndpoint::new(dest_addr, dest_port);
 
-        // For UDP, we use the NAT table to track "sessions" based on the guest's endpoint
-        if self.nat_table.contains_key(&guest_endpoint) {
-            // This is part of an existing session, we just need to forward the data.
-            // The mio event loop will handle reading/writing subsequent packets.
-            // We let smoltcp handle this packet to get it into the socket buffer.
-            return;
-        }
-
         info!(
             "New UDP session from guest {}:{} to {}:{}",
             guest_addr, guest_port, dest_addr, dest_port
         );
 
         let is_ipv4 = dest_addr.version() == IpVersion::Ipv4;
-
-        // Determine IP domain
         let domain = if is_ipv4 { Domain::IPV4 } else { Domain::IPV6 };
 
-        // Create and configure the socket using socket2
+        // Create and configure the host-facing socket
         let socket = Socket::new(domain, socket2::Type::DGRAM, None).unwrap();
-        const BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer
+        const BUF_SIZE: usize = 8 * 1024 * 1024;
         if let Err(e) = socket.set_recv_buffer_size(BUF_SIZE) {
             warn!(error = %e, "Failed to set UDP receive buffer size.");
         }
@@ -1078,74 +1315,44 @@ impl SmoltcpProxy {
         }
         socket.set_nonblocking(true).unwrap();
 
-        // Bind to a wildcard address
         let bind_addr: SocketAddr = if is_ipv4 { "0.0.0.0:0" } else { "[::]:0" }
             .parse()
             .unwrap();
         socket.bind(&bind_addr.into()).unwrap();
 
-        // This is a new UDP session. Set up the host socket and smoltcp twin.
-        // match socket.connect(&real_dest.into()) {
-        //     Ok(()) => {
-        // 2. Send the initial datagram using the standard socket directly.
-        let real_dest = SocketAddr::new(dest_addr.into(), dest_port);
-        if let Err(e) = socket.send_to(udp_packet.payload(), &real_dest.into()) {
-            error!("Failed to send initial UDP datagram: {}", e);
-            return;
-        }
-
         let mut mio_socket = mio::net::UdpSocket::from_std(socket.into());
 
-        let smoltcp_handle = *self.udp_listeners.entry(dest_endpoint).or_insert_with(|| {
-            info!("Creating new smoltcp listener for {}", dest_endpoint);
-            let rx_buffer = smoltcp::socket::udp::PacketBuffer::new(
-                vec![smoltcp::socket::udp::PacketMetadata::EMPTY],
-                vec![0; 1280],
-            );
-            let tx_buffer = smoltcp::socket::udp::PacketBuffer::new(
-                vec![smoltcp::socket::udp::PacketMetadata::EMPTY],
-                vec![0; 1280],
-            );
-            let mut socket = smoltcp::socket::udp::Socket::new(rx_buffer, tx_buffer);
-
-            // Bind the socket to the specific destination endpoint.
-            socket.bind(dest_endpoint).unwrap();
-
-            self.sockets.add(socket)
-        });
-
-        // Register with mio and map the sockets
+        // Register with mio and update NAT tables
         let token = Token(self.next_token);
         self.next_token += 1;
+
         self.registry
             .register(&mut mio_socket, token, Interest::READABLE)
             .unwrap();
-        self.host_connections
-            .insert(token, (HostSocket::Udp(mio_socket), smoltcp_handle));
 
-        // Add to NAT table to track the session
+        // The host_connections entry now represents a single UDP session.
+        // The handle is a dummy value since we are not using a smoltcp socket for UDP.
+        self.host_connections.insert(
+            token,
+            Conn {
+                socket: HostSocket::Udp(mio_socket),
+                handle: SocketHandle::default(), // Dummy handle
+                last_activity: Instant::now(),
+            },
+        );
+
         self.nat_table.insert(guest_endpoint, token);
         self.reverse_nat_table
             .insert(token, (guest_endpoint, dest_endpoint));
 
-        // let dest_socket_addr =
-        //     std::net::SocketAddr::new(dest_addr.into(), udp_packet.get_destination());
-
-        // if let Some((HostSocket::Udp(mio_socket), _)) = self.host_connections.get(&token) {
-        //     if let Err(e) = mio_socket.send_to(udp_packet.payload(), dest_socket_addr) {
-        //         error!("Failed to send initial UDP datagram: {}", e);
-        //     }
-        // }
-        // }
-        // Err(e) => {
-        //     error!("Failed to bind host UDP socket: {}", e);
-        // }
-        // }
-    }
-
-    /// Checks if a smoltcp socket is already being tracked.
-    fn is_socket_tracked(&self, handle: SocketHandle) -> bool {
-        self.host_connections.values().any(|(_, h)| *h == handle)
+        if let Some(conn) = self.host_connections.get(&token) {
+            if let HostSocket::Udp(s) = &conn.socket {
+                let real_dest = SocketAddr::new(dest_addr.into(), dest_port);
+                if let Err(e) = s.send_to(udp_packet.payload(), real_dest.into()) {
+                    error!("Failed to send initial UDP datagram: {}", e);
+                }
+            }
+        }
     }
 
     /// Signals the guest that there are used descriptors in a queue.
@@ -1239,13 +1446,15 @@ mod packet_dumper {
                                     if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                                         write!(
                                             f,
-                                            "[{}] IP {}.{} > {}.{}: len {}",
+                                            "[{}] IP {}.{} > {}.{}: len {} ({} > {})",
                                             self.direction,
                                             src,
                                             udp.get_source(),
                                             dst,
                                             udp.get_destination(),
-                                            udp.get_length()
+                                            udp.get_length(),
+                                            eth.get_source(),
+                                            eth.get_destination()
                                         )
                                     } else {
                                         write!(
