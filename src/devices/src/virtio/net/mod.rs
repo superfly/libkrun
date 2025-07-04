@@ -15,7 +15,7 @@ pub mod backend;
 pub mod device;
 mod gvproxy;
 mod passt;
-pub mod smoltcp_proxy;
+pub mod proxy;
 mod worker;
 
 pub use self::device::Net;

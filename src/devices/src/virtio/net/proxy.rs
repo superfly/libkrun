@@ -1,24 +1,24 @@
 use crate::legacy::IrqChip;
-use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, RX_INDEX, TX_INDEX};
+use crate::virtio::net::{MAX_BUFFER_SIZE, RX_INDEX, TX_INDEX};
 use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
 use crate::Error as DeviceError;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use mio::event::{Event, Source};
 use mio::net::UnixListener;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ethernet::EthernetPacket;
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::{TcpFlags, TcpPacket};
 use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
 use pnet::packet::{MutablePacket, Packet};
-use smoltcp::iface::{Config, Context, Interface, PollResult, Routes, SocketHandle, SocketSet};
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, TxToken as _};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
     EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion,
-    Ipv4Address, Ipv4Cidr,
+    Ipv4Address,
 };
 use socket2::{Domain, SockAddr, Socket};
 use std::cmp;
@@ -32,9 +32,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::EventFd;
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
-use vm_memory::{Bytes as MemBytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes as MemBytes, GuestMemoryMmap};
 
 // --- Constants and Configuration ---
 const VIRTQ_TX_TOKEN: Token = Token(0);
@@ -45,7 +45,6 @@ const VM_MAC: EthernetAddress = EthernetAddress([0xde, 0xad, 0xbe, 0xef, 0x00, 0
 const PROXY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
 const VM_IP: Ipv4Address = Ipv4Address::new(192, 168, 100, 2);
 const PROXY_IP: Ipv4Address = Ipv4Address::new(192, 168, 100, 1);
-const SUBNET_MASK: Ipv4Address = Ipv4Address::new(255, 255, 255, 0);
 
 /// Represents the virtio-net device as a `smoltcp` PHY device.
 /// This acts as the bridge between the VM's virtio queues and the smoltcp stack.
@@ -114,7 +113,7 @@ impl Device for VirtualDevice {
     /// Receives a packet from the virtio TX queue (i.e., from the guest).
     fn receive(
         &mut self,
-        timestamp: smoltcp::time::Instant,
+        _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.rx_buffer.pop_front().map(|buffer| {
             let rx_token = RxToken { buffer };
@@ -128,7 +127,7 @@ impl Device for VirtualDevice {
     }
 
     /// Transmits a packet to the virtio RX queue (i.e., to the guest).
-    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         // Check if there are any available descriptors in the RX queue.
         // The guest puts empty buffers here for us to fill.
         if !self.queues[RX_INDEX].is_empty(&self.mem) {
@@ -244,7 +243,7 @@ struct Conn {
 }
 
 /// The main proxy structure, now using smoltcp.
-pub struct SmoltcpProxy {
+pub struct ProxyNetWorker {
     // Virtio-related fields
     queue_evts: Vec<EventFd>,
     interrupt_status: Arc<AtomicUsize>,
@@ -264,7 +263,6 @@ pub struct SmoltcpProxy {
     host_connections: HashMap<Token, Conn>,
     nat_table: HashMap<IpEndpoint, Token>, // (External IP, External Port) -> Token
     reverse_nat_table: HashMap<Token, (IpEndpoint, IpEndpoint)>,
-    udp_listeners: HashMap<IpEndpoint, SocketHandle>,
     unix_listeners: HashMap<Token, (UnixListener, u16)>,
 
     raw_socket_handle: SocketHandle,
@@ -272,7 +270,7 @@ pub struct SmoltcpProxy {
     next_ephemeral_port: u16,
 }
 
-impl SmoltcpProxy {
+impl ProxyNetWorker {
     pub fn new(
         queues: Vec<Queue>,
         queue_evts: Vec<EventFd>,
@@ -367,7 +365,7 @@ impl SmoltcpProxy {
             unix_listeners.insert(token, (listener, vm_port));
         }
 
-        Ok(SmoltcpProxy {
+        Ok(ProxyNetWorker {
             queue_evts,
             interrupt_status,
             interrupt_evt,
@@ -383,7 +381,6 @@ impl SmoltcpProxy {
             nat_table: HashMap::new(),
             reverse_nat_table: HashMap::new(),
             next_ephemeral_port: 49152,
-            udp_listeners: HashMap::new(),
             unix_listeners,
             raw_socket_handle,
         })
@@ -484,7 +481,7 @@ impl SmoltcpProxy {
                 PollResult::None => {
                     let elapsed = last_changes_at.elapsed();
                     if elapsed > Duration::from_secs(5) {
-                        debug!("no changes since {elapsed:?}");
+                        trace!("no changes since {elapsed:?}");
                         for (handle, socket) in self.sockets.iter() {
                             match socket {
                                 smoltcp::socket::Socket::Raw(socket) => {
@@ -673,7 +670,7 @@ impl SmoltcpProxy {
 
                 // Now, clean them up
                 for (token, handle) in expired_tokens {
-                    debug!(?token, %handle, "Connection timed out. Removing.");
+                    trace!(?token, %handle, "Connection timed out. Removing.");
                     self.host_connections.remove(&token);
 
                     // no smoltcp socket to remove for UDP
@@ -831,7 +828,7 @@ impl SmoltcpProxy {
                     }
                 };
 
-                info!(
+                trace!(
                     ?token,
                     port = guest_port,
                     "Accepted new unix socket connection"
@@ -908,7 +905,7 @@ impl SmoltcpProxy {
                                 let dest_socket_addr =
                                     std::net::SocketAddr::new(dest_addr.into(), dest_port);
 
-                                info!(from = %guest_addr, to = %dest_socket_addr, "New connection attempt from guest");
+                                trace!(from = %guest_addr, to = %dest_socket_addr, "New connection attempt from guest");
 
                                 let real_dest = SocketAddr::new(dest_addr.into(), dest_port);
                                 let stream = match dest_addr.into() {
@@ -1191,64 +1188,6 @@ impl SmoltcpProxy {
         }
     }
 
-    // /// Constructs a UDP packet and sends it directly to the guest VM.
-    // fn send_udp_to_guest(
-    //     &mut self,
-    //     payload: &[u8],
-    //     real_source: SocketAddr,
-    //     guest_dest: IpEndpoint,
-    // ) {
-    //     // Try to get a transmit token from the device. If the guest's RX queue is full, we can't send.
-    //     if let Some(tx_token) = self.device.transmit(SmoltcpInstant::now()) {
-    //         let full_packet_len = 14 + 20 + 8 + payload.len();
-
-    //         tx_token.consume(full_packet_len, |buf| {
-    //             // 1. Create an Ethernet packet view into the buffer provided by the token.
-    //             let mut eth_packet = MutableEthernetPacket::new(buf).unwrap();
-    //             eth_packet.set_destination(VM_MAC.0.into());
-    //             eth_packet.set_source(PROXY_MAC.0.into());
-    //             eth_packet.set_ethertype(EtherTypes::Ipv4);
-
-    //             // 2. Create an IPv4 packet view.
-    //             let mut ipv4_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).unwrap();
-    //             ipv4_packet.set_version(4);
-    //             ipv4_packet.set_header_length(5);
-    //             ipv4_packet.set_total_length((20 + 8 + payload.len()) as u16);
-    //             ipv4_packet.set_ttl(64);
-    //             ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
-
-    //             // Spoof the source and destination IPs.
-    //             let src_ip: std::net::Ipv4Addr = if let IpAddr::V4(addr) = real_source.ip() {
-    //                 addr
-    //             } else {
-    //                 unimplemented!("IPv6 not supported for UDP NAT yet")
-    //             };
-    //             let dst_ip: std::net::Ipv4Addr = if let IpAddress::Ipv4(addr) = guest_dest.addr {
-    //                 addr
-    //             } else {
-    //                 unimplemented!("IPv6 not supported for UDP NAT yet")
-    //             };
-    //             ipv4_packet.set_source(src_ip);
-    //             ipv4_packet.set_destination(dst_ip);
-    //             ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(&ipv4_packet.to_immutable()));
-
-    //             // 3. Create a UDP packet view.
-    //             let mut udp_packet = MutableUdpPacket::new(ipv4_packet.payload_mut()).unwrap();
-    //             udp_packet.set_source(real_source.port());
-    //             udp_packet.set_destination(guest_dest.port);
-    //             udp_packet.set_length((8 + payload.len()) as u16);
-    //             udp_packet.set_payload(payload);
-    //             udp_packet.set_checksum(pnet::packet::udp::ipv4_checksum(
-    //                 &udp_packet.to_immutable(),
-    //                 &src_ip,
-    //                 &dst_ip,
-    //             ));
-    //         });
-    //     } else {
-    //         warn!("Guest RX queue full, dropping inbound UDP packet.");
-    //     }
-    // }
-
     fn get_ephemeral_port(&mut self) -> u16 {
         const EPHEMERAL_PORT_MIN: u16 = 49152;
 
@@ -1296,9 +1235,12 @@ impl SmoltcpProxy {
         let guest_endpoint = IpEndpoint::new(guest_addr, guest_port);
         let dest_endpoint = IpEndpoint::new(dest_addr, dest_port);
 
-        info!(
+        trace!(
             "New UDP session from guest {}:{} to {}:{}",
-            guest_addr, guest_port, dest_addr, dest_port
+            guest_addr,
+            guest_port,
+            dest_addr,
+            dest_port
         );
 
         let is_ipv4 = dest_addr.version() == IpVersion::Ipv4;

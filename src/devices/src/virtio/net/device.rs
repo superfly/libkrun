@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::legacy::IrqChip;
-use crate::virtio::net::smoltcp_proxy::SmoltcpProxy;
+use crate::virtio::net::proxy::ProxyNetWorker;
 use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{QUEUE_SIZES, RX_INDEX, TX_INDEX};
 use crate::virtio::queue::Error as QueueError;
@@ -244,23 +244,7 @@ impl VirtioDevice for Net {
 
         match &self.cfg_backend {
             VirtioNetBackend::Proxy(listeners) => {
-                // let unified_proxy = UnifiedNetProxy::new(
-                //     self.queues.clone(),
-                //     queue_evts,
-                //     self.interrupt_status.clone(),
-                //     self.interrupt_evt.try_clone().unwrap(),
-                //     self.intc.clone(),
-                //     self.irq_line,
-                //     mem.clone(),
-                //     listeners.clone(),
-                // )
-                // .map_err(|e| {
-                //     log::error!("Failed to create unified proxy: {}", e);
-                //     ActivateError::EpollCtl(e)
-                // })?;
-                // unified_proxy.run();
-                //
-                let proxy = SmoltcpProxy::new(
+                let proxy = ProxyNetWorker::new(
                     self.queues.clone(),
                     queue_evts,
                     self.interrupt_status.clone(),
