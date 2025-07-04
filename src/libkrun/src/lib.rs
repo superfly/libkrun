@@ -27,9 +27,8 @@ use devices::virtio::block::ImageType;
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
-use devices::virtio::{HostPortMap, Queue};
+use devices::virtio::Queue;
 use env_logger::Env;
-use event::Event;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
 use libc::{c_char, c_int};
@@ -126,7 +125,7 @@ impl KrunfwBindings {
 
 #[derive(Default)]
 struct TsiConfig {
-    port_map: Option<HostPortMap>,
+    port_map: Option<HashMap<u16, u16>>,
 }
 
 enum NetworkConfig {
@@ -270,7 +269,7 @@ impl ContextConfig {
         self.mac = Some(mac);
     }
 
-    fn set_port_map(&mut self, new_port_map: HostPortMap) -> Result<(), ()> {
+    fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
         match &mut self.net_cfg {
             NetworkConfig::Tsi(tsi_config) => {
                 tsi_config.port_map.replace(new_port_map);
@@ -722,7 +721,44 @@ pub unsafe extern "C" fn krun_set_net_mac(ctx_id: u32, c_mac: *const u8) -> i32 
     KRUN_SUCCESS
 }
 
-pub fn krun_set_port_map(ctx_id: u32, port_map: HostPortMap) -> i32 {
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
+    let mut port_map = HashMap::new();
+    let port_map_array: &[*const c_char] = slice::from_raw_parts(c_port_map, MAX_ARGS);
+    for item in port_map_array.iter().take(MAX_ARGS) {
+        if item.is_null() {
+            break;
+        } else {
+            let s = match CStr::from_ptr(*item).to_str() {
+                Ok(s) => s,
+                Err(_) => return -libc::EINVAL,
+            };
+            let port_tuple: Vec<&str> = s.split(':').collect();
+            if port_tuple.len() != 2 {
+                return -libc::EINVAL;
+            }
+            let host_port: u16 = match port_tuple[0].parse() {
+                Ok(p) => p,
+                Err(_) => return -libc::EINVAL,
+            };
+            let guest_port: u16 = match port_tuple[1].parse() {
+                Ok(p) => p,
+                Err(_) => return -libc::EINVAL,
+            };
+
+            if port_map.contains_key(&guest_port) {
+                return -libc::EINVAL;
+            }
+            for hp in port_map.values() {
+                if *hp == host_port {
+                    return -libc::EINVAL;
+                }
+            }
+            port_map.insert(guest_port, host_port);
+        }
+    }
+
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();

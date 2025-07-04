@@ -4,8 +4,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
-use crossbeam_channel::Sender;
-use event::Event;
 use utils::epoll::EventSet;
 
 #[derive(Debug)]
@@ -33,12 +31,6 @@ pub enum ProxyStatus {
     WaitingCreditUpdate,
     ReverseInit,
     WaitingOnAccept,
-}
-
-impl ProxyStatus {
-    pub fn is_busy_listening(&self) -> bool {
-        matches!(self, ProxyStatus::Listening | ProxyStatus::WaitingOnAccept)
-    }
 }
 
 #[derive(Default)]
@@ -72,32 +64,6 @@ impl fmt::Display for ProxyError {
     }
 }
 
-#[derive(Hash, Debug, Eq, PartialEq, Clone, Copy)]
-pub enum PortProtocol {
-    Tcp,
-    Udp,
-}
-
-#[derive(Debug, Clone)]
-pub enum HostPort {
-    Static(u16),
-    Dynamic(Sender<Event>),
-}
-
-impl PartialEq for HostPort {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Static(l0), Self::Static(r0)) => l0 == r0,
-            (Self::Dynamic(_), Self::Dynamic(_)) => true,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for HostPort {}
-
-pub type HostPortMap = HashMap<PortProtocol, HashMap<u16, HostPort>>;
-
 pub trait Proxy: Send + AsRawFd {
     fn id(&self) -> u64;
     #[allow(dead_code)]
@@ -114,7 +80,7 @@ pub trait Proxy: Send + AsRawFd {
         &mut self,
         pkt: &VsockPacket,
         req: TsiListenReq,
-        host_port_map: &Option<HostPortMap>,
+        host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate;
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
@@ -122,7 +88,7 @@ pub trait Proxy: Send + AsRawFd {
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}
     fn push_accept_rsp(&self, _result: i32) {}
-    fn shutdown(&mut self, _pkt: &VsockPacket, _host_port_map: &Option<HostPortMap>) {}
+    fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
 }

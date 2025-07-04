@@ -48,7 +48,6 @@ smoltcp = { version = "0.12", features = [
 arch = { path = "../arch" }
 utils = { path = "../utils" }
 polly = { path = "../polly" }
-event = { path = "../event" }
 rutabaga_gfx = { path = "../rutabaga_gfx", features = [
     "virgl_renderer",
     "virgl_renderer_next",

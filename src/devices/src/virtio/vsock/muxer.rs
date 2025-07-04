@@ -12,7 +12,7 @@ use super::defs::uapi;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
-use super::proxy::{HostPortMap, Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
 use super::tcp::TcpProxy;
 #[cfg(target_os = "macos")]
@@ -82,7 +82,7 @@ pub fn push_packet(
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &GuestMemoryMmap,
-) -> bool {
+) {
     let mut queue = queue_mutex.lock().unwrap();
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
@@ -91,18 +91,16 @@ pub fn push_packet(
                 error!("failed to add used elements to the queue: {:?}", e);
             }
         }
-        true
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
-        false
     }
 }
 
 pub struct VsockMuxer {
     cid: u64,
-    host_port_map: Option<HostPortMap>,
+    host_port_map: Option<HashMap<u16, u16>>,
     queue: Option<Arc<Mutex<VirtQueue>>>,
     mem: Option<GuestMemoryMmap>,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -119,7 +117,7 @@ pub struct VsockMuxer {
 impl VsockMuxer {
     pub(crate) fn new(
         cid: u64,
-        host_port_map: Option<HostPortMap>,
+        host_port_map: Option<HashMap<u16, u16>>,
         interrupt_evt: EventFd,
         interrupt_status: Arc<AtomicUsize>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
@@ -182,7 +180,6 @@ impl VsockMuxer {
             irq_line,
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
-            self.host_port_map.clone(),
         );
         thread.run();
 
@@ -232,7 +229,7 @@ impl VsockMuxer {
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                debug!("deferring proxy removal: {}", id);
+                warn!("deferring proxy removal: {}", id);
                 if let Some(reaper_sender) = &self.reaper_sender {
                     if reaper_sender.send(id).is_err() {
                         self.proxy_map.write().unwrap().remove(&id);
@@ -279,7 +276,7 @@ impl VsockMuxer {
             };
             match req._type {
                 defs::SOCK_STREAM => {
-                    debug!("vsock: proxy create stream (local port: {}, peer port: {}, control port: {})", defs::TSI_PROXY_PORT, req.peer_port, pkt.src_port());
+                    debug!("vsock: proxy create stream");
                     let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
                     match TcpProxy::new(
                         id,
@@ -290,7 +287,6 @@ impl VsockMuxer {
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
-                        self.host_port_map.clone(),
                     ) {
                         Ok(proxy) => {
                             self.proxy_map
@@ -577,7 +573,7 @@ impl VsockMuxer {
         debug!("vsock: OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-            proxy.lock().unwrap().shutdown(pkt, &self.host_port_map);
+            proxy.lock().unwrap().shutdown(pkt);
         }
     }
 

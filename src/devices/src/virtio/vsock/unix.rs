@@ -1,6 +1,6 @@
 use super::{
     defs::{self, uapi},
-    proxy::{HostPortMap, ProxyRemoval, RecvPkt},
+    proxy::{ProxyRemoval, RecvPkt},
 };
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -448,7 +448,7 @@ impl Proxy for UnixProxy {
         &mut self,
         _pkt: &VsockPacket,
         _req: TsiListenReq,
-        _host_port_map: &Option<HostPortMap>,
+        _host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
         todo!();
     }
@@ -512,7 +512,7 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket, _host_port_map: &Option<HostPortMap>) {
+    fn shutdown(&mut self, pkt: &VsockPacket) {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -674,7 +674,12 @@ impl Proxy for UnixAcceptorProxy {
     fn sendto_addr(&mut self, _: TsiSendtoAddr) -> ProxyUpdate {
         unreachable!()
     }
-    fn listen(&mut self, _: &VsockPacket, _: TsiListenReq, _: &Option<HostPortMap>) -> ProxyUpdate {
+    fn listen(
+        &mut self,
+        _: &VsockPacket,
+        _: TsiListenReq,
+        _: &Option<HashMap<u16, u16>>,
+    ) -> ProxyUpdate {
         unreachable!()
     }
     fn accept(&mut self, _: TsiAcceptReq) -> ProxyUpdate {

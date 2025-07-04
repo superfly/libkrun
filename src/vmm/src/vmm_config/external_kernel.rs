@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
-#[repr(u32)]
 pub enum KernelFormat {
     // Raw image, ready to be loaded into the VM.
     Raw,

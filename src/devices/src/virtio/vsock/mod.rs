@@ -22,7 +22,6 @@ mod unix;
 
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
-pub use self::proxy::{HostPort, HostPortMap, PortProtocol};
 
 use vm_memory::GuestMemoryError;
 

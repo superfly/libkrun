@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{
-    accept, bind, connect, getpeername, getsockname, listen, recv, send, setsockopt, shutdown,
-    socket, sockopt, AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, SockaddrIn,
+    accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
+    AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, SockaddrIn,
 };
 use nix::unistd::close;
 
@@ -22,8 +22,7 @@ use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{
-    HostPort, HostPortMap, NewProxyType, PortProtocol, Proxy, ProxyError, ProxyRemoval,
-    ProxyStatus, ProxyUpdate, RecvPkt,
+    NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
 use utils::epoll::EventSet;
 
@@ -48,8 +47,6 @@ pub struct TcpProxy {
     peer_fwd_cnt: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
-    listen_guest_port: Option<u16>,
-    host_port_map: Option<HostPortMap>,
 }
 
 impl TcpProxy {
@@ -63,7 +60,6 @@ impl TcpProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
-        host_port_map: Option<HostPortMap>,
     ) -> Result<Self, ProxyError> {
         let fd = socket(
             AddressFamily::Inet,
@@ -121,8 +117,6 @@ impl TcpProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
-            listen_guest_port: None,
-            host_port_map,
         })
     }
 
@@ -137,7 +131,6 @@ impl TcpProxy {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
-        host_port_map: Option<HostPortMap>,
     ) -> Self {
         debug!(
             "new_reverse: id={} local_port={} peer_port={}",
@@ -162,8 +155,6 @@ impl TcpProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             pending_accepts: 0,
-            listen_guest_port: None,
-            host_port_map,
         }
     }
 
@@ -182,26 +173,19 @@ impl TcpProxy {
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
-    fn try_listen(&mut self, req: &TsiListenReq, host_port_map: &Option<HostPortMap>) -> i32 {
-        if self.status.is_busy_listening() {
+    fn try_listen(&mut self, req: &TsiListenReq, host_port_map: &Option<HashMap<u16, u16>>) -> i32 {
+        if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
             return 0;
         }
 
-        let (port, evt_tx) = if let Some(port_map) = host_port_map {
-            if let Some(tcp_port_map) = port_map.get(&PortProtocol::Tcp) {
-                if let Some(port) = tcp_port_map.get(&req.port) {
-                    match &port {
-                        HostPort::Static(port) => (*port, None),
-                        HostPort::Dynamic(sender) => (0, Some(sender)),
-                    }
-                } else {
-                    return -libc::EPERM;
-                }
+        let port = if let Some(port_map) = host_port_map {
+            if let Some(port) = port_map.get(&req.port) {
+                *port
             } else {
                 return -libc::EPERM;
             }
         } else {
-            (req.port, None)
+            req.port
         };
 
         match bind(
@@ -210,38 +194,6 @@ impl TcpProxy {
         ) {
             Ok(_) => {
                 debug!("tcp bind: id={}", self.id);
-
-                if let Some(evt_tx) = evt_tx {
-                    match getsockname::<SockaddrIn>(self.fd) {
-                        Ok(t) => {
-                            if let Err(e) = evt_tx.send(event::Event::ListenPortAssignment(
-                                event::ListenPortAssignment {
-                                    proto: event::PortProtocol::Tcp,
-                                    guest_port: req.port,
-                                    port: t.port(),
-                                },
-                            )) {
-                                warn!("could not send back bound port: {e}");
-                            } else {
-                                info!(
-                                    "sent back bound port: {} for guest port: {} (addr: {})",
-                                    t.port(),
-                                    req.port,
-                                    req.addr
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!("tcp getsockaddr: id={} err={}", self.id, e);
-                            #[cfg(target_os = "macos")]
-                            let errno = -linux_errno_raw(e as i32);
-                            #[cfg(target_os = "linux")]
-                            let errno = -(e as i32);
-                            return errno;
-                        }
-                    }
-                }
-
                 match listen(self.fd, req.backlog as usize) {
                     Ok(_) => {
                         debug!("tcp: proxy: id={}", self.id);
@@ -374,7 +326,7 @@ impl TcpProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn push_reset(&self) -> bool {
+    fn push_reset(&self) {
         debug!(
             "push_reset: id: {}, peer_port: {}, local_port: {}",
             self.id, self.peer_port, self.local_port
@@ -385,7 +337,7 @@ impl TcpProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem)
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
     fn switch_to_connected(&mut self) {
@@ -573,7 +525,7 @@ impl Proxy for TcpProxy {
         &mut self,
         pkt: &VsockPacket,
         req: TsiListenReq,
-        host_port_map: &Option<HostPortMap>,
+        host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
         debug!(
             "listen: id={} addr={}, port={}, vm_port={} backlog={}",
@@ -593,7 +545,6 @@ impl Proxy for TcpProxy {
 
         if result == 0 {
             self.peer_port = req.vm_port;
-            self.listen_guest_port = Some(req.port);
             self.status = ProxyStatus::Listening;
             update.polling = Some((self.id, self.fd, EventSet::IN));
         }
@@ -698,7 +649,7 @@ impl Proxy for TcpProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket, host_port_map: &Option<HostPortMap>) {
+    fn shutdown(&mut self, pkt: &VsockPacket) {
         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -711,14 +662,7 @@ impl Proxy for TcpProxy {
         };
 
         if let Err(e) = shutdown(self.fd, how) {
-            debug!("error sending shutdown to socket: {}", e);
-        }
-
-        if self.status == ProxyStatus::Listening || self.status == ProxyStatus::WaitingOnAccept {
-            debug!(
-                "listening on port was shutdown, peer port: {}, local port: {}",
-                self.peer_port, self.local_port
-            );
+            warn!("error sending shutdown to socket: {}", e);
         }
     }
 
@@ -741,42 +685,18 @@ impl Proxy for TcpProxy {
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        // If already closed, ignore all events to prevent infinite loops
-        if self.status == ProxyStatus::Closed {
-            debug!(
-                "process_event: ignoring event for closed proxy: {:?}",
-                evset
-            );
-            update.polling = Some((self.id, self.fd, EventSet::empty()));
-            return update;
-        }
-
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
-
-            // Determine removal type and status before changing status
-            let was_listening = self.status == ProxyStatus::Listening;
-            let was_connecting = self.status == ProxyStatus::Connecting;
-
-            // Set status to closed FIRST to prevent re-processing
-            self.status = ProxyStatus::Closed;
-
-            // Immediately stop polling this fd to prevent infinite HANG_UP events
-            update.polling = Some((self.id, self.fd, EventSet::empty()));
-
-            // Try to send appropriate response based on what status we had before closing
-            if was_listening {
-                // Don't send reset for listening sockets
-            } else if was_connecting {
+            if self.status == ProxyStatus::Connecting {
                 self.push_connect_rsp(-libc::ECONNREFUSED);
             } else {
-                // Try to send reset, but don't worry if it fails due to queue being full
-                let _success = self.push_reset();
-                // Note: If push_reset fails, the reset will be queued in rxq and sent later
+                self.push_reset();
             }
 
+            self.status = ProxyStatus::Closed;
+            update.polling = Some((self.id, self.fd, EventSet::empty()));
             update.signal_queue = true;
-            update.remove_proxy = if was_listening {
+            update.remove_proxy = if self.status == ProxyStatus::Listening {
                 ProxyRemoval::Immediate
             } else {
                 ProxyRemoval::Deferred
@@ -842,9 +762,7 @@ impl Proxy for TcpProxy {
                 // OP_REQUEST and the vsock transport is fully established.
                 update.polling = Some((self.id(), self.fd, EventSet::empty()));
             } else {
-                // OUT events on non-connecting sockets are normal (socket ready for writing)
-                // Just ignore them since we don't currently use write buffering that would need this
-                debug!("process_event: OUT ignored for status {:?}", self.status);
+                error!("vsock::tcp: EventSet::OUT while not connecting");
             }
         }
 
@@ -860,40 +778,8 @@ impl AsRawFd for TcpProxy {
 
 impl Drop for TcpProxy {
     fn drop(&mut self) {
-        debug!(
-            "TcpProxy dropped! local port: {}, peer port: {}, control port: {}, status: {:?}",
-            self.local_port, self.peer_port, self.control_port, self.status
-        );
         if let Err(e) = close(self.fd) {
             warn!("error closing proxy fd: {}", e);
-        }
-        if let Some(port) = self.listen_guest_port {
-            debug!("was listening on guest port: {port}");
-            if let Some(port_map) = self
-                .host_port_map
-                .take()
-                .and_then(|mut port_protos| port_protos.remove(&PortProtocol::Tcp))
-            {
-                if let Some(port_def) = port_map.get(&port) {
-                    match port_def {
-                        HostPort::Static(host_port) => {
-                            debug!("static host port {host_port}, do nothing");
-                        }
-                        HostPort::Dynamic(sender) => {
-                            if let Err(e) = sender.send(event::Event::ListenPortShutdown(
-                                event::ListenPortShutdown {
-                                    proto: event::PortProtocol::Tcp,
-                                    guest_port: port,
-                                },
-                            )) {
-                                error!("could not sent port shutdown event for TCP {port}: {e}");
-                            } else {
-                                info!("sent port shutdown event port TCP {port}");
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }

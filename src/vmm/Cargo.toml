@@ -21,14 +21,12 @@ libc = ">=0.2.39"
 linux-loader = { version = "0.13.0", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
 vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
-rangemap = "1.5.1"
 
 arch = { path = "../arch" }
 devices = { path = "../devices" }
 kernel = { path = "../kernel" }
 utils = { path = "../utils"}
 polly = { path = "../polly" }
-event = { path = "../event" }
 
 # Dependencies for amd-sev
 codicon = { version = "3.0.0", optional = true }

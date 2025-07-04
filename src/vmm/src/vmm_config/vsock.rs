@@ -6,9 +6,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::Sender;
-use devices::virtio::{HostPortMap, Vsock, VsockError};
-use event::Event;
+use devices::virtio::{Vsock, VsockError};
 
 type MutexVsock = Arc<Mutex<Vsock>>;
 
@@ -39,7 +37,7 @@ pub struct VsockDeviceConfig {
     /// A 32-bit Context Identifier (CID) used to identify the guest.
     pub guest_cid: u32,
     /// An optional map of host to guest port mappings.
-    pub host_port_map: Option<HostPortMap>,
+    pub host_port_map: Option<HashMap<u16, u16>>,
     /// An optional map of guest port to host UNIX domain sockets for IPC.
     pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
 }

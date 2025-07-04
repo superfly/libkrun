@@ -12,7 +12,6 @@ use super::muxer::{push_packet, MuxerRx, ProxyMap};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tcp::TcpProxy;
-use super::HostPortMap;
 
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
@@ -35,7 +34,6 @@ pub struct MuxerThread {
     irq_line: Option<u32>,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
-    host_port_map: Option<HostPortMap>,
 }
 
 impl MuxerThread {
@@ -53,7 +51,6 @@ impl MuxerThread {
         irq_line: Option<u32>,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
-        host_port_map: Option<HostPortMap>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -68,7 +65,6 @@ impl MuxerThread {
             irq_line,
             reaper_sender,
             unix_ipc_port_map,
-            host_port_map,
         }
     }
 
@@ -109,11 +105,11 @@ impl MuxerThread {
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
-                debug!("immediately removing proxy: {}", id);
+                warn!("immediately removing proxy: {}", id);
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                debug!("deferring proxy removal: {}", id);
+                warn!("deferring proxy removal: {}", id);
                 if self.reaper_sender.send(id).is_err() {
                     self.proxy_map.write().unwrap().remove(&id);
                 }
@@ -136,7 +132,6 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
-                    self.host_port_map.clone(),
                 )),
                 NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
                     new_id,
