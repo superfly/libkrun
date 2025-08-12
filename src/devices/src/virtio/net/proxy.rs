@@ -547,10 +547,7 @@ impl ProxyNetWorker {
             ) in self.host_connections.iter_mut()
             {
                 let socket = match stream {
-                    HostSocket::Tcp(_stream) => {
-                        self.sockets.get::<smoltcp::socket::tcp::Socket>(*handle)
-                    }
-                    HostSocket::Unix(_stream) => {
+                    HostSocket::Tcp(_) | HostSocket::Unix(_) => {
                         self.sockets.get::<smoltcp::socket::tcp::Socket>(*handle)
                     }
                     HostSocket::Udp(_udp_socket) => {
@@ -558,25 +555,25 @@ impl ProxyNetWorker {
                     }
                 };
 
-                // Use `can_recv()` to check if there is ACTUALLY data waiting to be sent.
-                // `may_recv()` is too broad and causes the busy-loop.
-                if socket.can_recv() {
-                    // Re-register for writable events since we now have data to send.
-                    // This needs to handle both TCP and Unix streams.
-                    match stream {
-                        HostSocket::Tcp(s) => {
-                            self.registry
-                                .reregister(s, *token, Interest::READABLE | Interest::WRITABLE)
-                                .unwrap();
-                        }
-                        HostSocket::Unix(s) => {
-                            self.registry
-                                .reregister(s, *token, Interest::READABLE | Interest::WRITABLE)
-                                .unwrap();
-                        }
-                        // No action needed for UDP here.
-                        _ => {}
+                let interests = if socket.can_recv() && socket.can_send() {
+                    Interest::READABLE | Interest::WRITABLE
+                } else if socket.can_recv() {
+                    Interest::WRITABLE
+                } else if socket.can_send() {
+                    Interest::READABLE
+                } else {
+                    continue;
+                };
+
+                // Only re-register if we need any events
+                match stream {
+                    HostSocket::Tcp(s) => {
+                        self.registry.reregister(s, *token, interests).unwrap();
                     }
+                    HostSocket::Unix(s) => {
+                        self.registry.reregister(s, *token, interests).unwrap();
+                    }
+                    _ => {}
                 }
             }
 
@@ -643,7 +640,9 @@ impl ProxyNetWorker {
                 state = %socket_state,
                 active = socket.is_active(),
                 may_send = socket.may_send(),
+                can_send = socket.can_send(),
                 may_recv = socket.may_recv(),
+                can_recv = socket.can_recv(),
                 "Socket not ready for I/O, but still alive. Waiting."
             );
             // Keep the connection alive, but don't try to do I/O.
@@ -693,6 +692,7 @@ impl ProxyNetWorker {
 
         // --- 2. Read from Guest, Write to Host ---
         if event.is_writable() {
+            trace!(?token, %socket_state, "socket is writable");
             loop {
                 if !socket.can_recv() {
                     trace!(?token, %socket_state, "socket can't recv");
@@ -830,7 +830,7 @@ impl ProxyNetWorker {
                     },
                 );
 
-                trace!(token = ?new_token, "assigned token to proxy connection");
+                trace!(token = ?new_token, "assigned token to proxy (host unix) connection");
             }
             self.unix_listeners.insert(token, (listener, guest_port));
         }
