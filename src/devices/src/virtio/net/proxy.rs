@@ -553,43 +553,7 @@ impl ProxyNetWorker {
                     HostSocket::Unix(_stream) => {
                         self.sockets.get::<smoltcp::socket::tcp::Socket>(*handle)
                     }
-                    HostSocket::Udp(udp_socket) => {
-                        // let smoltcp_socket = self
-                        //     .sockets
-                        //     .get_mut::<smoltcp::socket::udp::Socket>(*handle);
-
-                        // trace!(?token, %handle, endpoint = %smoltcp_socket.endpoint(), send_queue = smoltcp_socket.send_queue(), recv_queue = smoltcp_socket.recv_queue(), "checking smoltcp udp socket");
-
-                        // if smoltcp_socket.can_recv() {
-                        //     trace!(?token, "udp socket can recv");
-                        //     // `can_recv` means there is data from the guest waiting to be sent to the host.
-                        //     match smoltcp_socket.recv() {
-                        //         Ok((data, metadata)) => {
-                        //             trace!(?token, bytes = data.len(), %metadata, "handling outgoing packet");
-                        //             // The remote_endpoint here is where the guest wants to send the data.
-                        //             // We need the mio socket to send it.
-                        //             // outgoing_udp_packets.push((*token, data.to_vec(), remote_endpoint));
-                        //             if let Some((_, real_dest_endpoint)) =
-                        //                 self.reverse_nat_table.get(&token)
-                        //             {
-                        //                 let dest_addr = SocketAddr::new(
-                        //                     real_dest_endpoint.addr.into(),
-                        //                     real_dest_endpoint.port,
-                        //                 );
-                        //                 trace!(?token, bytes = data.len(), %dest_addr, "Forwarding UDP packet from smoltcp to host");
-                        //                 if let Err(e) = udp_socket.send_to(&data, dest_addr) {
-                        //                     error!(?token, error = %e, "Failed to send UDP packet to host");
-                        //                 }
-                        //             } else {
-                        //                 warn!(?token, %metadata, "could not find UDP socket in reverse nat table!");
-                        //             }
-                        //         }
-                        //         Err(e) => {
-                        //             error!(?token, "could not recv from smotcp socket: {e}");
-                        //         }
-                        //     }
-                        // }
-
+                    HostSocket::Udp(_udp_socket) => {
                         continue;
                     }
                 };
@@ -615,41 +579,6 @@ impl ProxyNetWorker {
                     }
                 }
             }
-
-            // // First, collect packets to send without holding a mutable borrow on `sockets`.
-            // for (token, conn) in self.host_connections.iter_mut() {
-            //     if let HostSocket::Udp(udp_socket) = &mut conn.socket {
-            //         let smoltcp_socket = self
-            //             .sockets
-            //             .get_mut::<smoltcp::socket::udp::Socket>(conn.handle);
-            //         if smoltcp_socket.can_recv() {
-            //             // `can_recv` means there is data from the guest waiting to be sent to the host.
-            //             match smoltcp_socket.recv() {
-            //                 Ok((data, metadata)) => {
-            //                     trace!(?token, bytes = data.len(), %metadata, "handling outgoing packet");
-            //                     // The remote_endpoint here is where the guest wants to send the data.
-            //                     // We need the mio socket to send it.
-            //                     // outgoing_udp_packets.push((*token, data.to_vec(), remote_endpoint));
-            //                     if let Some((_, real_dest_endpoint)) =
-            //                         self.reverse_nat_table.get(&token)
-            //                     {
-            //                         let dest_addr = SocketAddr::new(
-            //                             real_dest_endpoint.addr.into(),
-            //                             real_dest_endpoint.port,
-            //                         );
-            //                         trace!(?token, bytes = data.len(), %dest_addr, "Forwarding UDP packet from smoltcp to host");
-            //                         if let Err(e) = udp_socket.send_to(&data, dest_addr) {
-            //                             error!(?token, error = %e, "Failed to send UDP packet to host");
-            //                         }
-            //                     }
-            //                 }
-            //                 Err(e) => {
-            //                     error!(?token, "could not recv from smotcp socket: {e}");
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
 
             const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
             const UDP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -694,19 +623,41 @@ impl ProxyNetWorker {
     ) -> bool {
         let socket = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
 
-        // If the smoltcp socket is dead, we can't do anything.
-        if !(socket.may_send() || socket.may_recv())
-            || socket.state() == smoltcp::socket::tcp::State::Closed
+        let socket_state = socket.state();
+        if socket_state == smoltcp::socket::tcp::State::Closed
+            || socket_state == smoltcp::socket::tcp::State::TimeWait
         {
-            return false; // Tells the caller to remove this connection.
+            trace!(
+                ?token,
+                state = %socket_state,
+                "Connection is fully closed, removing."
+            );
+            return false; // This connection is truly done.
+        }
+
+        // If the socket is still handshaking, it can't send/recv data yet, but it's not dead.
+        // We should just return true to keep it alive and wait for the handshake to complete.
+        if !socket.is_active() || !socket.may_send() && !socket.may_recv() {
+            trace!(
+                ?token,
+                state = %socket_state,
+                active = socket.is_active(),
+                may_send = socket.may_send(),
+                may_recv = socket.may_recv(),
+                "Socket not ready for I/O, but still alive. Waiting."
+            );
+            // Keep the connection alive, but don't try to do I/O.
+            return true;
         }
 
         // --- 1. Read from Host, Write to Guest ---
         if event.is_readable() {
+            trace!(?token, %socket_state, "socket is readable");
             let mut buffer = [0u8; 2048];
             loop {
                 // Loop to drain the readable data from the host socket.
                 if !socket.can_send() {
+                    trace!(?token, %socket_state, "socket can't send");
                     break; // Guest-side buffer is full.
                 }
 
@@ -744,6 +695,7 @@ impl ProxyNetWorker {
         if event.is_writable() {
             loop {
                 if !socket.can_recv() {
+                    trace!(?token, %socket_state, "socket can't recv");
                     break;
                 }
                 // Loop to drain the guest-side buffer.
@@ -806,9 +758,8 @@ impl ProxyNetWorker {
                 });
         }
 
-        // Return true to keep the connection, false to close it.
-        (socket.may_send() || socket.may_recv())
-            && socket.state() != smoltcp::socket::tcp::State::Closed
+        // Return true to keep the connection
+        true
     }
 
     fn handle_unix_listener_event(&mut self, token: Token) {

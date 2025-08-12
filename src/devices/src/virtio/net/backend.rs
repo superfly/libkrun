@@ -1,5 +1,7 @@
 use std::os::fd::RawFd;
 
+use utils::epoll::EpollEvent;
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
@@ -37,4 +39,7 @@ pub trait NetBackend {
     fn has_unfinished_write(&self) -> bool;
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
     fn raw_socket_fd(&self) -> RawFd;
+    fn handle_event(&self, _event: &EpollEvent) {
+        // noop by default
+    }
 }
