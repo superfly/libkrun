@@ -37,9 +37,6 @@ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 
 const UID_MAX: u32 = u32::MAX - 1;
 
-#[cfg(not(feature = "efi"))]
-static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
-
 type Inode = u64;
 type Handle = u64;
 
@@ -974,27 +971,6 @@ impl FileSystem for PassthroughFs {
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         debug!("lookup: {:?}", name);
-        let _init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
-
-        #[cfg(not(feature = "efi"))]
-        if self.init_inode != 0 && name == _init_name {
-            let mut st: bindings::stat64 = unsafe { mem::zeroed() };
-            st.st_size = INIT_BINARY.len() as i64;
-            st.st_ino = self.init_inode;
-            st.st_mode = 0o100_755;
-
-            Ok(Entry {
-                inode: self.init_inode,
-                generation: 0,
-                attr: st,
-                attr_flags: 0,
-                attr_timeout: self.cfg.attr_timeout,
-                entry_timeout: self.cfg.entry_timeout,
-            })
-        } else {
-            self.do_lookup(parent, name)
-        }
-        #[cfg(feature = "efi")]
         self.do_lookup(parent, name)
     }
 
@@ -1236,18 +1212,6 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {:?}", inode);
-        #[cfg(not(feature = "efi"))]
-        if inode == self.init_inode {
-            let off: usize = offset
-                .try_into()
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
-        }
 
         let data = self
             .handles

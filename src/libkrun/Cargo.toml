@@ -7,10 +7,10 @@ build = "build.rs"
 
 [features]
 tee = []
-amd-sev = [ "blk", "tee" ]
-net = []
-blk = []
-efi = [ "blk", "net" ]
+amd-sev = ["blk", "tee"]
+net = ["devices/net", "vmm/net"]
+blk = ["devices/blk", "vmm/blk"]
+efi = ["blk", "net"]
 gpu = []
 snd = []
 virgl_resource_map2 = []
@@ -27,6 +27,7 @@ devices = { path = "../devices" }
 polly = { path = "../polly" }
 utils = { path = "../utils" }
 vmm = { path = "../vmm" }
+vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { path = "../hvf" }
@@ -38,4 +39,4 @@ vm-memory = ">=0.13"
 
 [lib]
 name = "krun"
-crate-type = ["cdylib"]
+# crate-type = ["cdylib"]

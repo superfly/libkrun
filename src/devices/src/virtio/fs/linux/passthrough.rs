@@ -33,8 +33,6 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
-static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
-
 type Inode = u64;
 type Handle = u64;
 
@@ -147,26 +145,20 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
-    let mut stx = MaybeUninit::<libc::statx>::zeroed();
-
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
     // Safe because the kernel will only write data in `st` and we check the return
     // value.
     let res = unsafe {
-        libc::statx(
-            f.as_raw_fd(),
-            pathname.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
-            stx.as_mut_ptr(),
+        rustix::fs::statx(
+            f,
+            pathname,
+            rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            rustix::fs::StatxFlags::BASIC_STATS | rustix::fs::StatxFlags::MNT_ID,
         )
     };
-    if res >= 0 {
-        // Safe because the kernel guarantees that the struct is now fully initialized.
-        let stx = unsafe { stx.assume_init() };
-
+    if let Ok(stx) = res {
         // Unfortunately, we cannot use an initializer to create the stat64 object,
         // because it may contain padding and reserved fields (depending on the
         // architecture), and it does not implement the Default trait.
@@ -940,25 +932,7 @@ impl FileSystem for PassthroughFs {
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         debug!("do_lookup: {:?}", name);
-        let init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
-
-        if self.init_inode != 0 && name == init_name {
-            let mut st: libc::stat64 = unsafe { mem::zeroed() };
-            st.st_size = INIT_BINARY.len() as i64;
-            st.st_ino = self.init_inode;
-            st.st_mode = 0o100_755;
-
-            Ok(Entry {
-                inode: self.init_inode,
-                generation: 0,
-                attr: st,
-                attr_flags: 0,
-                attr_timeout: self.cfg.attr_timeout,
-                entry_timeout: self.cfg.entry_timeout,
-            })
-        } else {
-            self.do_lookup(parent, name)
-        }
+        self.do_lookup(parent, name)
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1174,17 +1148,6 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {:?}", inode);
-        if inode == self.init_inode {
-            let off: usize = offset
-                .try_into()
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
-        }
 
         let data = self
             .handles
@@ -2018,36 +1981,6 @@ impl FileSystem for PassthroughFs {
         let addr = host_shm_base + moffset;
 
         debug!("setupmapping: ino {:?} addr={:x} len={}", inode, addr, len);
-
-        if inode == self.init_inode {
-            let ret = unsafe {
-                libc::mmap(
-                    addr as *mut libc::c_void,
-                    len as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                    -1,
-                    0,
-                )
-            };
-            if std::ptr::eq(ret, libc::MAP_FAILED) {
-                return Err(io::Error::last_os_error());
-            }
-
-            let to_copy = if len as usize > INIT_BINARY.len() {
-                INIT_BINARY.len()
-            } else {
-                len as usize
-            };
-            unsafe {
-                libc::memcpy(
-                    addr as *mut libc::c_void,
-                    INIT_BINARY.as_ptr() as *const _,
-                    to_copy,
-                )
-            };
-            return Ok(());
-        }
 
         let file = self.open_inode(inode, open_flags)?;
         let fd = file.as_raw_fd();

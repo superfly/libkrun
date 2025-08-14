@@ -337,6 +337,8 @@ mod tests {
             external_kernel: None,
             fs: Default::default(),
             vsock: Default::default(),
+            #[cfg(feature = "blk")]
+            block: Default::default(),
             #[cfg(feature = "net")]
             net_builder: Default::default(),
             gpu_virgl_flags: None,

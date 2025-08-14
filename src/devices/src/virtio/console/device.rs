@@ -50,7 +50,9 @@ pub(crate) fn get_win_size() -> (u16, u16) {
     let ret = unsafe { tiocgwinsz(0, &mut ws) };
 
     if let Err(err) = ret {
-        error!("Couldn't get terminal dimensions: {}", err);
+        if err != nix::errno::Errno::ENODEV {
+            error!("Couldn't get terminal dimensions: {}", err);
+        }
         (0, 0)
     } else {
         (ws.cols, ws.rows)

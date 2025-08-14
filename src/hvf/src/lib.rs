@@ -113,7 +113,7 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
-    VmCreate,
+    VmCreate(i32),
 }
 
 impl Display for Error {
@@ -143,7 +143,7 @@ impl Display for Error {
                 reg, val
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
-            VmCreate => write!(f, "Error creating HVF VM instance"),
+            VmCreate(code) => write!(f, "Error creating HVF VM instance, code: {code}"),
         }
     }
 }
@@ -255,7 +255,7 @@ impl HvfVm {
         let ret = unsafe { hv_vm_create(config) };
 
         if ret != HV_SUCCESS {
-            Err(Error::VmCreate)
+            Err(Error::VmCreate(ret))
         } else {
             Ok(Self {})
         }

@@ -5,9 +5,9 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::env;
-use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
+use std::ffi::{CStr, OsStr};
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
@@ -16,17 +16,18 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
-#[cfg(not(feature = "efi"))]
-use std::sync::LazyLock;
 use std::sync::Mutex;
+#[cfg(not(feature = "efi"))]
+use std::sync::OnceLock;
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Sender};
 #[cfg(feature = "blk")]
 use devices::virtio::block::ImageType;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
+use devices::virtio::Queue;
 use env_logger::Env;
 #[cfg(not(feature = "efi"))]
 use libc::size_t;
@@ -34,6 +35,7 @@ use libc::{c_char, c_int};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+use vm_memory::GuestMemoryMmap;
 use vmm::resources::VmResources;
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::BlockDeviceConfig;
@@ -68,8 +70,7 @@ const KRUNFW_NAME: &str = "libkrunfw.4.dylib";
 const INIT_PATH: &str = "/init.krun";
 
 #[cfg(not(feature = "efi"))]
-static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+static KRUNFW: OnceLock<libloading::Library> = OnceLock::new();
 
 #[cfg(not(feature = "efi"))]
 pub struct KrunfwBindings {
@@ -85,11 +86,27 @@ pub struct KrunfwBindings {
 
 #[cfg(not(feature = "efi"))]
 impl KrunfwBindings {
-    fn load_bindings() -> Result<KrunfwBindings, libloading::Error> {
-        let krunfw = match KRUNFW.as_ref() {
-            Some(krunfw) => krunfw,
-            None => return Err(libloading::Error::DlOpenUnknown),
+    fn load_bindings<P: AsRef<OsStr>>(
+        path: Option<P>,
+    ) -> Result<KrunfwBindings, libloading::Error> {
+        if let Some(p) = path {
+            eprintln!("setting custom krunfw");
+            KRUNFW
+                .set(unsafe { libloading::Library::new(p)? })
+                .expect("could not set custom KRUNFW");
+        }
+        let krunfw = if let Some(krunfw) = KRUNFW.get() {
+            krunfw
+        } else {
+            eprintln!("attempting to load default krunfw {KRUNFW_NAME}");
+            let lib = unsafe { libloading::Library::new(KRUNFW_NAME)? };
+            KRUNFW.set(lib).expect("could not set default KRUNFW");
+            KRUNFW.get().unwrap()
         };
+        // match KRUNFW.get_or_init(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() }) {
+        //     Some(krunfw) => krunfw,
+        //     None => return Err(libloading::Error::DlOpenUnknown),
+        // };
         Ok(unsafe {
             KrunfwBindings {
                 get_kernel: krunfw.get(b"krunfw_get_kernel")?,
@@ -101,8 +118,8 @@ impl KrunfwBindings {
         })
     }
 
-    pub fn new() -> Option<Self> {
-        Self::load_bindings().ok()
+    pub fn new<P: AsRef<OsStr>>(path: Option<P>) -> Option<Self> {
+        Self::load_bindings(path).ok()
     }
 }
 
@@ -115,6 +132,7 @@ enum NetworkConfig {
     Tsi(TsiConfig),
     VirtioNetPasst(RawFd),
     VirtioNetGvproxy(PathBuf),
+    VirtioNetProxy(Vec<(u16, String)>),
 }
 
 impl Default for NetworkConfig {
@@ -152,6 +170,7 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    kernel_cmdline: Option<String>,
 }
 
 impl ContextConfig {
@@ -258,6 +277,7 @@ impl ContextConfig {
             }
             NetworkConfig::VirtioNetPasst(_) => Err(()),
             NetworkConfig::VirtioNetGvproxy(_) => Err(()),
+            NetworkConfig::VirtioNetProxy(_) => Err(()),
         }
     }
 
@@ -315,8 +335,7 @@ pub extern "C" fn krun_set_log_level(level: u32) -> i32 {
     KRUN_SUCCESS
 }
 
-#[no_mangle]
-pub extern "C" fn krun_create_ctx() -> i32 {
+pub fn krun_create_ctx<P: AsRef<OsStr>>(krunfw: Option<P>) -> i32 {
     let ctx_cfg = {
         let shutdown_efd = if cfg!(feature = "efi") {
             Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
@@ -326,7 +345,7 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 
         ContextConfig {
             #[cfg(not(feature = "efi"))]
-            krunfw: KrunfwBindings::new(),
+            krunfw: KrunfwBindings::new(krunfw),
             shutdown_efd,
             ..Default::default()
         }
@@ -631,13 +650,13 @@ pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
         return -libc::ENOTSUP;
     }
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.set_net_cfg(NetworkConfig::VirtioNetPasst(fd));
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
+    // match CTX_MAP.lock().unwrap().entry(ctx_id) {
+    //     Entry::Occupied(mut ctx_cfg) => {
+    //         let cfg = ctx_cfg.get_mut();
+    //         cfg.set_net_cfg(NetworkConfig::VirtioNetPasst(fd));
+    //     }
+    //     Entry::Vacant(_) => return -libc::ENOENT,
+    // }
     KRUN_SUCCESS
 }
 
@@ -658,6 +677,22 @@ pub unsafe extern "C" fn krun_set_gvproxy_path(ctx_id: u32, c_path: *const c_cha
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
             cfg.set_net_cfg(NetworkConfig::VirtioNetGvproxy(path));
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
+}
+
+pub fn krun_set_direct_proxy(ctx_id: u32, listeners: &[(u16, &str)]) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.set_net_cfg(NetworkConfig::VirtioNetProxy(
+                listeners
+                    .iter()
+                    .map(|(vm_port, path)| (*vm_port, (*path).to_owned()))
+                    .collect(),
+            ));
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -1346,8 +1381,41 @@ pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     KRUN_SUCCESS
 }
 
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+pub unsafe extern "C" fn krun_set_kernel_cmdline(ctx_id: u32, c_cmdline: *const c_char) -> i32 {
+    let cmdline = match CStr::from_ptr(c_cmdline).to_str() {
+        Ok(cmdline) => cmdline,
+        Err(e) => {
+            error!("Error parsing cmdline: {:?}", e);
+            return -libc::EINVAL;
+        }
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.kernel_cmdline = Some(cmdline.to_owned());
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+pub struct StartVmm {
+    pub handle: std::thread::JoinHandle<Result<(), polly::event_manager::Error>>,
+    pub virtio_net: Option<VirtioNetDevice>,
+}
+
+pub struct VirtioNetDevice {
+    pub rx_queue: Queue,
+    pub tx_queue: Queue,
+    pub tx_eventfd: std::fs::File, // The File for notifying the guest
+    pub guest_memory: GuestMemoryMmap, // The shared memory region
+}
+
+pub fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(target_os = "linux")]
     {
         let prname = match env::var("HOSTNAME") {
@@ -1385,8 +1453,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(feature = "blk")]
     for block_cfg in ctx_cfg.get_block_cfg() {
-        if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
-            error!("Error configuring virtio-blk for block");
+        if let Err(e) = ctx_cfg.vmr.add_block_device(block_cfg) {
+            error!("Error configuring virtio-blk for block: {e}");
             return -libc::EINVAL;
         }
     }
@@ -1408,18 +1476,39 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    let boot_source = BootSourceConfig {
-        kernel_cmdline_prolog: Some(format!(
-            "{} init={} {} {} {} {}",
-            DEFAULT_KERNEL_CMDLINE,
-            INIT_PATH,
-            ctx_cfg.get_exec_path(),
-            ctx_cfg.get_workdir(),
-            ctx_cfg.get_rlimits(),
-            ctx_cfg.get_env(),
-        )),
-        kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+    let boot_source = if let Some(kernel_cmdline) = &ctx_cfg.kernel_cmdline {
+        BootSourceConfig {
+            kernel_cmdline_prolog: Some(kernel_cmdline.clone()),
+            kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+        }
+    } else {
+        BootSourceConfig {
+            kernel_cmdline_prolog: Some(format!(
+                "{} init={} {} {} {} {}",
+                DEFAULT_KERNEL_CMDLINE,
+                "/sbin/init", // INIT_PATH,
+                ctx_cfg.get_exec_path(),
+                ctx_cfg.get_workdir(),
+                ctx_cfg.get_rlimits(),
+                ctx_cfg.get_env(),
+            )),
+            kernel_cmdline_epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+        }
     };
+
+    // eprintln!(
+    //     "cmdline: {}{}",
+    //     boot_source
+    //         .kernel_cmdline_prolog
+    //         .as_ref()
+    //         .map(|s| s.as_str())
+    //         .unwrap_or_default(),
+    //     boot_source
+    //         .kernel_cmdline_epilog
+    //         .as_ref()
+    //         .map(|s| s.as_str())
+    //         .unwrap_or_default()
+    // );
 
     if ctx_cfg.vmr.set_boot_source(boot_source).is_err() {
         return -libc::EINVAL;
@@ -1438,6 +1527,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vsock_set = true;
     }
 
+    let mut wants_virtio_net = false;
+
     match ctx_cfg.net_cfg {
         NetworkConfig::Tsi(tsi_cfg) => {
             vsock_config.host_port_map = tsi_cfg.port_map;
@@ -1454,6 +1545,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             #[cfg(feature = "net")]
             {
                 let backend = VirtioNetBackend::Gvproxy(_path.clone());
+                create_virtio_net(&mut ctx_cfg, backend);
+            }
+        }
+        NetworkConfig::VirtioNetProxy(ref listeners) => {
+            #[cfg(feature = "net")]
+            {
+                let backend = VirtioNetBackend::Proxy(listeners.clone());
                 create_virtio_net(&mut ctx_cfg, backend);
             }
         }

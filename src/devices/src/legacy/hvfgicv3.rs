@@ -75,14 +75,14 @@ impl HvfGicV3 {
         let mut dist_size: usize = 0;
         let ret = unsafe { (bindings.hv_gic_get_distributor_size)(&mut dist_size) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::VmCreate(ret));
         }
         let dist_size = dist_size as u64;
 
         let mut redist_size: usize = 0;
         let ret = unsafe { (bindings.hv_gic_get_redistributor_size)(&mut redist_size) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::VmCreate(ret));
         }
 
         let redists_size = redist_size as u64 * vcpu_count;
@@ -92,7 +92,7 @@ impl HvfGicV3 {
         let gic_config = unsafe { (bindings.hv_gic_config_create)() };
         let ret = unsafe { (bindings.hv_gic_config_set_distributor_base)(gic_config, dist_addr) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::VmCreate(ret));
         }
 
         let ret = unsafe {
@@ -102,12 +102,12 @@ impl HvfGicV3 {
             )
         };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::VmCreate(ret));
         }
 
         let ret = unsafe { (bindings.hv_gic_create)(gic_config) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::VmCreate(ret));
         }
 
         Ok(Self {

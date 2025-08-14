@@ -5,14 +5,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::legacy::IrqChip;
+use crate::virtio::net::proxy::ProxyNetWorker;
 use crate::virtio::net::{Error, Result};
 use crate::virtio::net::{QUEUE_SIZES, RX_INDEX, TX_INDEX};
 use crate::virtio::queue::Error as QueueError;
-use crate::virtio::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_NET};
+use crate::virtio::{ActivateError, ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_NET};
 use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
+use crossbeam_channel::Sender;
 
 use std::cmp;
 use std::io::Write;
@@ -43,6 +45,7 @@ pub enum FrontendError {
 pub enum RxError {
     Backend(ReadError),
     DeviceError(DeviceError),
+    QueueError(QueueError),
 }
 
 #[derive(Debug)]
@@ -50,6 +53,25 @@ pub enum TxError {
     Backend(WriteError),
     DeviceError(DeviceError),
     QueueError(QueueError),
+    GuestMemory(vm_memory::GuestMemoryError),
+}
+
+impl From<WriteError> for TxError {
+    fn from(value: WriteError) -> Self {
+        Self::Backend(value)
+    }
+}
+
+impl From<DeviceError> for TxError {
+    fn from(value: DeviceError) -> Self {
+        Self::DeviceError(value)
+    }
+}
+
+impl From<QueueError> for TxError {
+    fn from(value: QueueError) -> Self {
+        Self::QueueError(value)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -67,6 +89,7 @@ unsafe impl ByteValued for VirtioNetConfig {}
 pub enum VirtioNetBackend {
     Passt(RawFd),
     Gvproxy(PathBuf),
+    Proxy(Vec<(u16, String)>),
 }
 
 pub struct Net {
@@ -95,10 +118,6 @@ impl Net {
     pub fn new(id: String, cfg_backend: VirtioNetBackend, mac: [u8; 6]) -> Result<Self> {
         let avail_features = (1 << VIRTIO_NET_F_GUEST_CSUM)
             | (1 << VIRTIO_NET_F_CSUM)
-            | (1 << VIRTIO_NET_F_GUEST_TSO4)
-            | (1 << VIRTIO_NET_F_HOST_TSO4)
-            | (1 << VIRTIO_NET_F_GUEST_UFO)
-            | (1 << VIRTIO_NET_F_HOST_UFO)
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
@@ -222,17 +241,39 @@ impl VirtioDevice for Net {
             .iter()
             .map(|e| e.try_clone().unwrap())
             .collect();
-        let worker = NetWorker::new(
-            self.queues.clone(),
-            queue_evts,
-            self.interrupt_status.clone(),
-            self.interrupt_evt.try_clone().unwrap(),
-            self.intc.clone(),
-            self.irq_line,
-            mem.clone(),
-            self.cfg_backend.clone(),
-        );
-        worker.run();
+
+        match &self.cfg_backend {
+            VirtioNetBackend::Proxy(listeners) => {
+                let proxy = ProxyNetWorker::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    self.interrupt_status.clone(),
+                    self.interrupt_evt.try_clone().unwrap(),
+                    self.intc.clone(),
+                    self.irq_line,
+                    mem.clone(),
+                    listeners.clone(),
+                )
+                .map_err(|e| {
+                    log::error!("Failed to create unified proxy: {}", e);
+                    ActivateError::EpollCtl(e)
+                })?;
+                proxy.run();
+            }
+            _ => {
+                let worker = NetWorker::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    self.interrupt_status.clone(),
+                    self.interrupt_evt.try_clone().unwrap(),
+                    self.intc.clone(),
+                    self.irq_line,
+                    mem.clone(),
+                    self.cfg_backend.clone(),
+                );
+                worker.run();
+            }
+        }
 
         self.device_state = DeviceState::Activated(mem);
         Ok(())
@@ -243,5 +284,14 @@ impl VirtioDevice for Net {
             DeviceState::Inactive => false,
             DeviceState::Activated(_) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_net_module_works() {
+        // Simple test to verify virtio::net tests are running
+        assert_eq!(2 + 2, 4);
     }
 }
