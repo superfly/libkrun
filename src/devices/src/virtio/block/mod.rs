@@ -4,7 +4,11 @@
 pub mod device;
 mod worker;
 
-pub use self::device::{Block, CacheType};
+use std::io;
+
+use vm_memory::VolatileSlice;
+
+pub use self::device::{Block, CacheType, DiskProperties};
 
 use vm_memory::GuestMemoryError;
 
@@ -79,4 +83,37 @@ impl TryFrom<u32> for SyncMode {
             }
         }
     }
+}
+
+/// Trait for block device backends.
+///
+/// This trait abstracts the storage operations needed by the virtio block worker,
+/// allowing different backend implementations (disk images, in-memory, networked storage, etc.).
+pub trait BlockBackend: Send {
+    /// Returns the cache type configuration for this backend.
+    fn cache_type(&self) -> CacheType;
+
+    /// Returns the device/image identifier bytes.
+    fn image_id(&self) -> &[u8];
+
+    /// Reads data from the backend at the given offset into the provided buffers.
+    /// Returns the number of bytes read.
+    fn read_vectored_at(&self, bufs: &[VolatileSlice], offset: u64) -> io::Result<usize>;
+
+    /// Writes data to the backend at the given offset from the provided buffers.
+    /// Returns the number of bytes written.
+    fn write_vectored_at(&self, bufs: &[VolatileSlice], offset: u64) -> io::Result<usize>;
+
+    /// Flushes any cached data to the underlying storage.
+    fn flush(&self) -> io::Result<()>;
+
+    /// Syncs data to persistent storage (fsync).
+    fn sync(&self) -> io::Result<()>;
+
+    /// Discards/trims the given range, potentially freeing underlying storage.
+    fn discard(&self, offset: u64, len: u64) -> io::Result<()>;
+
+    /// Writes zeroes to the given range.
+    /// If `unmap` is true, the implementation may also discard the range.
+    fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> io::Result<()>;
 }

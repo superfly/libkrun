@@ -27,12 +27,13 @@ use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryMmap, VolatileSlice};
+use imago::io_buffers::{IoVector, IoVectorMut};
 
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_BLOCK},
-    Error, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
+    BlockBackend, Error, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
@@ -66,7 +67,7 @@ impl CacheType {
 }
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
-pub(crate) struct DiskProperties {
+pub struct DiskProperties {
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
@@ -157,6 +158,62 @@ impl Drop for DiskProperties {
                 // This is a noop.
             }
         };
+    }
+}
+
+impl BlockBackend for DiskProperties {
+    fn cache_type(&self) -> CacheType {
+        self.cache_type
+    }
+
+    fn image_id(&self) -> &[u8] {
+        &self.image_id
+    }
+
+    fn read_vectored_at(&self, bufs: &[VolatileSlice], offset: u64) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
+        let full_length = iovec
+            .len()
+            .try_into()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.file.lock().unwrap().readv(iovec, offset)?;
+        Ok(full_length)
+    }
+
+    fn write_vectored_at(&self, bufs: &[VolatileSlice], offset: u64) -> io::Result<usize> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
+        let full_length = iovec
+            .len()
+            .try_into()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.file.lock().unwrap().writev(iovec, offset)?;
+        Ok(full_length)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.file.lock().unwrap().flush()
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.lock().unwrap().sync()
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.file.lock().unwrap().discard_to_any(offset, len)
+    }
+
+    fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> io::Result<()> {
+        if unmap {
+            self.file.lock().unwrap().discard_to_zero(offset, len)
+        } else {
+            self.file.lock().unwrap().write_zeroes(offset, len)
+        }
     }
 }
 

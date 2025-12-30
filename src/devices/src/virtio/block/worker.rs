@@ -1,7 +1,8 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
+use crate::virtio::file_traits::BlockBackendAdapter;
 
 use super::super::Queue;
-use super::device::{CacheType, DiskProperties};
+use super::{BlockBackend, CacheType};
 
 use crate::virtio::InterruptTransport;
 use std::io::{self, Write};
@@ -17,7 +18,6 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 #[derive(Debug)]
 pub enum RequestError {
     Discarding(io::Error),
-    DiscardingToZero(io::Error),
     FlushingToDisk(io::Error),
     InvalidDataLength,
     ReadingFromDescriptor(io::Error),
@@ -55,23 +55,23 @@ pub struct DiscardWriteData {
 // Safe because DiscardWriteData only contains plain data.
 unsafe impl ByteValued for DiscardWriteData {}
 
-pub struct BlockWorker {
+pub struct BlockWorker<B: BlockBackend> {
     queue: Queue,
     queue_evt: EventFd,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
-    disk: DiskProperties,
+    disk: B,
     stop_fd: EventFd,
 }
 
-impl BlockWorker {
+impl<B: BlockBackend + 'static> BlockWorker<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queue: Queue,
         queue_evt: EventFd,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        disk: DiskProperties,
+        disk: B,
         stop_fd: EventFd,
     ) -> Self {
         Self {
@@ -224,7 +224,11 @@ impl BlockWorker {
                     Err(RequestError::InvalidDataLength)
                 } else {
                     writer
-                        .write_from_at(&self.disk, data_len, request_header.sector * 512)
+                        .write_from_at(
+                            BlockBackendAdapter(&self.disk),
+                            data_len,
+                            request_header.sector * 512,
+                        )
                         .map_err(RequestError::WritingToDescriptor)
                 }
             }
@@ -234,15 +238,18 @@ impl BlockWorker {
                     Err(RequestError::InvalidDataLength)
                 } else {
                     reader
-                        .read_to_at(&self.disk, data_len, request_header.sector * 512)
+                        .read_to_at(
+                            BlockBackendAdapter(&self.disk),
+                            data_len,
+                            request_header.sector * 512,
+                        )
                         .map_err(RequestError::ReadingFromDescriptor)
                 }
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
                 CacheType::Writeback => {
-                    let diskfile = self.disk.file.lock().unwrap();
-                    diskfile.flush().map_err(RequestError::FlushingToDisk)?;
-                    diskfile.sync().map_err(RequestError::FlushingToDisk)?;
+                    self.disk.flush().map_err(RequestError::FlushingToDisk)?;
+                    self.disk.sync().map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
                 }
                 CacheType::Unsafe => Ok(0),
@@ -264,10 +271,7 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 self.disk
-                    .file
-                    .lock()
-                    .unwrap()
-                    .discard_to_any(
+                    .discard(
                         discard_write_data.sector * 512,
                         discard_write_data.num_sectors as u64 * 512,
                     )
@@ -279,27 +283,13 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
-                if unmap {
-                    self.disk
-                        .file
-                        .lock()
-                        .unwrap()
-                        .discard_to_zero(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
-                        .map_err(RequestError::DiscardingToZero)?;
-                } else {
-                    self.disk
-                        .file
-                        .lock()
-                        .unwrap()
-                        .write_zeroes(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
-                        .map_err(RequestError::WritingZeroes)?;
-                }
+                self.disk
+                    .write_zeroes(
+                        discard_write_data.sector * 512,
+                        discard_write_data.num_sectors as u64 * 512,
+                        unmap,
+                    )
+                    .map_err(RequestError::WritingZeroes)?;
                 Ok(0)
             }
             _ => Err(RequestError::UnknownRequest),
