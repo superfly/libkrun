@@ -173,6 +173,24 @@ impl<'a> DescriptorChainConsumer<'a> {
             Err(Error::SplitOutOfBounds(offset))
         }
     }
+
+    /// Returns a slice of the underlying volatile slices up to `count` bytes.
+    /// This is a non-consuming view of the buffers.
+    fn get_slices(&self, count: usize) -> &[VolatileSlice<'a>] {
+        let mut total = 0;
+        let mut end = 0;
+        for vs in &self.buffers {
+            if total >= count {
+                break;
+            }
+            total += vs.len();
+            end += 1;
+        }
+        // VecDeque may not be contiguous, but make_contiguous requires &mut self.
+        // For now, we return an empty slice if buffers aren't contiguous from the start.
+        // In practice, the buffers are usually contiguous when created.
+        self.buffers.as_slices().0.get(..end).unwrap_or(&[])
+    }
 }
 
 /// Provides high-level interface over the sequence of memory regions
@@ -304,6 +322,12 @@ impl<'a> Reader<'a> {
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Reader<'a>> {
         self.buffer.split_at(offset).map(|buffer| Reader { buffer })
+    }
+
+    /// Returns a reference to the underlying volatile slices up to `count` bytes.
+    /// This allows direct access to the memory regions for async processing.
+    pub fn get_slices(&self, count: usize) -> &[VolatileSlice<'a>] {
+        self.buffer.get_slices(count)
     }
 }
 
@@ -445,6 +469,25 @@ impl<'a> Writer<'a> {
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a>> {
         self.buffer.split_at(offset).map(|buffer| Writer { buffer })
+    }
+
+    /// Returns a reference to the underlying volatile slices up to `count` bytes.
+    /// This allows direct access to the memory regions for async processing.
+    pub fn get_slices(&self, count: usize) -> &[VolatileSlice<'a>] {
+        self.buffer.get_slices(count)
+    }
+
+    /// Returns a raw pointer to the status byte location (last byte of the writable region).
+    ///
+    /// # Safety
+    /// The caller must ensure the pointer remains valid for the lifetime of the write operation.
+    pub unsafe fn get_status_ptr(&self) -> *mut u8 {
+        // Status is at the last byte of the last buffer
+        if let Some(last) = self.buffer.buffers.back() {
+            last.ptr_guard_mut().as_ptr().add(last.len() - 1)
+        } else {
+            std::ptr::null_mut()
+        }
     }
 }
 

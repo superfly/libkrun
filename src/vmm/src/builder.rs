@@ -2216,6 +2216,9 @@ fn attach_block_devices(
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+
+        // Register for exit notification to allow cleanup (e.g., flushing)
+        vmm.exit_observers.push(block.clone());
     }
 
     Ok(())

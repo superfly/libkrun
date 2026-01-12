@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/libkrun", "src/krun_input", "examples/rust_api"]
+members = ["src/libkrun", "src/krun_input", "examples/rust_api", "examples/smoltcp-proxy"]
 exclude = ["examples/gtk_display"]
 resolver = "2"
 
@@ -9,3 +9,8 @@ resolver = "2"
 [profile.release]
 #panic = "abort"
 lto = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false

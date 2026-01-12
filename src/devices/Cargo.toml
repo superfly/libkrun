@@ -8,8 +8,8 @@ edition = "2021"
 tee = []
 amd-sev = ["blk", "tee"]
 tdx = ["blk", "tee"]
-net = []
-blk = []
+net = ["tokio", "bytes"]
+blk = ["tokio", "futures"]
 efi = ["blk", "net"]
 gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
 snd = ["pw", "thiserror"]
@@ -39,6 +39,9 @@ utils = { path = "../utils" }
 polly = { path = "../polly" }
 rutabaga_gfx = { path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
 imago = { version = "0.2.1", features = ["sync-wrappers", "vm-memory"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net", "io-util"], optional = true }
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { path = "../hvf" }

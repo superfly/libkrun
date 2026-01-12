@@ -6,14 +6,26 @@ use crossbeam_channel::unbounded;
 use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
-#[cfg(feature = "net")]
-use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
-use devices::virtio::CacheType;
+pub use devices::virtio::CacheType;
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
 
+#[cfg(feature = "blk")]
+pub use devices::virtio::block::device::BlockDeviceType;
+#[cfg(feature = "blk")]
+pub use devices::virtio::block::{
+    AsyncBlockBackend, AsyncBlockBackendFactory, BlockBackend, BoxFuture, IoVector, IoVectorMut,
+    SendBoxFuture, VolatileSlice, VolatileSliceGuard,
+};
+#[cfg(feature = "net")]
+pub use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(feature = "net")]
+pub use devices::virtio::net::{
+    AsyncNetBackend, AsyncNetBackendFactory, BoxFuture as NetBoxFuture, NetBackendHandle,
+    SendBoxFuture as NetSendBoxFuture,
+};
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
@@ -43,7 +55,7 @@ use vmm::resources::{
     VmResources,
 };
 #[cfg(feature = "blk")]
-use vmm::vmm_config::block::{BlockConfigError, BlockDeviceConfig, BlockRootConfig};
+pub use vmm::vmm_config::block::{BlockConfigError, BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
@@ -269,19 +281,19 @@ impl ContextConfig {
     }
 
     #[cfg(feature = "blk")]
-    fn get_block_cfg(&self) -> Vec<BlockDeviceConfig> {
+    fn take_block_cfg(&mut self) -> Vec<BlockDeviceConfig> {
         // For backwards compat, when cfgs is empty (the new API is not used), this needs to be
         // root and then data, in that order. Also for backwards compat, root/data are setters and
         // need to discard redundant calls. So we have simple setters above and fix up here.
         //
         // When the new API is used, this is simpler.
         if self.block_cfgs.is_empty() {
-            [&self.root_block_cfg, &self.data_block_cfg]
+            [&mut self.root_block_cfg, &mut self.data_block_cfg]
                 .into_iter()
-                .filter_map(|cfg| cfg.clone())
+                .filter_map(|cfg| cfg.take())
                 .collect()
         } else {
-            self.block_cfgs.clone()
+            std::mem::take(&mut self.block_cfgs)
         }
     }
 
@@ -394,8 +406,9 @@ impl TryFrom<ContextConfig> for NitroEnclave {
                     let device = list.pop_front().unwrap();
 
                     match device.lock().unwrap().backend() {
-                        VirtioNetBackend::UnixstreamFd(_) | VirtioNetBackend::UnixstreamPath(_) => {
-                        }
+                        Some(
+                            VirtioNetBackend::UnixstreamFd(_) | VirtioNetBackend::UnixstreamPath(_),
+                        ) => {}
                         _ => {
                             error!("configured virtio-net backend must be unix stream");
                             return Err(-libc::EINVAL);
@@ -577,16 +590,8 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
         Err(_) => return -libc::EINVAL,
     };
 
-    let fs_id = "/dev/root".to_string();
-    let shared_dir = root_path.to_string();
-
     with_builder(ctx_id, |cfg| {
-        cfg.config.vmr.add_fs_device(FsDeviceConfig {
-            fs_id,
-            shared_dir,
-            // Default to a conservative 512 MB window.
-            shm_size: Some(1 << 29),
-        });
+        cfg.set_root(root_path);
         KRUN_SUCCESS
     })
 }
@@ -680,14 +685,16 @@ pub unsafe extern "C" fn krun_add_disk(
         let block_device_config = BlockDeviceConfig {
             block_id: block_id.to_string(),
             cache_type: CacheType::auto(disk_path),
-            disk_image_path: disk_path.to_string(),
-            disk_image_format: ImageType::Raw,
+            disk_type: BlockDeviceType::Image {
+                path: disk_path.to_string(),
+                format: ImageType::Raw,
+                #[cfg(not(target_os = "macos"))]
+                sync_mode: SyncMode::Full,
+                #[cfg(target_os = "macos")]
+                sync_mode: SyncMode::Relaxed,
+            },
             is_disk_read_only: read_only,
             direct_io: false,
-            #[cfg(not(target_os = "macos"))]
-            sync_mode: SyncMode::Full,
-            #[cfg(target_os = "macos")]
-            sync_mode: SyncMode::Relaxed,
         };
         cfg.add_block_cfg(block_device_config);
 
@@ -721,17 +728,21 @@ pub unsafe extern "C" fn krun_add_disk2(
     };
 
     with_builder(ctx_id, |cfg| {
+        use devices::virtio::block::device::BlockDeviceType;
+
         let block_device_config = BlockDeviceConfig {
             block_id: block_id.to_string(),
             cache_type: CacheType::auto(disk_path),
-            disk_image_path: disk_path.to_string(),
-            disk_image_format: format,
+            disk_type: BlockDeviceType::Image {
+                path: disk_path.to_string(),
+                format,
+                #[cfg(not(target_os = "macos"))]
+                sync_mode: SyncMode::Full,
+                #[cfg(target_os = "macos")]
+                sync_mode: SyncMode::Relaxed,
+            },
             is_disk_read_only: read_only,
             direct_io: false,
-            #[cfg(not(target_os = "macos"))]
-            sync_mode: SyncMode::Full,
-            #[cfg(target_os = "macos")]
-            sync_mode: SyncMode::Relaxed,
         };
         cfg.add_block_cfg(block_device_config);
 
@@ -772,14 +783,18 @@ pub unsafe extern "C" fn krun_add_disk3(
     };
 
     with_builder(ctx_id, |cfg| {
+        use devices::virtio::block::device::BlockDeviceType;
+
         let block_device_config = BlockDeviceConfig {
             block_id: block_id.to_string(),
             cache_type: CacheType::auto(disk_path),
-            disk_image_path: disk_path.to_string(),
-            disk_image_format: format,
+            disk_type: BlockDeviceType::Image {
+                path: disk_path.to_string(),
+                format,
+                sync_mode,
+            },
             is_disk_read_only: read_only,
             direct_io,
-            sync_mode,
         };
         cfg.add_block_cfg(block_device_config);
         KRUN_SUCCESS
@@ -796,17 +811,21 @@ pub unsafe extern "C" fn krun_set_root_disk(ctx_id: u32, c_disk_path: *const c_c
     };
 
     with_builder(ctx_id, |cfg| {
+        use devices::virtio::block::device::BlockDeviceType;
+
         let block_device_config = BlockDeviceConfig {
             block_id: "root".to_string(),
             cache_type: CacheType::auto(disk_path),
-            disk_image_path: disk_path.to_string(),
-            disk_image_format: ImageType::Raw,
+            disk_type: BlockDeviceType::Image {
+                path: disk_path.to_string(),
+                format: ImageType::Raw,
+                #[cfg(not(target_os = "macos"))]
+                sync_mode: SyncMode::Full,
+                #[cfg(target_os = "macos")]
+                sync_mode: SyncMode::Relaxed,
+            },
             is_disk_read_only: false,
             direct_io: false,
-            #[cfg(not(target_os = "macos"))]
-            sync_mode: SyncMode::Full,
-            #[cfg(target_os = "macos")]
-            sync_mode: SyncMode::Relaxed,
         };
         cfg.root_block_cfg(block_device_config);
 
@@ -824,17 +843,21 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
     };
 
     with_builder(ctx_id, |cfg| {
+        use devices::virtio::block::device::BlockDeviceType;
+
         let block_device_config = BlockDeviceConfig {
             block_id: "data".to_string(),
             cache_type: CacheType::auto(disk_path),
-            disk_image_path: disk_path.to_string(),
-            disk_image_format: ImageType::Raw,
+            disk_type: BlockDeviceType::Image {
+                path: disk_path.to_string(),
+                format: ImageType::Raw,
+                #[cfg(not(target_os = "macos"))]
+                sync_mode: SyncMode::Full,
+                #[cfg(target_os = "macos")]
+                sync_mode: SyncMode::Relaxed,
+            },
             is_disk_read_only: false,
             direct_io: false,
-            #[cfg(not(target_os = "macos"))]
-            sync_mode: SyncMode::Full,
-            #[cfg(target_os = "macos")]
-            sync_mode: SyncMode::Relaxed,
         };
         cfg.config.set_data_block_cfg(block_device_config);
 
@@ -880,7 +903,7 @@ const NET_COMPAT_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_UFO;
 #[cfg(feature = "net")]
-const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
+pub const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_CSUM
     | NET_FEATURE_GUEST_TSO4
     | NET_FEATURE_GUEST_TSO6
@@ -2372,6 +2395,23 @@ impl Builder {
         }
     }
 
+    pub fn vm_config(&mut self, num_vcpus: u8, ram_mib: u32) -> &mut Self {
+        let mem_size_mib: usize = ram_mib.try_into().expect("ram_mib did not fit in a usize");
+
+        let vm_config = VmConfig {
+            vcpu_count: Some(num_vcpus),
+            mem_size_mib: Some(mem_size_mib),
+            ht_enabled: Some(false),
+            cpu_template: None,
+        };
+
+        self.config
+            .vmr
+            .set_vm_config(&vm_config)
+            .expect("invalid vm config");
+        self
+    }
+
     pub fn workdir(&mut self, workdir: String) -> &mut Self {
         self.config.workdir = Some(workdir);
         self
@@ -2437,7 +2477,7 @@ impl Builder {
 
     #[cfg(feature = "blk")]
     pub fn add_block_cfg(&mut self, block_cfg: BlockDeviceConfig) -> &mut Self {
-        self.block_cfgs.push(block_cfg);
+        self.config.block_cfgs.push(block_cfg);
         self
     }
 
@@ -2596,7 +2636,7 @@ impl Context {
         }
 
         #[cfg(feature = "blk")]
-        for block_cfg in ctx_cfg.get_block_cfg() {
+        for block_cfg in ctx_cfg.take_block_cfg() {
             ctx_cfg.vmr.add_block_device(block_cfg)?;
         }
 

@@ -197,6 +197,7 @@ impl VirtioDevice for Fs {
             .iter()
             .map(|e| e.try_clone().unwrap())
             .collect();
+
         let worker = FsWorker::new(
             self.queues.clone(),
             queue_evts,

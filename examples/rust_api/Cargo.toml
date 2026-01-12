@@ -5,4 +5,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libkrun = { path = "../../src/libkrun" }
+libkrun = { path = "../../src/libkrun", features = ["net", "blk"] }
+env_logger = "0.9.3"
+graft = { version = "0.2", path = "../../../../jeromegn/graft/crates/graft" } #git = "https://github.com/orbitinghail/graft.git", branch = "main" }
+tracing-appender = "0.2"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+anyhow = "1.0.100"
+tokio = { version = "1", features = ["full"] }
+mimalloc = { version = "0.1", features = ["v3"] }
+libmimalloc-sys = { version = "0.1", features = ["v3", "extended"] }
+bytes = "1.11.0"
+rustix = { version = "1.0.7", features = ["process", "fs", "mm"] }
+clap = { version = "4.5.53", features = ["derive"] }
+memmap2 = "0.9"
+wal-blk = { path = "../../../../jeromegn/wal-blk", features = ["tokio"] }
+slatedb = { version = "0.10", default-features = false, features = ["wal_disable", "aws"] }
+futures = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "*"
+
+[features]
+blk = []
+net = []

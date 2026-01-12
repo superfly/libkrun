@@ -1,0 +1,26 @@
+[package]
+name = "custom-disk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+libkrun = { path = "../../src/libkrun", features = ["blk"] }
+rustix = { version = "1.0.7", features = ["process"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+devices = { path = "../../src/devices", features = ["blk"] }
+vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
+imago = { version = "0.1.4", features = ["sync-wrappers", "vm-memory"] }
+graft = { version = "0.2", path = "../../../../jeromegn/graft/crates/graft" } #git = "https://github.com/orbitinghail/graft.git", branch = "main" }
+tokio = { version = "1", features = ["full"] }
+mimalloc = { version = "0.1.48", features = ["secure"] }
+bytes = "1.11.0"
+# fjall = { version = "=3.0.0-rc.7" }
+clap = { version = "4.5.53", features = ["derive"] }
+tracing-appender = "0.2"
+rand = "0.9"
+
+[features]
+net = []
+blk = []

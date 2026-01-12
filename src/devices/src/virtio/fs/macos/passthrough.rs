@@ -639,8 +639,16 @@ impl PassthroughFs {
         let mut ds = data.dirstream.lock().unwrap();
 
         let dir_stream = if ds.stream == 0 {
-            let dir = unsafe { libc::fdopendir(data.file.write().unwrap().as_raw_fd()) };
+            // fdopendir takes ownership of the fd, so we need to dup() it first.
+            // Otherwise closedir() will close the fd and then File::drop will try
+            // to close it again, causing an IO Safety violation.
+            let fd = unsafe { libc::dup(data.file.read().unwrap().as_raw_fd()) };
+            if fd < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+            let dir = unsafe { libc::fdopendir(fd) };
             if dir.is_null() {
+                unsafe { libc::close(fd) };
                 return Err(linux_error(io::Error::last_os_error()));
             }
             ds.stream = dir as u64;

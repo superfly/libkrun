@@ -381,9 +381,8 @@ mod tests {
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
         KernelCmdlineConfig {
-            cmdline: None,
-            krun_env: None,
-            args: None,
+            cmdline: vec![],
+            args: vec![],
         }
     }
 
@@ -416,6 +415,8 @@ mod tests {
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
+            #[cfg(feature = "blk")]
+            block: Default::default(),
         }
     }
 

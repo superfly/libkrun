@@ -16,5 +16,6 @@ examples/external_kernel
 examples/nitro
 examples/consoles
 examples/rootfs_fedora
+examples/rootfs_debian
 test-prefix
 /linux-sysroot

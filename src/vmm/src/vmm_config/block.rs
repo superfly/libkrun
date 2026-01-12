@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use devices::virtio::block::device::BlockDeviceType;
+use devices::virtio::BlockBackend;
 use devices::virtio::{
     block::{ImageType, SyncMode},
     Block, CacheType,
@@ -26,15 +28,13 @@ impl std::error::Error for BlockConfigError {}
 
 type Result<T> = std::result::Result<T, BlockConfigError>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct BlockDeviceConfig {
     pub block_id: String,
     pub cache_type: CacheType,
-    pub disk_image_path: String,
-    pub disk_image_format: ImageType,
+    pub disk_type: BlockDeviceType,
     pub is_disk_read_only: bool,
     pub direct_io: bool,
-    pub sync_mode: SyncMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,11 +67,9 @@ impl BlockBuilder {
             config.block_id,
             None,
             config.cache_type,
-            config.disk_image_path,
-            config.disk_image_format,
+            config.disk_type,
             config.is_disk_read_only,
             config.direct_io,
-            config.sync_mode,
         )
         .map_err(BlockConfigError::CreateBlockDevice)
     }

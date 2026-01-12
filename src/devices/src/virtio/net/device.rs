@@ -15,6 +15,8 @@ use crate::Error as DeviceError;
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
+use log::{debug, error};
+
 use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -59,7 +61,14 @@ struct VirtioNetConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioNetConfig {}
 
-#[derive(Clone)]
+use super::async_backend::AsyncNetBackendFactory;
+use super::async_worker::AsyncNetWorker;
+
+/// Configuration for virtio-net backends.
+///
+/// The `Clone` variants (unix stream, unix gram, tap) can be used with the
+/// synchronous NetWorker. The `CustomAsyncFactory` variant uses the async
+/// worker and cannot be cloned.
 pub enum VirtioNetBackend {
     UnixstreamFd(RawFd),
     UnixstreamPath(PathBuf),
@@ -67,11 +76,29 @@ pub enum VirtioNetBackend {
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
+    /// Custom async backend using factory pattern.
+    /// The factory creates the backend inside the worker's tokio runtime.
+    CustomAsyncFactory(Box<dyn AsyncNetBackendFactory>),
+}
+
+impl Clone for VirtioNetBackend {
+    fn clone(&self) -> Self {
+        match self {
+            Self::UnixstreamFd(fd) => Self::UnixstreamFd(*fd),
+            Self::UnixstreamPath(p) => Self::UnixstreamPath(p.clone()),
+            Self::UnixgramFd(fd) => Self::UnixgramFd(*fd),
+            Self::UnixgramPath(p, b) => Self::UnixgramPath(p.clone(), *b),
+            #[cfg(target_os = "linux")]
+            Self::Tap(s) => Self::Tap(s.clone()),
+            Self::CustomAsyncFactory(_) => panic!("CustomAsyncFactory cannot be cloned"),
+        }
+    }
 }
 
 pub struct Net {
     id: String,
-    pub cfg_backend: VirtioNetBackend,
+    /// Backend configuration. Stored as Option so async factory can be taken.
+    cfg_backend: Option<VirtioNetBackend>,
 
     avail_features: u64,
     acked_features: u64,
@@ -82,6 +109,9 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    /// Stop event for async worker shutdown
+    worker_stop_fd: EventFd,
 }
 
 impl Net {
@@ -110,9 +140,11 @@ impl Net {
             max_virtqueue_pairs: 0,
         };
 
+        let worker_stop_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFd)?;
+
         Ok(Net {
             id,
-            cfg_backend,
+            cfg_backend: Some(cfg_backend),
 
             avail_features,
             acked_features: 0u64,
@@ -121,6 +153,7 @@ impl Net {
             queue_evts,
             device_state: DeviceState::Inactive,
             config,
+            worker_stop_fd,
         })
     }
 
@@ -130,8 +163,9 @@ impl Net {
     }
 
     /// Provides the virtio-net backend of this net device.
-    pub fn backend(&self) -> &VirtioNetBackend {
-        &self.cfg_backend
+    /// Returns None if the backend has been consumed (e.g., async factory activated).
+    pub fn backend(&self) -> Option<&VirtioNetBackend> {
+        self.cfg_backend.as_ref()
     }
 }
 
@@ -195,31 +229,55 @@ impl VirtioDevice for Net {
         self.queues[RX_INDEX].set_event_idx(event_idx);
         self.queues[TX_INDEX].set_event_idx(event_idx);
 
-        let queue_evts = self
+        let queue_evts: Vec<EventFd> = self
             .queue_evts
             .iter()
             .map(|e| e.try_clone().unwrap())
             .collect();
 
-        match NetWorker::new(
-            self.queues.clone(),
-            queue_evts,
-            interrupt.clone(),
-            mem.clone(),
-            self.acked_features,
-            self.cfg_backend.clone(),
-        ) {
-            Ok(worker) => {
+        // Take ownership of the backend - for async factory we need to move it to the worker
+        let backend = self.cfg_backend.take().ok_or(ActivateError::BadActivate)?;
+
+        match backend {
+            VirtioNetBackend::CustomAsyncFactory(factory) => {
+                debug!("virtio-net ({}): starting async worker", self.id());
+                let worker = AsyncNetWorker::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    interrupt.clone(),
+                    mem.clone(),
+                    factory,
+                    self.worker_stop_fd.try_clone().unwrap(),
+                );
                 worker.run();
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
-            Err(err) => {
-                error!(
-                    "Error activating virtio-net ({}) backend: {err:?}",
-                    self.id()
-                );
-                Err(ActivateError::BadActivate)
+            sync_backend => {
+                // Put the backend back for sync path (it's cloneable)
+                self.cfg_backend = Some(sync_backend.clone());
+
+                match NetWorker::new(
+                    self.queues.clone(),
+                    queue_evts,
+                    interrupt.clone(),
+                    mem.clone(),
+                    self.acked_features,
+                    sync_backend,
+                ) {
+                    Ok(worker) => {
+                        worker.run();
+                        self.device_state = DeviceState::Activated(mem, interrupt);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        error!(
+                            "Error activating virtio-net ({}) backend: {err:?}",
+                            self.id()
+                        );
+                        Err(ActivateError::BadActivate)
+                    }
+                }
             }
         }
     }

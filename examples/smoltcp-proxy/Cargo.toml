@@ -1,0 +1,24 @@
+[package]
+name = "smoltcp-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# For the async network backend
+libkrun = { path = "../../src/libkrun", features = ["net"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "net"] }
+bytes = "1"
+smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+pnet = "0.35"
+log = "0.4"
+tracing-appender = "0.2"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+mimalloc = { version = "0.1", features = ["v3"] }
+libmimalloc-sys = { version = "0.1", features = ["v3", "extended"] }
+clap = { version = "4.5.53", features = ["derive"] }
+
+
+[features]
+blk = []
+net = []

@@ -67,6 +67,9 @@ impl NetWorker {
             VirtioNetBackend::Tap(tap_name) => {
                 Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
             }
+            VirtioNetBackend::CustomAsyncFactory(_) => {
+                panic!("CustomAsyncFactory should use AsyncNetWorker, not NetWorker")
+            }
         };
 
         Ok(Self {

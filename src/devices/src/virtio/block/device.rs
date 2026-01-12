@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use core::fmt;
 use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
@@ -18,6 +19,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::{
     file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
     PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
@@ -28,7 +30,6 @@ use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
 use vm_memory::{ByteValued, GuestMemoryMmap, VolatileSlice};
-use imago::io_buffers::{IoVector, IoVectorMut};
 
 use super::worker::BlockWorker;
 use super::{
@@ -36,9 +37,10 @@ use super::{
     BlockBackend, Error, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
+use crate::virtio::block::{AsyncBlockBackendFactory, AsyncBlockWorker};
 use crate::virtio::{
     block::{ImageType, SyncMode},
-    ActivateError, InterruptTransport,
+    ActivateError, InterruptTransport, VmmExitObserver,
 };
 
 /// Configuration options for disk caching.
@@ -63,6 +65,42 @@ impl CacheType {
             return CacheType::Unsafe;
         }
         CacheType::Writeback
+    }
+}
+
+pub enum BlockDeviceType {
+    Image {
+        path: String,
+        format: ImageType,
+        sync_mode: SyncMode,
+    },
+    Custom {
+        backend: Arc<dyn BlockBackend + Send + Sync>,
+    },
+    /// Async backend using factory pattern.
+    /// The factory creates the backend inside the worker's tokio runtime,
+    /// ensuring async resources (like database connections) are properly initialized.
+    CustomAsyncFactory {
+        factory: Box<dyn AsyncBlockBackendFactory>,
+    },
+}
+
+impl fmt::Debug for BlockDeviceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Image {
+                path,
+                format,
+                sync_mode,
+            } => f
+                .debug_struct("Image")
+                .field("path", path)
+                .field("format", format)
+                .field("sync_mode", sync_mode)
+                .finish(),
+            Self::Custom { .. } => f.debug_struct("Custom").finish(),
+            Self::CustomAsyncFactory { .. } => f.debug_struct("CustomAsyncFactory").finish(),
+        }
     }
 }
 
@@ -166,6 +204,10 @@ impl BlockBackend for DiskProperties {
         self.cache_type
     }
 
+    fn nsectors(&self) -> u64 {
+        self.nsectors
+    }
+
     fn image_id(&self) -> &[u8] {
         &self.image_id
     }
@@ -257,13 +299,37 @@ struct VirtioBlkConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBlkConfig {}
 
+/// Storage for block device backend - either sync backend or async factory.
+enum BlockDeviceBackend {
+    /// Synchronous backend (ready to use)
+    Sync(Arc<dyn BlockBackend + Send + Sync>),
+    /// Async backend factory (creates backend inside worker runtime)
+    AsyncFactory(Box<dyn AsyncBlockBackendFactory>),
+}
+
+impl BlockDeviceBackend {
+    fn nsectors(&self) -> u64 {
+        match self {
+            Self::Sync(b) => b.nsectors(),
+            Self::AsyncFactory(f) => f.nsectors(),
+        }
+    }
+
+    fn on_exit(&self) {
+        match self {
+            Self::Sync(b) => b.on_exit(),
+            Self::AsyncFactory(_) => {
+                // Factory hasn't created a backend yet, nothing to clean up.
+                // The actual backend's on_exit is called by the worker when it shuts down.
+            }
+        }
+    }
+}
+
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     // Host file and properties.
-    disk: Option<DiskProperties>,
-    cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
-    disk_image_id: Vec<u8>,
+    disk: Option<BlockDeviceBackend>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
 
@@ -291,59 +357,79 @@ impl Block {
         id: String,
         partuuid: Option<String>,
         cache_type: CacheType,
-        disk_image_path: String,
-        disk_image_format: ImageType,
+        disk_type: BlockDeviceType,
         is_disk_read_only: bool,
         direct_io: bool,
-        sync_mode: SyncMode,
     ) -> io::Result<Block> {
-        let disk_image = OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
-            .open(PathBuf::from(&disk_image_path))?;
+        let (disk, discard_alignment, accepts_flush) = match disk_type {
+            BlockDeviceType::Image {
+                path,
+                format,
+                sync_mode,
+            } => {
+                let disk_image = OpenOptions::new()
+                    .read(true)
+                    .write(!is_disk_read_only)
+                    .open(PathBuf::from(&path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+                let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(disk_image_path)
-            .direct(direct_io);
+                let file_opts = StorageOpenOptions::new()
+                    .write(!is_disk_read_only)
+                    .filename(path)
+                    .direct(direct_io);
 
-        #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
-        let discard_alignment = file.discard_align();
+                #[cfg(target_os = "macos")]
+                let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+                let file = ImagoFile::open_sync(file_opts)?;
+                let discard_alignment = file.discard_align() as u32 / 512;
 
-        let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
-                let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
-                        Box::new(file),
-                        !is_disk_read_only,
-                    )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
-            }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
-            }
-            ImageType::Vmdk => {
-                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
+                let disk_image = match format {
+                    ImageType::Qcow2 => {
+                        let mut qcow2 =
+                            Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                                Box::new(file),
+                                !is_disk_read_only,
+                            )?;
+                        qcow2.open_implicit_dependencies_sync()?;
+                        SyncFormatAccess::new(qcow2)?
+                    }
+                    ImageType::Raw => {
+                        let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
+                            Box::new(file),
+                            !is_disk_read_only,
+                        )?;
+                        SyncFormatAccess::new(raw)?
+                    }
+                    ImageType::Vmdk => {
+                        let vmdk =
+                            Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
+                                Box::new(file),
+                            )
+                            .open_sync(PermissiveImplicitOpenGate::default())?;
+                        SyncFormatAccess::new(vmdk)?
+                    }
+                };
+
+                let disk_image = Arc::new(Mutex::new(disk_image));
+
+                let disk_properties = DiskProperties::new(disk_image, disk_image_id, cache_type)?;
+
+                (
+                    BlockDeviceBackend::Sync(
+                        Arc::new(disk_properties) as Arc<dyn BlockBackend + Send + Sync>
+                    ),
+                    discard_alignment,
+                    sync_mode != SyncMode::None,
                 )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+            }
+            BlockDeviceType::Custom { backend } => {
+                (BlockDeviceBackend::Sync(backend), 128u32, true)
+            }
+            BlockDeviceType::CustomAsyncFactory { factory } => {
+                (BlockDeviceBackend::AsyncFactory(factory), 128u32, true)
             }
         };
-
-        let disk_image = Arc::new(Mutex::new(disk_image));
-
-        let disk_properties =
-            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -351,7 +437,7 @@ impl Block {
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
-        if sync_mode != SyncMode::None {
+        if accepts_flush {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
         }
 
@@ -364,13 +450,13 @@ impl Block {
         let queues = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
         let config = VirtioBlkConfig {
-            capacity: disk_properties.nsectors(),
+            capacity: disk.nsectors(),
             size_max: 0,
             // QUEUE_SIZE - 2
             seg_max: 254,
             max_discard_sectors: u32::MAX,
             max_discard_seg: 1,
-            discard_sector_alignment: discard_alignment as u32 / 512,
+            discard_sector_alignment: discard_alignment,
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: 1,
@@ -381,10 +467,7 @@ impl Block {
             id,
             partuuid,
             config,
-            disk: Some(disk_properties),
-            cache_type,
-            disk_image,
-            disk_image_id,
+            disk: Some(disk),
             avail_features,
             acked_features: 0u64,
             queue_evts,
@@ -467,6 +550,7 @@ impl VirtioDevice for Block {
     }
 
     fn activate(&mut self, mem: GuestMemoryMmap, interrupt: InterruptTransport) -> ActivateResult {
+        log::debug!("block: activate called");
         if self.worker_thread.is_some() {
             panic!("virtio_blk: worker thread already exists");
         }
@@ -474,25 +558,39 @@ impl VirtioDevice for Block {
         let event_idx: bool = (self.acked_features & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
         self.queues[0].set_event_idx(event_idx);
 
-        let disk = match self.disk.take() {
-            Some(d) => d,
-            None => DiskProperties::new(
-                Arc::clone(&self.disk_image),
-                self.disk_image_id.clone(),
-                self.cache_type,
-            )
-            .map_err(|_| ActivateError::BadActivate)?,
-        };
+        // Take ownership of the disk - for async factory we need to move it to the worker
+        let disk = self.disk.take().ok_or(ActivateError::BadActivate)?;
 
-        let worker = BlockWorker::new(
-            self.queues[0].clone(),
-            self.queue_evts[0].try_clone().unwrap(),
-            interrupt.clone(),
-            mem.clone(),
-            disk,
-            self.worker_stopfd.try_clone().unwrap(),
-        );
-        self.worker_thread = Some(worker.run());
+        match disk {
+            BlockDeviceBackend::Sync(backend) => {
+                log::debug!("block: starting sync worker");
+                // Put the backend back so on_exit can access it
+                self.disk = Some(BlockDeviceBackend::Sync(backend.clone()));
+
+                let worker = BlockWorker::new(
+                    self.queues[0].clone(),
+                    self.queue_evts[0].try_clone().unwrap(),
+                    interrupt.clone(),
+                    mem.clone(),
+                    backend,
+                    self.worker_stopfd.try_clone().unwrap(),
+                );
+                self.worker_thread = Some(worker.run());
+            }
+            BlockDeviceBackend::AsyncFactory(factory) => {
+                log::debug!("block: starting async worker with factory");
+                // Factory is consumed by the worker, don't put it back
+                let worker = AsyncBlockWorker::new(
+                    self.queues[0].clone(),
+                    self.queue_evts[0].try_clone().unwrap(),
+                    interrupt.clone(),
+                    mem.clone(),
+                    factory,
+                    self.worker_stopfd.try_clone().unwrap(),
+                );
+                self.worker_thread = Some(worker.run());
+            }
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
@@ -507,5 +605,17 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+impl VmmExitObserver for Block {
+    fn on_vmm_exit(&mut self) {
+        // Stop the worker first
+        self.reset();
+
+        // Then call on_exit on the backend for cleanup
+        if let Some(disk) = &self.disk {
+            disk.on_exit();
+        }
     }
 }

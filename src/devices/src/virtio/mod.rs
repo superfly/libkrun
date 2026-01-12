@@ -41,11 +41,13 @@ pub mod vsock;
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
-pub use self::block::{Block, BlockBackend, CacheType, DiskProperties};
-#[cfg(feature = "blk")]
-pub use self::file_traits::BlockBackendAdapter;
+pub use self::block::{
+    AsyncBlockBackend, Block, BlockBackend, CacheType, DiskProperties, VolatileSliceGuard,
+};
 pub use self::console::*;
 pub use self::device::*;
+#[cfg(feature = "blk")]
+pub use self::file_traits::BlockBackendAdapter;
 #[cfg(not(any(feature = "tee", feature = "nitro")))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]

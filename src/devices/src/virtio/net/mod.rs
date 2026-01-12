@@ -21,6 +21,14 @@ mod unixgram;
 mod unixstream;
 mod worker;
 
+pub mod async_backend;
+pub mod async_worker;
+
+pub use async_backend::{
+    AsyncNetBackend, AsyncNetBackendFactory, BoxFuture, NetBackendHandle, SendBoxFuture,
+};
+pub use async_worker::AsyncNetWorker;
+
 fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
