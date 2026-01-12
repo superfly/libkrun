@@ -45,7 +45,9 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -199,6 +201,9 @@ pub struct SmoltcpProxyConfig {
     pub vm_ip: Ipv4Address,
     pub gateway_mac: EthernetAddress,
     pub gateway_ip: Ipv4Address,
+    /// Unix socket listeners: maps VM port to Unix socket path on host
+    /// When a connection arrives on the Unix socket, it's forwarded to the VM port
+    pub unix_listeners: HashMap<u16, PathBuf>,
 }
 
 impl Default for SmoltcpProxyConfig {
@@ -208,6 +213,7 @@ impl Default for SmoltcpProxyConfig {
             vm_ip: VM_IP,
             gateway_mac: PROXY_MAC,
             gateway_ip: PROXY_IP,
+            unix_listeners: HashMap::new(),
         }
     }
 }
@@ -228,7 +234,77 @@ impl AsyncNetBackendFactory for SmoltcpProxyFactory {
         Box::pin(async move {
             let (to_guest_tx, to_guest_rx) = mpsc::channel(CHANNEL_SIZE);
             let (wake_tx, wake_rx) = mpsc::channel(256);
-            let backend = SmoltcpProxyBackend::new(self.config, to_guest_tx, wake_tx)?;
+            let (host_events_tx, host_events_rx) = mpsc::channel(CHANNEL_SIZE);
+
+            // Spawn Unix socket listener tasks before creating backend
+            let mut next_conn_id = 1_000_000u64; // Start high to avoid collision with TCP conn IDs
+            for (vm_port, socket_path) in &self.config.unix_listeners {
+                // Remove existing socket file if present
+                if socket_path.exists() {
+                    if let Err(e) = std::fs::remove_file(socket_path) {
+                        error!("Failed to remove existing socket {:?}: {}", socket_path, e);
+                    }
+                }
+
+                // Create Unix listener
+                let listener = match UnixListener::bind(socket_path) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Failed to bind Unix socket {:?}: {}", socket_path, e);
+                        continue;
+                    }
+                };
+
+                info!(
+                    "Unix socket listener started: {:?} -> VM port {}",
+                    socket_path, vm_port
+                );
+
+                // Spawn listener task
+                let events_tx = host_events_tx.clone();
+                let wake_tx_clone = wake_tx.clone();
+                let vm_port = *vm_port;
+                let base_conn_id = next_conn_id;
+                next_conn_id += 100_000; // Reserve range for this listener
+
+                tokio::task::spawn_local(async move {
+                    let mut conn_counter = 0u64;
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _addr)) => {
+                                let conn_id = base_conn_id + conn_counter;
+                                conn_counter += 1;
+                                debug!("Unix listener: accepted connection {}", conn_id);
+
+                                if events_tx
+                                    .send(HostEvent::UnixAccepted {
+                                        conn_id,
+                                        vm_port,
+                                        stream,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break; // Channel closed
+                                }
+                                let _ = wake_tx_clone.try_send(());
+                            }
+                            Err(e) => {
+                                error!("Unix listener accept error: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
+
+            let backend = SmoltcpProxyBackend::new_with_channels(
+                self.config,
+                to_guest_tx,
+                wake_tx,
+                host_events_tx,
+                host_events_rx,
+            )?;
+
             Ok(NetBackendHandle {
                 backend: Box::new(backend),
                 to_guest_rx,
@@ -250,6 +326,12 @@ enum HostEvent {
     TcpFailed { conn_id: u64, error: String },
     UdpData { flow_id: u64, data: Bytes },
     UdpClosed { flow_id: u64 },
+    /// A new connection was accepted on a Unix socket listener
+    UnixAccepted { conn_id: u64, vm_port: u16, stream: UnixStream },
+    /// Data received from Unix socket (to be sent to VM)
+    UnixData { conn_id: u64, data: Bytes },
+    /// Unix socket closed
+    UnixClosed { conn_id: u64 },
 }
 
 /// Commands sent to host TCP connection tasks.
@@ -295,6 +377,27 @@ struct UdpFlow {
     last_activity: Instant,
 }
 
+/// State for a Unix socket inbound connection (host Unix socket -> VM TCP).
+/// This is the reverse direction: connections from the host to the VM.
+struct UnixInboundConnection {
+    smoltcp_handle: SocketHandle,
+    cmd_tx: mpsc::Sender<HostCommand>,
+    vm_port: u16,
+    state: UnixInboundState,
+    /// Pending data from Unix socket that couldn't be sent to smoltcp yet
+    pending_to_vm: VecDeque<Bytes>,
+    /// Pending data to send to Unix socket (backpressure when channel is full)
+    pending_to_unix: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixInboundState {
+    /// TCP connection to VM is being established (SYN sent)
+    Connecting,
+    /// TCP connection to VM is established
+    Established,
+}
+
 /// The userspace NAT proxy backend using smoltcp.
 pub struct SmoltcpProxyBackend {
     iface: Interface,
@@ -311,8 +414,10 @@ pub struct SmoltcpProxyBackend {
     next_flow_id: u64,
     udp_flows: HashMap<u64, UdpFlow>,
     udp_nat: HashMap<IpEndpoint, u64>,
+    // Unix socket inbound connections (host -> VM)
+    unix_inbound: HashMap<u64, UnixInboundConnection>,
+    next_ephemeral_port: u16,
     start_time: Instant,
-    #[allow(dead_code)]
     config: SmoltcpProxyConfig,
 }
 
@@ -323,6 +428,16 @@ impl SmoltcpProxyBackend {
         wake_tx: mpsc::Sender<()>,
     ) -> io::Result<Self> {
         let (host_events_tx, host_events_rx) = mpsc::channel(CHANNEL_SIZE);
+        Self::new_with_channels(config, to_guest_tx, wake_tx, host_events_tx, host_events_rx)
+    }
+
+    pub fn new_with_channels(
+        config: SmoltcpProxyConfig,
+        to_guest_tx: mpsc::Sender<Bytes>,
+        wake_tx: mpsc::Sender<()>,
+        host_events_tx: mpsc::Sender<HostEvent>,
+        host_events_rx: mpsc::Receiver<HostEvent>,
+    ) -> io::Result<Self> {
 
         // Create the device first - it will be used throughout
         let mut device = ProxyDevice::new();
@@ -361,9 +476,21 @@ impl SmoltcpProxyBackend {
             next_flow_id: 0,
             udp_flows: HashMap::new(),
             udp_nat: HashMap::new(),
+            unix_inbound: HashMap::new(),
+            next_ephemeral_port: 49152, // Start of ephemeral port range
             start_time: Instant::now(),
             config,
         })
+    }
+
+    /// Get the next ephemeral port for outbound connections from the proxy.
+    fn get_ephemeral_port(&mut self) -> u16 {
+        let port = self.next_ephemeral_port;
+        self.next_ephemeral_port = self.next_ephemeral_port.wrapping_add(1);
+        if self.next_ephemeral_port < 49152 {
+            self.next_ephemeral_port = 49152;
+        }
+        port
     }
 
     fn timestamp(&self) -> SmoltcpInstant {
@@ -890,6 +1017,60 @@ impl SmoltcpProxyBackend {
                     debug!("process_host_events: UdpClosed for flow {}", flow_id);
                     self.close_udp_flow(flow_id);
                 }
+                HostEvent::UnixAccepted {
+                    conn_id,
+                    vm_port,
+                    stream,
+                } => {
+                    debug!(
+                        "Unix connection {} accepted, forwarding to VM port {}",
+                        conn_id, vm_port
+                    );
+                    self.handle_unix_accept(conn_id, vm_port, stream);
+                }
+                HostEvent::UnixData { conn_id, data } => {
+                    trace!(
+                        "Unix connection {}: received {} bytes from host",
+                        conn_id,
+                        data.len()
+                    );
+                    if let Some(conn) = self.unix_inbound.get_mut(&conn_id) {
+                        conn.pending_to_vm.push_back(data);
+
+                        // Try to send to smoltcp
+                        let socket = self
+                            .sockets
+                            .get_mut::<smoltcp_tcp::Socket>(conn.smoltcp_handle);
+
+                        loop {
+                            if !socket.can_send() {
+                                break;
+                            }
+
+                            let Some(chunk) = conn.pending_to_vm.pop_front() else {
+                                break;
+                            };
+
+                            match socket.send_slice(&chunk) {
+                                Ok(sent) if sent == chunk.len() => {}
+                                Ok(sent) => {
+                                    let remaining = chunk.slice(sent..);
+                                    conn.pending_to_vm.push_front(remaining);
+                                    break;
+                                }
+                                Err(e) => {
+                                    conn.pending_to_vm.push_front(chunk);
+                                    error!("Unix {}: smoltcp send error: {e}", conn_id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                HostEvent::UnixClosed { conn_id } => {
+                    debug!("Unix connection {} closed by host", conn_id);
+                    self.close_unix_connection(conn_id);
+                }
             }
         }
     }
@@ -920,6 +1101,130 @@ impl SmoltcpProxyBackend {
             let _ = flow.cmd_tx.try_send(UdpHostCommand::Close);
         } else {
             warn!("close_udp_flow: flow {} not found", flow_id);
+        }
+    }
+
+    /// Handle a new Unix socket connection by creating a smoltcp TCP connection to the VM.
+    fn handle_unix_accept(&mut self, conn_id: u64, vm_port: u16, stream: UnixStream) {
+        // Create smoltcp TCP socket to connect to VM
+        let rx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let tx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let mut socket = smoltcp_tcp::Socket::new(rx_buffer, tx_buffer);
+
+        // The remote endpoint is the VM's IP and port
+        let remote_endpoint = IpEndpoint::new(IpAddress::from(self.config.vm_ip), vm_port);
+        let local_port = self.get_ephemeral_port();
+
+        // Initiate connection to VM
+        if let Err(e) = socket.connect(
+            self.iface.context(),
+            remote_endpoint,
+            smoltcp::wire::IpListenEndpoint {
+                port: local_port,
+                addr: Some(IpAddress::from(self.config.gateway_ip)),
+            },
+        ) {
+            error!(
+                "Unix {}: failed to connect smoltcp socket to VM: {}",
+                conn_id, e
+            );
+            return;
+        }
+
+        let smoltcp_handle = self.sockets.add(socket);
+
+        // Create channel for sending data to Unix socket
+        let (cmd_tx, cmd_rx) = mpsc::channel::<HostCommand>(512);
+
+        // Spawn task to handle Unix socket I/O
+        let events_tx = self.host_events_tx.clone();
+        let wake_tx = self.wake_tx.clone();
+        tokio::task::spawn_local(Self::unix_socket_task(
+            conn_id,
+            stream,
+            events_tx,
+            wake_tx,
+            cmd_rx,
+        ));
+
+        // Track the connection
+        self.unix_inbound.insert(
+            conn_id,
+            UnixInboundConnection {
+                smoltcp_handle,
+                cmd_tx,
+                vm_port,
+                state: UnixInboundState::Connecting,
+                pending_to_vm: VecDeque::new(),
+                pending_to_unix: None,
+            },
+        );
+
+        debug!(
+            "Unix {}: created smoltcp connection to VM {}:{}",
+            conn_id, self.config.vm_ip, vm_port
+        );
+    }
+
+    /// Task to handle Unix socket I/O.
+    async fn unix_socket_task(
+        conn_id: u64,
+        stream: UnixStream,
+        events_tx: mpsc::Sender<HostEvent>,
+        wake_tx: mpsc::Sender<()>,
+        mut cmd_rx: mpsc::Receiver<HostCommand>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut reader, mut writer) = stream.into_split();
+        let mut buf = vec![0u8; 65535];
+
+        loop {
+            tokio::select! {
+                result = reader.read(&mut buf) => {
+                    match result {
+                        Ok(0) => {
+                            let _ = events_tx.send(HostEvent::UnixClosed { conn_id }).await;
+                            let _ = wake_tx.try_send(());
+                            break;
+                        }
+                        Ok(n) => {
+                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            let _ = events_tx.send(HostEvent::UnixData { conn_id, data }).await;
+                            let _ = wake_tx.try_send(());
+                        }
+                        Err(e) => {
+                            error!("Unix {} read error: {e}", conn_id);
+                            let _ = events_tx.send(HostEvent::UnixClosed { conn_id }).await;
+                            let _ = wake_tx.try_send(());
+                            break;
+                        }
+                    }
+                }
+
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        HostCommand::Send(data) => {
+                            if let Err(e) = writer.write_all(&data).await {
+                                trace!("Unix {} write error: {e}", conn_id);
+                                break;
+                            }
+                            let _ = wake_tx.try_send(());
+                        }
+                        HostCommand::Close => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn close_unix_connection(&mut self, conn_id: u64) {
+        if let Some(conn) = self.unix_inbound.remove(&conn_id) {
+            let socket = self
+                .sockets
+                .get_mut::<smoltcp_tcp::Socket>(conn.smoltcp_handle);
+            socket.close();
+            let _ = conn.cmd_tx.try_send(HostCommand::Close);
         }
     }
 
@@ -1026,6 +1331,96 @@ impl SmoltcpProxyBackend {
 
             if socket.state() == smoltcp_tcp::State::Closed {
                 trace!("process_sockets: TCP {} smoltcp socket closed", conn_id);
+            }
+        }
+
+        // Process Unix inbound connections (host Unix socket -> VM)
+        let unix_conn_ids: Vec<u64> = self.unix_inbound.keys().copied().collect();
+
+        for conn_id in unix_conn_ids {
+            let Some(conn) = self.unix_inbound.get_mut(&conn_id) else {
+                continue;
+            };
+
+            let socket = self
+                .sockets
+                .get_mut::<smoltcp_tcp::Socket>(conn.smoltcp_handle);
+
+            // Check if connection is established
+            if conn.state == UnixInboundState::Connecting
+                && socket.state() == smoltcp_tcp::State::Established
+            {
+                debug!("Unix {}: connection to VM established", conn_id);
+                conn.state = UnixInboundState::Established;
+            }
+
+            // Try to drain pending data to smoltcp (host -> VM)
+            loop {
+                if !socket.can_send() {
+                    break;
+                }
+
+                let Some(chunk) = conn.pending_to_vm.pop_front() else {
+                    break;
+                };
+
+                match socket.send_slice(&chunk) {
+                    Ok(sent) if sent == chunk.len() => {}
+                    Ok(sent) => {
+                        let remaining = chunk.slice(sent..);
+                        conn.pending_to_vm.push_front(remaining);
+                        break;
+                    }
+                    Err(e) => {
+                        conn.pending_to_vm.push_front(chunk);
+                        error!("Unix {}: smoltcp send error: {e}", conn_id);
+                        break;
+                    }
+                }
+            }
+
+            // Try to drain pending_to_unix first (backpressure handling)
+            if let Some(pending) = conn.pending_to_unix.take() {
+                match conn.cmd_tx.try_send(HostCommand::Send(pending)) {
+                    Ok(_) => {
+                        trace!("Unix {}: drained pending unix send", conn_id);
+                    }
+                    Err(mpsc::error::TrySendError::Full(HostCommand::Send(data))) => {
+                        conn.pending_to_unix = Some(data);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            // Read from smoltcp (VM -> Unix socket)
+            if conn.pending_to_unix.is_none() && socket.can_recv() {
+                let mut buf = vec![0u8; 65535];
+                match socket.recv_slice(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        trace!(
+                            "Unix {}: received {} bytes from VM, forwarding to unix socket",
+                            conn_id, n
+                        );
+                        let data = Bytes::copy_from_slice(&buf[..n]);
+                        match conn.cmd_tx.try_send(HostCommand::Send(data)) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(HostCommand::Send(data))) => {
+                                trace!("Unix {}: unix channel full, applying backpressure", conn_id);
+                                conn.pending_to_unix = Some(data);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        trace!("Unix {}: recv_slice error: {}", conn_id, e);
+                    }
+                }
+            }
+
+            // Check for closed connection
+            if socket.state() == smoltcp_tcp::State::Closed {
+                trace!("Unix {}: smoltcp socket closed", conn_id);
             }
         }
     }
@@ -1144,13 +1539,18 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
     }
 
     fn poll_delay(&mut self) -> Option<Duration> {
-        // If any connection has pending data to send to host, poll quickly to retry
-        let has_pending_host_send = self
+        // If any connection has pending data to send, poll quickly to retry
+        let has_pending_tcp = self
             .tcp_connections
             .values()
             .any(|conn| conn.pending_host_send.is_some());
 
-        if has_pending_host_send {
+        let has_pending_unix = self
+            .unix_inbound
+            .values()
+            .any(|conn| conn.pending_to_unix.is_some() || !conn.pending_to_vm.is_empty());
+
+        if has_pending_tcp || has_pending_unix {
             // Retry quickly when backpressured
             return Some(Duration::from_micros(100));
         }
@@ -1178,6 +1578,11 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
 struct Cli {
     #[arg(long, default_value = "examples/rootfs_debian")]
     rootfs: String,
+
+    /// Unix socket listener mapping (format: /path/to/socket:vm_port)
+    /// Example: --unix-listener /tmp/vm.sock:8080
+    #[arg(long = "unix-listener", value_name = "PATH:PORT")]
+    unix_listeners: Vec<String>,
 
     command: Vec<String>,
 }
@@ -1224,6 +1629,25 @@ async fn main() {
         builder.args(args);
     }
 
+    // Parse Unix socket listeners from CLI
+    let mut unix_listeners = HashMap::new();
+    for listener_spec in &cli.unix_listeners {
+        // Format: /path/to/socket:port
+        if let Some((path, port_str)) = listener_spec.rsplit_once(':') {
+            match port_str.parse::<u16>() {
+                Ok(port) => {
+                    println!("Adding Unix socket listener: {} -> VM port {}", path, port);
+                    unix_listeners.insert(port, PathBuf::from(path));
+                }
+                Err(e) => {
+                    eprintln!("Invalid port in '{}': {}", listener_spec, e);
+                }
+            }
+        } else {
+            eprintln!("Invalid listener format '{}', expected /path:port", listener_spec);
+        }
+    }
+
     builder.add_net_device(
         VirtioNetBackend::CustomAsyncFactory(Box::new(SmoltcpProxyFactory::new(
             SmoltcpProxyConfig {
@@ -1231,6 +1655,7 @@ async fn main() {
                 vm_ip: Ipv4Address::new(192, 168, 100, 2),
                 gateway_mac: EthernetAddress([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]),
                 gateway_ip: Ipv4Address::new(192, 168, 100, 1),
+                unix_listeners,
             },
         ))),
         [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00],

@@ -280,7 +280,8 @@ fn push_to_rx_queue(
     packet: &[u8],
 ) {
     let Some(head) = queues[RX_INDEX].pop(mem) else {
-        warn!("async net worker: no RX buffers available, dropping packet");
+        // This is expected under high load - guest can't replenish RX buffers fast enough
+        trace!("async net worker: no RX buffers available, dropping packet");
         return;
     };
 
