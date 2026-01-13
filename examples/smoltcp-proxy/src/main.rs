@@ -198,7 +198,6 @@ impl<'a> smoltcp::phy::TxToken for ProxyTxToken<'a> {
 // ============================================================================
 
 /// What to do with a packet after handling.
-#[derive(Debug)]
 pub enum PacketVerdict {
     /// Drop the packet silently
     Drop,
@@ -206,6 +205,21 @@ pub enum PacketVerdict {
     Respond(Bytes),
     /// Continue to next handler (or default NAT processing if last)
     Continue,
+    /// Proxy this TCP flow through handler-provided channels.
+    /// smoltcp handles TCP state (handshake, ACKs, retransmits).
+    /// Handler just deals with payload byte streams.
+    ProxyFlow(FlowChannels),
+}
+
+/// Bidirectional channels for proxied flow data.
+///
+/// Used with `PacketVerdict::ProxyFlow` to let handlers proxy TCP streams
+/// without dealing with TCP state machine complexity.
+pub struct FlowChannels {
+    /// Handler receives payload data from guest on this channel
+    pub to_handler: mpsc::Sender<Bytes>,
+    /// Handler sends payload data to guest on this channel
+    pub from_handler: mpsc::Receiver<Bytes>,
 }
 
 /// Transport protocol info parsed from the packet.
@@ -253,13 +267,21 @@ pub struct PacketContext<'a> {
     // Config for building responses (from proxy config)
     vm_mac: [u8; 6],
     gateway_mac: [u8; 6],
+
+    /// Channel to send packets to guest. Clone this for async tasks.
+    pub to_guest: &'a mpsc::Sender<Bytes>,
 }
 
 impl<'a> PacketContext<'a> {
     /// Parse a raw Ethernet frame into a PacketContext.
     ///
     /// All payload slices are derived from `raw` to ensure proper lifetimes.
-    pub fn parse(raw: &'a [u8], vm_mac: [u8; 6], gateway_mac: [u8; 6]) -> Option<Self> {
+    pub fn parse(
+        raw: &'a [u8],
+        vm_mac: [u8; 6],
+        gateway_mac: [u8; 6],
+        to_guest: &'a mpsc::Sender<Bytes>,
+    ) -> Option<Self> {
         // Ethernet header is 14 bytes
         const ETH_HEADER_LEN: usize = 14;
         if raw.len() < ETH_HEADER_LEN {
@@ -388,6 +410,7 @@ impl<'a> PacketContext<'a> {
             transport,
             vm_mac,
             gateway_mac,
+            to_guest,
         })
     }
 
@@ -1329,6 +1352,21 @@ enum TcpConnectionState {
     Closing,
 }
 
+/// A TCP flow proxied through handler-provided channels.
+/// smoltcp handles TCP state, handler deals with payload streams.
+struct ProxiedTcpFlow {
+    smoltcp_handle: SocketHandle,
+    guest_endpoint: IpEndpoint,
+    /// Send payload data from guest to handler
+    to_handler: mpsc::Sender<Bytes>,
+    /// Receive payload data from handler to send to guest
+    from_handler: mpsc::Receiver<Bytes>,
+    /// Pending data from handler that couldn't be sent to smoltcp yet
+    pending_to_guest: VecDeque<Bytes>,
+    /// Pending data to send to handler (backpressure)
+    pending_to_handler: Option<Bytes>,
+}
+
 /// State for a proxied UDP flow.
 /// UDP is connectionless, so we track "flows" by the guest's source endpoint.
 struct UdpFlow {
@@ -1375,6 +1413,9 @@ pub struct SmoltcpProxyBackend {
     next_flow_id: u64,
     udp_flows: HashMap<u64, UdpFlow>,
     udp_nat: HashMap<IpEndpoint, u64>,
+    // Handler-proxied TCP flows
+    proxied_flows: HashMap<u64, ProxiedTcpFlow>,
+    proxied_nat: HashMap<IpEndpoint, u64>,
     // Unix socket inbound connections (host -> VM)
     unix_inbound: HashMap<u64, UnixInboundConnection>,
     next_ephemeral_port: u16,
@@ -1441,6 +1482,8 @@ impl SmoltcpProxyBackend {
             next_flow_id: 0,
             udp_flows: HashMap::new(),
             udp_nat: HashMap::new(),
+            proxied_flows: HashMap::new(),
+            proxied_nat: HashMap::new(),
             unix_inbound: HashMap::new(),
             next_ephemeral_port: 49152, // Start of ephemeral port range
             start_time: Instant::now(),
@@ -1461,6 +1504,50 @@ impl SmoltcpProxyBackend {
 
     fn timestamp(&self) -> SmoltcpInstant {
         SmoltcpInstant::from_millis(self.start_time.elapsed().as_millis() as i64)
+    }
+
+    /// Set up a proxied TCP flow with handler-provided channels.
+    /// Creates a smoltcp socket that will handle TCP state while routing
+    /// payload data through the handler's channels.
+    fn setup_proxied_flow(
+        &mut self,
+        guest_endpoint: IpEndpoint,
+        dst_port: u16,
+        channels: FlowChannels,
+    ) {
+        // Create a TCP socket for this flow
+        let tcp_rx_buf = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let tcp_tx_buf = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let mut socket = smoltcp_tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
+
+        // Listen on the destination port (from guest's perspective)
+        // smoltcp will accept the incoming SYN and complete handshake
+        socket.listen(dst_port).expect("failed to listen on proxied port");
+
+        let handle = self.sockets.add(socket);
+
+        // Generate a flow ID
+        let flow_id = self.next_conn_id;
+        self.next_conn_id += 1;
+
+        // Store the proxied flow
+        self.proxied_flows.insert(
+            flow_id,
+            ProxiedTcpFlow {
+                smoltcp_handle: handle,
+                guest_endpoint,
+                to_handler: channels.to_handler,
+                from_handler: channels.from_handler,
+                pending_to_guest: VecDeque::new(),
+                pending_to_handler: None,
+            },
+        );
+        self.proxied_nat.insert(guest_endpoint, flow_id);
+
+        debug!(
+            "Created proxied flow {} for {} -> port {}",
+            flow_id, guest_endpoint, dst_port
+        );
     }
 
     /// Try to intercept a new TCP connection from the guest.
@@ -2676,6 +2763,141 @@ impl SmoltcpProxyBackend {
                 trace!("Unix {}: smoltcp socket closed", conn_id);
             }
         }
+
+        // Process handler-proxied TCP flows
+        let proxied_ids: Vec<u64> = self.proxied_flows.keys().copied().collect();
+
+        for flow_id in proxied_ids {
+            let Some(flow) = self.proxied_flows.get_mut(&flow_id) else {
+                continue;
+            };
+
+            let socket = self
+                .sockets
+                .get_mut::<smoltcp_tcp::Socket>(flow.smoltcp_handle);
+
+            // Log socket state for debugging
+            let state = socket.state();
+            if state != smoltcp_tcp::State::Established && state != smoltcp_tcp::State::Listen {
+                trace!(
+                    "Proxied flow {}: state={}, can_recv={}, can_send={}",
+                    flow_id,
+                    state,
+                    socket.can_recv(),
+                    socket.can_send()
+                );
+            }
+
+            // Try to receive data from handler (from_handler -> smoltcp -> guest)
+            loop {
+                match flow.from_handler.try_recv() {
+                    Ok(data) => {
+                        trace!(
+                            "Proxied flow {}: received {} bytes from handler",
+                            flow_id,
+                            data.len()
+                        );
+                        flow.pending_to_guest.push_back(data);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        trace!("Proxied flow {}: handler channel disconnected", flow_id);
+                        break;
+                    }
+                }
+            }
+
+            // Try to drain pending_to_guest to smoltcp
+            loop {
+                if !socket.can_send() {
+                    break;
+                }
+
+                let Some(chunk) = flow.pending_to_guest.pop_front() else {
+                    break;
+                };
+
+                match socket.send_slice(&chunk) {
+                    Ok(sent) if sent == chunk.len() => {
+                        trace!(
+                            "Proxied flow {}: sent {} bytes to guest",
+                            flow_id,
+                            sent
+                        );
+                    }
+                    Ok(sent) if sent > 0 => {
+                        let remaining = chunk.slice(sent..);
+                        flow.pending_to_guest.push_front(remaining);
+                        break;
+                    }
+                    Ok(_) => {
+                        flow.pending_to_guest.push_front(chunk);
+                        break;
+                    }
+                    Err(e) => {
+                        flow.pending_to_guest.push_front(chunk);
+                        trace!("Proxied flow {}: smoltcp send error: {}", flow_id, e);
+                        break;
+                    }
+                }
+            }
+
+            // Try to drain pending_to_handler first (backpressure handling)
+            if let Some(pending) = flow.pending_to_handler.take() {
+                match flow.to_handler.try_send(pending) {
+                    Ok(_) => {
+                        trace!("Proxied flow {}: drained pending handler send", flow_id);
+                    }
+                    Err(mpsc::error::TrySendError::Full(data)) => {
+                        // Still full, put it back
+                        flow.pending_to_handler = Some(data);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Handler closed, will be cleaned up
+                        trace!("Proxied flow {}: handler channel closed", flow_id);
+                    }
+                }
+            }
+
+            // Read from smoltcp (guest -> handler)
+            // Only read if we don't have pending data (backpressure)
+            if flow.pending_to_handler.is_none() && socket.can_recv() {
+                let mut buf = vec![0u8; 65535];
+                match socket.recv_slice(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        trace!(
+                            "Proxied flow {}: received {} bytes from guest, forwarding to handler",
+                            flow_id,
+                            n
+                        );
+                        let data = Bytes::copy_from_slice(&buf[..n]);
+                        match flow.to_handler.try_send(data) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(data)) => {
+                                // Channel full - store for later, apply backpressure
+                                trace!(
+                                    "Proxied flow {}: handler channel full, applying backpressure",
+                                    flow_id
+                                );
+                                flow.pending_to_handler = Some(data);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                trace!("Proxied flow {}: handler channel closed", flow_id);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        trace!("Proxied flow {}: recv_slice error: {}", flow_id, e);
+                    }
+                }
+            }
+
+            // Check for closed socket
+            if socket.state() == smoltcp_tcp::State::Closed {
+                trace!("Proxied flow {}: smoltcp socket closed", flow_id);
+            }
+        }
     }
 
     fn flush_tx(&mut self) {
@@ -2791,7 +3013,7 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
             let vm_mac: [u8; 6] = self.config.vm_mac.0;
             let gateway_mac: [u8; 6] = self.config.gateway_mac.0;
 
-            if let Some(ctx) = PacketContext::parse(packet, vm_mac, gateway_mac) {
+            if let Some(ctx) = PacketContext::parse(packet, vm_mac, gateway_mac, &self.to_guest_tx) {
                 for (i, handler) in self.handlers.iter().enumerate() {
                     // Catch panics to prevent handler bugs from crashing the proxy
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2809,6 +3031,34 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
                             return;
                         }
                         Ok(Ok(PacketVerdict::Continue)) => continue,
+                        Ok(Ok(PacketVerdict::ProxyFlow(channels))) => {
+                            // Handler wants to proxy this TCP flow
+                            if let TransportProtocol::Tcp { src_port, dst_port, .. } = ctx.transport {
+                                let guest_endpoint = IpEndpoint::new(
+                                    IpAddress::from(ctx.src_ip),
+                                    src_port,
+                                );
+
+                                debug!(
+                                    "Handler proxying TCP flow {}:{} -> {}:{}",
+                                    ctx.src_ip, src_port, ctx.dst_ip, dst_port
+                                );
+
+                                // Create smoltcp socket for this flow
+                                self.setup_proxied_flow(guest_endpoint, dst_port, channels);
+
+                                // Queue packet to smoltcp so TCP handshake proceeds
+                                self.device.queue_rx(Bytes::copy_from_slice(packet));
+
+                                // Run smoltcp to process the SYN
+                                let timestamp = self.timestamp();
+                                self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+                                self.flush_tx();
+                            } else {
+                                error!("ProxyFlow returned for non-TCP packet, dropping");
+                            }
+                            return;
+                        }
                         Ok(Err(e)) => {
                             error!("Handler {} returned error: {}, dropping packet", i, e);
                             return;
