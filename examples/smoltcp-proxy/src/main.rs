@@ -47,6 +47,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -193,6 +194,544 @@ impl<'a> smoltcp::phy::TxToken for ProxyTxToken<'a> {
 }
 
 // ============================================================================
+// Packet Handler Infrastructure
+// ============================================================================
+
+/// What to do with a packet after handling.
+#[derive(Debug)]
+pub enum PacketVerdict {
+    /// Drop the packet silently
+    Drop,
+    /// Respond directly to the guest with this packet
+    Respond(Bytes),
+    /// Continue to next handler (or default NAT processing if last)
+    Continue,
+}
+
+/// Transport protocol info parsed from the packet.
+#[derive(Debug, Clone)]
+pub enum TransportProtocol<'a> {
+    Tcp {
+        src_port: u16,
+        dst_port: u16,
+        flags: u8,
+        seq: u32,
+        ack: u32,
+        payload: &'a [u8],
+    },
+    Udp {
+        src_port: u16,
+        dst_port: u16,
+        payload: &'a [u8],
+    },
+    Icmp {
+        icmp_type: u8,
+        code: u8,
+        payload: &'a [u8],
+    },
+    Other {
+        protocol: u8,
+    },
+}
+
+/// Parsed packet context passed to handlers.
+/// Provides both parsed fields and response-building helpers.
+pub struct PacketContext<'a> {
+    /// Raw packet bytes
+    pub raw: &'a [u8],
+    /// Source MAC address
+    pub src_mac: [u8; 6],
+    /// Destination MAC address
+    pub dst_mac: [u8; 6],
+    /// Source IP address
+    pub src_ip: Ipv4Addr,
+    /// Destination IP address
+    pub dst_ip: Ipv4Addr,
+    /// Transport layer protocol and data
+    pub transport: TransportProtocol<'a>,
+
+    // Config for building responses (from proxy config)
+    vm_mac: [u8; 6],
+    gateway_mac: [u8; 6],
+}
+
+impl<'a> PacketContext<'a> {
+    /// Parse a raw Ethernet frame into a PacketContext.
+    ///
+    /// All payload slices are derived from `raw` to ensure proper lifetimes.
+    pub fn parse(raw: &'a [u8], vm_mac: [u8; 6], gateway_mac: [u8; 6]) -> Option<Self> {
+        // Ethernet header is 14 bytes
+        const ETH_HEADER_LEN: usize = 14;
+        if raw.len() < ETH_HEADER_LEN {
+            return None;
+        }
+
+        // Parse MAC addresses directly from raw bytes
+        let src_mac = [raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]];
+        let dst_mac = [raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]];
+
+        // Check EtherType for IPv4 (0x0800)
+        if raw[12] != 0x08 || raw[13] != 0x00 {
+            return None;
+        }
+
+        let ip_start = ETH_HEADER_LEN;
+        if raw.len() < ip_start + 20 {
+            return None;
+        }
+
+        // Parse IPv4 header
+        let ihl = (raw[ip_start] & 0x0F) as usize;
+        let ip_header_len = ihl * 4;
+        if ip_header_len < 20 || raw.len() < ip_start + ip_header_len {
+            return None;
+        }
+
+        let src_ip = Ipv4Addr::new(
+            raw[ip_start + 12],
+            raw[ip_start + 13],
+            raw[ip_start + 14],
+            raw[ip_start + 15],
+        );
+        let dst_ip = Ipv4Addr::new(
+            raw[ip_start + 16],
+            raw[ip_start + 17],
+            raw[ip_start + 18],
+            raw[ip_start + 19],
+        );
+        let protocol = raw[ip_start + 9];
+
+        let transport_start = ip_start + ip_header_len;
+
+        let transport = match protocol {
+            // TCP (protocol 6)
+            6 => {
+                if raw.len() < transport_start + 20 {
+                    return None;
+                }
+                let src_port = u16::from_be_bytes([raw[transport_start], raw[transport_start + 1]]);
+                let dst_port =
+                    u16::from_be_bytes([raw[transport_start + 2], raw[transport_start + 3]]);
+                let seq = u32::from_be_bytes([
+                    raw[transport_start + 4],
+                    raw[transport_start + 5],
+                    raw[transport_start + 6],
+                    raw[transport_start + 7],
+                ]);
+                let ack = u32::from_be_bytes([
+                    raw[transport_start + 8],
+                    raw[transport_start + 9],
+                    raw[transport_start + 10],
+                    raw[transport_start + 11],
+                ]);
+                let data_offset = ((raw[transport_start + 12] >> 4) as usize) * 4;
+                let flags = raw[transport_start + 13];
+
+                let payload_start = transport_start + data_offset;
+                let payload = if payload_start <= raw.len() {
+                    &raw[payload_start..]
+                } else {
+                    &raw[raw.len()..]
+                };
+
+                TransportProtocol::Tcp {
+                    src_port,
+                    dst_port,
+                    flags,
+                    seq,
+                    ack,
+                    payload,
+                }
+            }
+            // UDP (protocol 17)
+            17 => {
+                if raw.len() < transport_start + 8 {
+                    return None;
+                }
+                let src_port = u16::from_be_bytes([raw[transport_start], raw[transport_start + 1]]);
+                let dst_port =
+                    u16::from_be_bytes([raw[transport_start + 2], raw[transport_start + 3]]);
+                let payload_start = transport_start + 8;
+                let payload = &raw[payload_start..];
+
+                TransportProtocol::Udp {
+                    src_port,
+                    dst_port,
+                    payload,
+                }
+            }
+            // ICMP (protocol 1)
+            1 => {
+                if raw.len() < transport_start + 8 {
+                    return None;
+                }
+                let icmp_type = raw[transport_start];
+                let code = raw[transport_start + 1];
+                let payload_start = transport_start + 8;
+                let payload = &raw[payload_start..];
+
+                TransportProtocol::Icmp {
+                    icmp_type,
+                    code,
+                    payload,
+                }
+            }
+            other => TransportProtocol::Other { protocol: other },
+        };
+
+        Some(Self {
+            raw,
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            transport,
+            vm_mac,
+            gateway_mac,
+        })
+    }
+
+    /// Build a UDP response packet to send back to the guest.
+    /// Swaps src/dst and wraps payload in UDP/IP/Ethernet headers.
+    pub fn build_udp_response(&self, payload: &[u8]) -> Bytes {
+        let (src_port, dst_port) = match &self.transport {
+            TransportProtocol::Udp {
+                src_port, dst_port, ..
+            } => (*dst_port, *src_port),
+            _ => (0, 0),
+        };
+
+        // UDP header (8 bytes)
+        let udp_len = 8 + payload.len();
+        let mut udp_header = Vec::with_capacity(udp_len);
+        udp_header.extend_from_slice(&src_port.to_be_bytes());
+        udp_header.extend_from_slice(&dst_port.to_be_bytes());
+        udp_header.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        udp_header.extend_from_slice(&[0, 0]); // Checksum (optional for IPv4)
+        udp_header.extend_from_slice(payload);
+
+        self.build_ip_response(17, &udp_header) // 17 = UDP
+    }
+
+    /// Build an ICMP echo reply packet.
+    pub fn build_icmp_echo_reply(&self, id: u16, sequence: u16, data: &[u8]) -> Bytes {
+        let mut icmp = Vec::with_capacity(8 + data.len());
+        icmp.push(0); // Type: Echo Reply
+        icmp.push(0); // Code
+        icmp.extend_from_slice(&[0, 0]); // Checksum placeholder
+        icmp.extend_from_slice(&id.to_be_bytes());
+        icmp.extend_from_slice(&sequence.to_be_bytes());
+        icmp.extend_from_slice(data);
+
+        // Calculate checksum
+        let checksum = internet_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        self.build_ip_response(1, &icmp) // 1 = ICMP
+    }
+
+    /// Build a TCP RST packet to reject a connection.
+    pub fn build_tcp_rst(&self) -> Bytes {
+        let (src_port, dst_port, their_seq, their_ack) = match &self.transport {
+            TransportProtocol::Tcp {
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                ..
+            } => (*dst_port, *src_port, *seq, *ack),
+            _ => return Bytes::new(),
+        };
+
+        // TCP header (20 bytes, no options)
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        // Seq = their ack (or 0 if no ack)
+        let seq = if their_ack != 0 { their_ack } else { 0 };
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        // Ack = their seq + 1
+        let ack = their_seq.wrapping_add(1);
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4; // Data offset: 5 (20 bytes)
+        tcp[13] = 0x14; // Flags: RST + ACK
+        tcp[14..16].copy_from_slice(&0u16.to_be_bytes()); // Window
+                                                          // Checksum calculated below
+        tcp[18..20].copy_from_slice(&0u16.to_be_bytes()); // Urgent pointer
+
+        // TCP checksum requires pseudo-header
+        let checksum = self.tcp_checksum(&tcp);
+        tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        self.build_ip_response(6, &tcp) // 6 = TCP
+    }
+
+    /// Build an IP response packet (helper for other builders).
+    fn build_ip_response(&self, protocol: u8, payload: &[u8]) -> Bytes {
+        let ip_total_len = 20 + payload.len();
+        let mut ip = Vec::with_capacity(ip_total_len);
+
+        // IPv4 header
+        ip.push(0x45); // Version + IHL
+        ip.push(0x00); // DSCP + ECN
+        ip.extend_from_slice(&(ip_total_len as u16).to_be_bytes());
+        ip.extend_from_slice(&[0x00, 0x00]); // Identification
+        ip.extend_from_slice(&[0x40, 0x00]); // Flags + Fragment offset
+        ip.push(64); // TTL
+        ip.push(protocol);
+        ip.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
+        ip.extend_from_slice(&self.dst_ip.octets()); // Src = original dst
+        ip.extend_from_slice(&self.src_ip.octets()); // Dst = original src
+
+        // Calculate IP checksum
+        let checksum = internet_checksum(&ip[..20]);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        // Append payload
+        ip.extend_from_slice(payload);
+
+        // Build Ethernet frame
+        let mut eth = Vec::with_capacity(14 + ip.len());
+        eth.extend_from_slice(&self.vm_mac); // Dst = VM
+        eth.extend_from_slice(&self.gateway_mac); // Src = Gateway
+        eth.extend_from_slice(&[0x08, 0x00]); // EtherType: IPv4
+        eth.extend_from_slice(&ip);
+
+        Bytes::from(eth)
+    }
+
+    /// Calculate TCP checksum with pseudo-header.
+    fn tcp_checksum(&self, tcp_segment: &[u8]) -> u16 {
+        let mut pseudo = Vec::with_capacity(12 + tcp_segment.len());
+        pseudo.extend_from_slice(&self.dst_ip.octets()); // Src in response
+        pseudo.extend_from_slice(&self.src_ip.octets()); // Dst in response
+        pseudo.push(0);
+        pseudo.push(6); // TCP protocol
+        pseudo.extend_from_slice(&(tcp_segment.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(tcp_segment);
+        internet_checksum(&pseudo)
+    }
+
+    // Convenience accessors
+
+    /// Get destination port if TCP or UDP.
+    pub fn dst_port(&self) -> Option<u16> {
+        match &self.transport {
+            TransportProtocol::Tcp { dst_port, .. } => Some(*dst_port),
+            TransportProtocol::Udp { dst_port, .. } => Some(*dst_port),
+            _ => None,
+        }
+    }
+
+    /// Get source port if TCP or UDP.
+    pub fn src_port(&self) -> Option<u16> {
+        match &self.transport {
+            TransportProtocol::Tcp { src_port, .. } => Some(*src_port),
+            TransportProtocol::Udp { src_port, .. } => Some(*src_port),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a TCP SYN packet (new connection).
+    pub fn is_tcp_syn(&self) -> bool {
+        matches!(&self.transport, TransportProtocol::Tcp { flags, .. } if *flags == TcpFlags::SYN)
+    }
+
+    /// Check if this is an ICMP echo request.
+    pub fn is_icmp_echo_request(&self) -> bool {
+        matches!(
+            &self.transport,
+            TransportProtocol::Icmp { icmp_type: 8, .. }
+        )
+    }
+
+    /// Check if this is a DNS query (UDP port 53).
+    pub fn is_dns_query(&self) -> bool {
+        matches!(&self.transport, TransportProtocol::Udp { dst_port: 53, .. })
+    }
+
+    /// Get UDP payload if this is a UDP packet.
+    pub fn udp_payload(&self) -> Option<&[u8]> {
+        match &self.transport {
+            TransportProtocol::Udp { payload, .. } => Some(payload),
+            _ => None,
+        }
+    }
+}
+
+/// Error type for packet handlers.
+pub type HandlerError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Result type for packet handler methods.
+pub type HandlerResult = Result<PacketVerdict, HandlerError>;
+
+/// Trait for packet handlers in the processing chain.
+///
+/// Handlers are called in order for each outbound packet from the guest.
+/// Each handler can inspect the packet and decide to:
+/// - `Ok(Drop)` - drop the packet (firewall deny)
+/// - `Ok(Respond(...))` - respond directly (DNS, ICMP error, TCP RST)
+/// - `Ok(Continue)` - pass to next handler
+/// - `Err(...)` - log error and drop packet
+///
+/// If all handlers return `Ok(Continue)`, the packet proceeds to default NAT processing.
+///
+/// # Error Handling
+///
+/// Handlers can return errors, which will be logged and cause the packet to be dropped.
+/// Panics are also caught and logged - they won't crash the proxy.
+///
+/// # Protocol-specific methods
+///
+/// Override only the methods for protocols you care about. All default to `Ok(Continue)`.
+///
+/// # Example: Block specific TCP ports
+/// ```ignore
+/// struct PortBlocker {
+///     blocked: HashSet<u16>,
+/// }
+///
+/// impl PacketHandler for PortBlocker {
+///     fn handle_tcp(&self, ctx: &PacketContext, tcp: TcpInfo) -> HandlerResult {
+///         if self.blocked.contains(&tcp.dst_port) {
+///             Ok(PacketVerdict::Drop)
+///         } else {
+///             Ok(PacketVerdict::Continue)
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Example: Custom DNS responder with error handling
+/// ```ignore
+/// struct DnsHandler;
+///
+/// impl PacketHandler for DnsHandler {
+///     fn handle_udp(&self, ctx: &PacketContext, udp: UdpInfo) -> HandlerResult {
+///         if udp.dst_port == 53 {
+///             let response = parse_and_resolve(udp.payload)?;  // can use ?
+///             Ok(PacketVerdict::Respond(ctx.build_udp_response(&response)))
+///         } else {
+///             Ok(PacketVerdict::Continue)
+///         }
+///     }
+/// }
+/// ```
+pub trait PacketHandler: Send + Sync + 'static {
+    /// Handle a TCP packet. Override to process TCP traffic.
+    fn handle_tcp(&self, _ctx: &PacketContext, _tcp: TcpInfo) -> HandlerResult {
+        Ok(PacketVerdict::Continue)
+    }
+
+    /// Handle a UDP packet. Override to process UDP traffic.
+    fn handle_udp(&self, _ctx: &PacketContext, _udp: UdpInfo) -> HandlerResult {
+        Ok(PacketVerdict::Continue)
+    }
+
+    /// Handle an ICMP packet. Override to process ICMP traffic.
+    fn handle_icmp(&self, _ctx: &PacketContext, _icmp: IcmpInfo) -> HandlerResult {
+        Ok(PacketVerdict::Continue)
+    }
+
+    /// Handle packets with other/unknown protocols. Rarely needed.
+    fn handle_other(&self, _ctx: &PacketContext, _protocol: u8) -> HandlerResult {
+        Ok(PacketVerdict::Continue)
+    }
+
+    /// Main dispatch method. Override only if you need custom dispatch logic.
+    fn handle(&self, ctx: &PacketContext) -> HandlerResult {
+        match &ctx.transport {
+            TransportProtocol::Tcp {
+                src_port,
+                dst_port,
+                flags,
+                seq,
+                ack,
+                payload,
+            } => self.handle_tcp(
+                ctx,
+                TcpInfo {
+                    src_port: *src_port,
+                    dst_port: *dst_port,
+                    flags: *flags,
+                    seq: *seq,
+                    ack: *ack,
+                    payload,
+                },
+            ),
+            TransportProtocol::Udp {
+                src_port,
+                dst_port,
+                payload,
+            } => self.handle_udp(
+                ctx,
+                UdpInfo {
+                    src_port: *src_port,
+                    dst_port: *dst_port,
+                    payload,
+                },
+            ),
+            TransportProtocol::Icmp {
+                icmp_type,
+                code,
+                payload,
+            } => self.handle_icmp(
+                ctx,
+                IcmpInfo {
+                    icmp_type: *icmp_type,
+                    code: *code,
+                    payload,
+                },
+            ),
+            TransportProtocol::Other { protocol } => self.handle_other(ctx, *protocol),
+        }
+    }
+}
+
+/// TCP packet info passed to `handle_tcp`.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpInfo<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub flags: u8,
+    pub seq: u32,
+    pub ack: u32,
+    pub payload: &'a [u8],
+}
+
+impl TcpInfo<'_> {
+    /// Check if this is a SYN packet (new connection).
+    #[inline]
+    pub fn is_syn(&self) -> bool {
+        (self.flags & TcpFlags::SYN) != 0 && (self.flags & TcpFlags::ACK) == 0
+    }
+}
+
+/// UDP packet info passed to `handle_udp`.
+#[derive(Debug, Clone, Copy)]
+pub struct UdpInfo<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// ICMP packet info passed to `handle_icmp`.
+#[derive(Debug, Clone, Copy)]
+pub struct IcmpInfo<'a> {
+    pub icmp_type: u8,
+    pub code: u8,
+    pub payload: &'a [u8],
+}
+
+impl IcmpInfo<'_> {
+    /// Check if this is an echo request (ping).
+    #[inline]
+    pub fn is_echo_request(&self) -> bool {
+        self.icmp_type == 8
+    }
+}
+
+// ============================================================================
 // Firewall Configuration
 // ============================================================================
 
@@ -238,16 +777,16 @@ impl Cidr {
             (s, 32) // Single host
         };
 
-        let parts: Vec<u8> = ip_str
-            .split('.')
-            .filter_map(|p| p.parse().ok())
-            .collect();
+        let parts: Vec<u8> = ip_str.split('.').filter_map(|p| p.parse().ok()).collect();
 
         if parts.len() != 4 {
             return None;
         }
 
-        Some(Self::new([parts[0], parts[1], parts[2], parts[3]], prefix_len))
+        Some(Self::new(
+            [parts[0], parts[1], parts[2], parts[3]],
+            prefix_len,
+        ))
     }
 
     /// Check if an IP address matches this CIDR.
@@ -482,7 +1021,10 @@ impl FirewallConfig {
         }
 
         // Denylist mode: must not match any denied destination
-        !self.denied_destinations.iter().any(|cidr| cidr.contains(dst_ip))
+        !self
+            .denied_destinations
+            .iter()
+            .any(|cidr| cidr.contains(dst_ip))
     }
 
     /// Check if a TCP connection to the given destination is allowed.
@@ -505,6 +1047,72 @@ impl FirewallConfig {
 }
 
 // ============================================================================
+// Built-in Packet Handlers
+// ============================================================================
+
+/// A packet handler that implements firewall rules using FirewallConfig.
+///
+/// This handler drops packets that don't pass the firewall checks.
+/// For TCP, only SYN packets are checked (connection initiation).
+///
+/// # Example
+/// ```ignore
+/// let mut firewall = FirewallConfig::default();
+/// firewall.deny_tcp(22);  // Block SSH
+/// firewall.deny_destination_str("10.0.0.0/8");  // Block private network
+///
+/// let handler = FirewallHandler::new(firewall);
+/// config.handlers.push(Arc::new(handler));
+/// ```
+pub struct FirewallHandler {
+    config: FirewallConfig,
+}
+
+impl FirewallHandler {
+    /// Create a new firewall handler with the given configuration.
+    pub fn new(config: FirewallConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl PacketHandler for FirewallHandler {
+    fn handle_tcp(&self, ctx: &PacketContext, tcp: TcpInfo) -> HandlerResult {
+        // Only check SYN packets (connection initiation)
+        if tcp.is_syn() && !self.config.check_tcp(tcp.dst_port, ctx.dst_ip) {
+            debug!(
+                "FirewallHandler: blocked TCP {} -> {}:{}",
+                ctx.src_ip, ctx.dst_ip, tcp.dst_port
+            );
+            return Ok(PacketVerdict::Drop);
+        }
+        Ok(PacketVerdict::Continue)
+    }
+
+    fn handle_udp(&self, ctx: &PacketContext, udp: UdpInfo) -> HandlerResult {
+        if !self.config.check_udp(udp.dst_port, ctx.dst_ip) {
+            debug!(
+                "FirewallHandler: blocked UDP {} -> {}:{}",
+                ctx.src_ip, ctx.dst_ip, udp.dst_port
+            );
+            return Ok(PacketVerdict::Drop);
+        }
+        Ok(PacketVerdict::Continue)
+    }
+
+    fn handle_icmp(&self, ctx: &PacketContext, icmp: IcmpInfo) -> HandlerResult {
+        // Only check echo requests (pings)
+        if icmp.is_echo_request() && !self.config.check_icmp(ctx.dst_ip) {
+            debug!(
+                "FirewallHandler: blocked ICMP {} -> {}",
+                ctx.src_ip, ctx.dst_ip
+            );
+            return Ok(PacketVerdict::Drop);
+        }
+        Ok(PacketVerdict::Continue)
+    }
+}
+
+// ============================================================================
 // Backend Configuration and Factory
 // ============================================================================
 
@@ -517,8 +1125,10 @@ pub struct SmoltcpProxyConfig {
     /// Unix socket listeners: maps VM port to Unix socket path on host
     /// When a connection arrives on the Unix socket, it's forwarded to the VM port
     pub unix_listeners: HashMap<u16, PathBuf>,
-    /// Firewall rules for outbound traffic from the VM.
-    pub firewall: FirewallConfig,
+    /// Packet handlers - processed in order before NAT.
+    /// Handlers can Drop, Respond, or Continue to next handler.
+    /// Use `FirewallHandler` for firewall rules.
+    pub handlers: Vec<Arc<dyn PacketHandler>>,
 }
 
 impl Default for SmoltcpProxyConfig {
@@ -529,7 +1139,7 @@ impl Default for SmoltcpProxyConfig {
             gateway_mac: PROXY_MAC,
             gateway_ip: PROXY_IP,
             unix_listeners: HashMap::new(),
-            firewall: FirewallConfig::default(),
+            handlers: Vec::new(),
         }
     }
 }
@@ -639,18 +1249,42 @@ impl AsyncNetBackendFactory for SmoltcpProxyFactory {
 
 /// Messages from host connection tasks to the backend.
 enum HostEvent {
-    TcpData { conn_id: u64, data: Bytes },
-    TcpClosed { conn_id: u64 },
-    TcpConnected { conn_id: u64 },
-    TcpFailed { conn_id: u64, error: String },
-    UdpData { flow_id: u64, data: Bytes },
-    UdpClosed { flow_id: u64 },
+    TcpData {
+        conn_id: u64,
+        data: Bytes,
+    },
+    TcpClosed {
+        conn_id: u64,
+    },
+    TcpConnected {
+        conn_id: u64,
+    },
+    TcpFailed {
+        conn_id: u64,
+        error: String,
+    },
+    UdpData {
+        flow_id: u64,
+        data: Bytes,
+    },
+    UdpClosed {
+        flow_id: u64,
+    },
     /// A new connection was accepted on a Unix socket listener
-    UnixAccepted { conn_id: u64, vm_port: u16, stream: UnixStream },
+    UnixAccepted {
+        conn_id: u64,
+        vm_port: u16,
+        stream: UnixStream,
+    },
     /// Data received from Unix socket (to be sent to VM)
-    UnixData { conn_id: u64, data: Bytes },
+    UnixData {
+        conn_id: u64,
+        data: Bytes,
+    },
     /// Unix socket closed
-    UnixClosed { conn_id: u64 },
+    UnixClosed {
+        conn_id: u64,
+    },
     /// ICMP echo reply received from host
     IcmpReply {
         dest_ip: Ipv4Addr,   // Original destination (becomes source in reply)
@@ -746,6 +1380,8 @@ pub struct SmoltcpProxyBackend {
     next_ephemeral_port: u16,
     start_time: Instant,
     config: SmoltcpProxyConfig,
+    /// Packet handlers - processed in order before NAT
+    handlers: Vec<Arc<dyn PacketHandler>>,
 }
 
 impl SmoltcpProxyBackend {
@@ -759,13 +1395,12 @@ impl SmoltcpProxyBackend {
     }
 
     pub fn new_with_channels(
-        config: SmoltcpProxyConfig,
+        mut config: SmoltcpProxyConfig,
         to_guest_tx: mpsc::Sender<Bytes>,
         wake_tx: mpsc::Sender<()>,
         host_events_tx: mpsc::Sender<HostEvent>,
         host_events_rx: mpsc::Receiver<HostEvent>,
     ) -> io::Result<Self> {
-
         // Create the device first - it will be used throughout
         let mut device = ProxyDevice::new();
 
@@ -789,6 +1424,9 @@ impl SmoltcpProxyBackend {
 
         let sockets = SocketSet::new(vec![]);
 
+        // Extract handlers before moving config
+        let handlers = std::mem::take(&mut config.handlers);
+
         Ok(Self {
             iface,
             sockets,
@@ -807,6 +1445,7 @@ impl SmoltcpProxyBackend {
             next_ephemeral_port: 49152, // Start of ephemeral port range
             start_time: Instant::now(),
             config,
+            handlers,
         })
     }
 
@@ -848,18 +1487,8 @@ impl SmoltcpProxyBackend {
 
         let src_ip = IpAddress::from(ipv4.get_source());
         let dst_ip = IpAddress::from(ipv4.get_destination());
-        let dst_ip_v4 = ipv4.get_destination(); // std::net::Ipv4Addr for firewall
         let src_port = tcp.get_source();
         let dst_port = tcp.get_destination();
-
-        // Firewall check
-        if !self.config.firewall.check_tcp(dst_port, dst_ip_v4) {
-            debug!(
-                "Firewall: denied TCP connection to {}:{}",
-                dst_ip_v4, dst_port
-            );
-            return true; // Intercepted (blocked)
-        }
 
         let guest_endpoint = IpEndpoint::new(src_ip, src_port);
         let host_addr: SocketAddr = match dst_ip {
@@ -964,15 +1593,8 @@ impl SmoltcpProxyBackend {
 
         let src_ip = IpAddress::from(ipv4.get_source());
         let dst_ip = IpAddress::from(ipv4.get_destination());
-        let dst_ip_v4 = ipv4.get_destination(); // std::net::Ipv4Addr for firewall
         let src_port = udp.get_source();
         let dst_port = udp.get_destination();
-
-        // Firewall check
-        if !self.config.firewall.check_udp(dst_port, dst_ip_v4) {
-            debug!("Firewall: denied UDP packet to {}:{}", dst_ip_v4, dst_port);
-            return true; // Intercepted (blocked)
-        }
 
         let guest_endpoint = IpEndpoint::new(src_ip, src_port);
         let host_addr: SocketAddr = match dst_ip {
@@ -1118,12 +1740,6 @@ impl SmoltcpProxyBackend {
 
         let dest_ip = ipv4.get_destination();
 
-        // Firewall check
-        if !self.config.firewall.check_icmp(dest_ip) {
-            debug!("Firewall: denied ICMP echo request to {}", dest_ip);
-            return true; // Intercepted (blocked)
-        }
-
         // Parse echo request fields
         let payload = icmp.payload();
         if payload.len() < 4 {
@@ -1145,13 +1761,7 @@ impl SmoltcpProxyBackend {
         let events_tx = self.host_events_tx.clone();
         let wake_tx = self.wake_tx.clone();
         tokio::task::spawn_local(Self::icmp_ping_task(
-            source_ip,
-            dest_ip,
-            id,
-            sequence,
-            echo_data,
-            events_tx,
-            wake_tx,
+            source_ip, dest_ip, id, sequence, echo_data, events_tx, wake_tx,
         ));
 
         true
@@ -1177,15 +1787,15 @@ impl SmoltcpProxyBackend {
 
         // Create unprivileged ICMP socket (SOCK_DGRAM with IPPROTO_ICMP)
         // This works on macOS and Linux with proper sysctl settings
-        let socket_fd = unsafe {
-            libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP)
-        };
+        let socket_fd =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
 
         if socket_fd < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EACCES) || err.raw_os_error() == Some(libc::EPERM) {
                 // Only log once per session to avoid spam
-                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     warn!(
                         "ICMP ping forwarding unavailable: permission denied. \
@@ -1326,14 +1936,10 @@ impl SmoltcpProxyBackend {
                 // Parse ICMP: type(1) + code(1) + checksum(2) + id(2) + seq(2) + data
                 if n >= icmp_offset + 8 {
                     let reply_type = recv_buf[icmp_offset];
-                    let reply_id = u16::from_be_bytes([
-                        recv_buf[icmp_offset + 4],
-                        recv_buf[icmp_offset + 5],
-                    ]);
-                    let reply_seq = u16::from_be_bytes([
-                        recv_buf[icmp_offset + 6],
-                        recv_buf[icmp_offset + 7],
-                    ]);
+                    let reply_id =
+                        u16::from_be_bytes([recv_buf[icmp_offset + 4], recv_buf[icmp_offset + 5]]);
+                    let reply_seq =
+                        u16::from_be_bytes([recv_buf[icmp_offset + 6], recv_buf[icmp_offset + 7]]);
                     let reply_data = Bytes::copy_from_slice(&recv_buf[icmp_offset + 8..n]);
 
                     debug!(
@@ -1367,10 +1973,7 @@ impl SmoltcpProxyBackend {
                 debug!("ICMP ping task: no reply received");
             }
             Err(_) => {
-                debug!(
-                    "ICMP ping task: timeout waiting for reply from {}",
-                    dest_ip
-                );
+                debug!("ICMP ping task: timeout waiting for reply from {}", dest_ip);
             }
         }
     }
@@ -1713,7 +2316,9 @@ impl SmoltcpProxyBackend {
                         dest_ip, source_ip, id, sequence
                     );
                     // Build and send ICMP echo reply to guest
-                    if let Some(packet) = self.build_icmp_reply(dest_ip, source_ip, id, sequence, &payload) {
+                    if let Some(packet) =
+                        self.build_icmp_reply(dest_ip, source_ip, id, sequence, &payload)
+                    {
                         if self.to_guest_tx.try_send(packet).is_err() {
                             warn!("ICMP reply: failed to send to guest (channel full)");
                         }
@@ -1788,11 +2393,7 @@ impl SmoltcpProxyBackend {
         let events_tx = self.host_events_tx.clone();
         let wake_tx = self.wake_tx.clone();
         tokio::task::spawn_local(Self::unix_socket_task(
-            conn_id,
-            stream,
-            events_tx,
-            wake_tx,
-            cmd_rx,
+            conn_id, stream, events_tx, wake_tx, cmd_rx,
         ));
 
         // Track the connection
@@ -2047,13 +2648,17 @@ impl SmoltcpProxyBackend {
                     Ok(n) if n > 0 => {
                         trace!(
                             "Unix {}: received {} bytes from VM, forwarding to unix socket",
-                            conn_id, n
+                            conn_id,
+                            n
                         );
                         let data = Bytes::copy_from_slice(&buf[..n]);
                         match conn.cmd_tx.try_send(HostCommand::Send(data)) {
                             Ok(_) => {}
                             Err(mpsc::error::TrySendError::Full(HostCommand::Send(data))) => {
-                                trace!("Unix {}: unix channel full, applying backpressure", conn_id);
+                                trace!(
+                                    "Unix {}: unix channel full, applying backpressure",
+                                    conn_id
+                                );
                                 conn.pending_to_unix = Some(data);
                             }
                             Err(_) => {}
@@ -2176,6 +2781,42 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
                             tcp.get_destination(),
                             tcp.get_flags()
                         );
+                    }
+                }
+            }
+        }
+
+        // Run packet through handler chain before NAT processing
+        if !self.handlers.is_empty() {
+            let vm_mac: [u8; 6] = self.config.vm_mac.0;
+            let gateway_mac: [u8; 6] = self.config.gateway_mac.0;
+
+            if let Some(ctx) = PacketContext::parse(packet, vm_mac, gateway_mac) {
+                for (i, handler) in self.handlers.iter().enumerate() {
+                    // Catch panics to prevent handler bugs from crashing the proxy
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handler.handle(&ctx)
+                    }));
+
+                    match result {
+                        Ok(Ok(PacketVerdict::Drop)) => {
+                            debug!("Handler dropped packet");
+                            return;
+                        }
+                        Ok(Ok(PacketVerdict::Respond(response))) => {
+                            debug!("Handler generated response, len={}", response.len());
+                            let _ = self.to_guest_tx.try_send(response);
+                            return;
+                        }
+                        Ok(Ok(PacketVerdict::Continue)) => continue,
+                        Ok(Err(e)) => {
+                            error!("Handler {} returned error: {}, dropping packet", i, e);
+                            return;
+                        }
+                        Err(_panic) => {
+                            error!("Handler {} panicked, dropping packet", i);
+                            return;
+                        }
                     }
                 }
             }
@@ -2444,7 +3085,10 @@ async fn main() {
                 }
             }
         } else {
-            eprintln!("Invalid listener format '{}', expected /path:port", listener_spec);
+            eprintln!(
+                "Invalid listener format '{}', expected /path:port",
+                listener_spec
+            );
         }
     }
 
@@ -2456,7 +3100,8 @@ async fn main() {
                 gateway_mac: EthernetAddress([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]),
                 gateway_ip: Ipv4Address::new(192, 168, 100, 1),
                 unix_listeners,
-                firewall: FirewallConfig::allow_all(),
+                // Use FirewallHandler with allow_all for default open policy
+                handlers: vec![Arc::new(FirewallHandler::new(FirewallConfig::allow_all()))],
             },
         ))),
         [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00],
