@@ -193,6 +193,318 @@ impl<'a> smoltcp::phy::TxToken for ProxyTxToken<'a> {
 }
 
 // ============================================================================
+// Firewall Configuration
+// ============================================================================
+
+/// A CIDR block for IP filtering.
+#[derive(Clone, Copy, Debug)]
+pub struct Cidr {
+    /// Network address
+    network: u32,
+    /// Precomputed mask (e.g., /24 = 0xFFFFFF00)
+    mask: u32,
+    /// Prefix length (for display)
+    prefix_len: u8,
+}
+
+impl Cidr {
+    /// Create a CIDR from an IP and prefix length.
+    /// Example: `Cidr::new([10, 0, 0, 0], 8)` for 10.0.0.0/8
+    pub fn new(ip: [u8; 4], prefix_len: u8) -> Self {
+        let prefix_len = prefix_len.min(32);
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix_len)
+        };
+        let network = u32::from_be_bytes(ip) & mask;
+        Self {
+            network,
+            mask,
+            prefix_len,
+        }
+    }
+
+    /// Create from Ipv4Addr and prefix length.
+    pub fn from_addr(ip: Ipv4Addr, prefix_len: u8) -> Self {
+        Self::new(ip.octets(), prefix_len)
+    }
+
+    /// Parse from string like "10.0.0.0/8" or "192.168.1.1" (single host).
+    pub fn parse(s: &str) -> Option<Self> {
+        let (ip_str, prefix_len) = if let Some((ip, prefix)) = s.split_once('/') {
+            (ip, prefix.parse().ok()?)
+        } else {
+            (s, 32) // Single host
+        };
+
+        let parts: Vec<u8> = ip_str
+            .split('.')
+            .filter_map(|p| p.parse().ok())
+            .collect();
+
+        if parts.len() != 4 {
+            return None;
+        }
+
+        Some(Self::new([parts[0], parts[1], parts[2], parts[3]], prefix_len))
+    }
+
+    /// Check if an IP address matches this CIDR.
+    #[inline(always)]
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        let ip_bits = u32::from_be_bytes(ip.octets());
+        (ip_bits & self.mask) == self.network
+    }
+
+    /// Check if an IP (as u32 in network byte order) matches this CIDR.
+    #[inline(always)]
+    pub fn contains_u32(&self, ip_bits: u32) -> bool {
+        (ip_bits & self.mask) == self.network
+    }
+}
+
+/// Bitmap for fast port lookup. 65536 ports = 1024 u64s = 8KB.
+/// Fits in L1 cache for extremely fast checks.
+#[derive(Clone)]
+pub struct PortBitmap {
+    bits: Box<[u64; 1024]>,
+}
+
+impl Default for PortBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortBitmap {
+    pub fn new() -> Self {
+        Self {
+            bits: Box::new([0u64; 1024]),
+        }
+    }
+
+    /// Create a bitmap with all ports set.
+    pub fn all() -> Self {
+        Self {
+            bits: Box::new([u64::MAX; 1024]),
+        }
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, port: u16) {
+        let idx = port as usize / 64;
+        let bit = port as usize % 64;
+        self.bits[idx] |= 1 << bit;
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self, port: u16) {
+        let idx = port as usize / 64;
+        let bit = port as usize % 64;
+        self.bits[idx] &= !(1 << bit);
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, port: u16) -> bool {
+        let idx = port as usize / 64;
+        let bit = port as usize % 64;
+        (self.bits[idx] >> bit) & 1 != 0
+    }
+
+    /// Set a range of ports (inclusive).
+    pub fn set_range(&mut self, start: u16, end: u16) {
+        for port in start..=end {
+            self.set(port);
+        }
+    }
+}
+
+/// Firewall configuration with O(1) port lookups and CIDR-based destination filtering.
+///
+/// Uses bitmaps for port matching - each check is a single array lookup + bit test.
+/// The entire bitmap (8KB per protocol) fits in L1 cache.
+///
+/// Destination filtering uses a deny list (blocked destinations) and an optional
+/// allow list (if set, only those destinations are permitted).
+///
+/// # Example
+/// ```
+/// let mut fw = FirewallConfig::deny_all();
+/// fw.allow_tcp(80).allow_tcp(443).allow_tcp_range(8080, 8090);
+/// fw.allow_udp(53);
+/// fw.allow_icmp();
+///
+/// // Block private networks
+/// fw.deny_destination_str("10.0.0.0/8");
+/// fw.deny_destination_str("172.16.0.0/12");
+/// fw.deny_destination_str("192.168.0.0/16");
+///
+/// assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
+/// assert!(!fw.check_tcp(80, [10, 0, 0, 1].into())); // Blocked by destination
+/// ```
+#[derive(Clone)]
+pub struct FirewallConfig {
+    tcp_allowed: PortBitmap,
+    udp_allowed: PortBitmap,
+    icmp_allowed: bool,
+    /// Destinations that are always blocked (deny list).
+    denied_destinations: Vec<Cidr>,
+    /// If Some, only these destinations are allowed (allowlist mode).
+    /// Takes precedence over denied_destinations.
+    allowed_destinations: Option<Vec<Cidr>>,
+}
+
+impl Default for FirewallConfig {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl FirewallConfig {
+    /// Allow all traffic (no filtering).
+    pub fn allow_all() -> Self {
+        Self {
+            tcp_allowed: PortBitmap::all(),
+            udp_allowed: PortBitmap::all(),
+            icmp_allowed: true,
+            denied_destinations: Vec::new(),
+            allowed_destinations: None,
+        }
+    }
+
+    /// Deny all traffic by default. Use allow_* methods to open ports.
+    pub fn deny_all() -> Self {
+        Self {
+            tcp_allowed: PortBitmap::new(),
+            udp_allowed: PortBitmap::new(),
+            icmp_allowed: false,
+            denied_destinations: Vec::new(),
+            allowed_destinations: None,
+        }
+    }
+
+    /// Allow a TCP port.
+    pub fn allow_tcp(&mut self, port: u16) -> &mut Self {
+        self.tcp_allowed.set(port);
+        self
+    }
+
+    /// Allow a range of TCP ports (inclusive).
+    pub fn allow_tcp_range(&mut self, start: u16, end: u16) -> &mut Self {
+        self.tcp_allowed.set_range(start, end);
+        self
+    }
+
+    /// Deny a TCP port.
+    pub fn deny_tcp(&mut self, port: u16) -> &mut Self {
+        self.tcp_allowed.clear(port);
+        self
+    }
+
+    /// Allow a UDP port.
+    pub fn allow_udp(&mut self, port: u16) -> &mut Self {
+        self.udp_allowed.set(port);
+        self
+    }
+
+    /// Allow a range of UDP ports (inclusive).
+    pub fn allow_udp_range(&mut self, start: u16, end: u16) -> &mut Self {
+        self.udp_allowed.set_range(start, end);
+        self
+    }
+
+    /// Deny a UDP port.
+    pub fn deny_udp(&mut self, port: u16) -> &mut Self {
+        self.udp_allowed.clear(port);
+        self
+    }
+
+    /// Allow ICMP (ping).
+    pub fn allow_icmp(&mut self) -> &mut Self {
+        self.icmp_allowed = true;
+        self
+    }
+
+    /// Deny ICMP (ping).
+    pub fn deny_icmp(&mut self) -> &mut Self {
+        self.icmp_allowed = false;
+        self
+    }
+
+    /// Add a destination to the deny list.
+    pub fn deny_destination(&mut self, cidr: Cidr) -> &mut Self {
+        self.denied_destinations.push(cidr);
+        self
+    }
+
+    /// Add a destination to the deny list (from string like "10.0.0.0/8").
+    pub fn deny_destination_str(&mut self, cidr: &str) -> &mut Self {
+        if let Some(c) = Cidr::parse(cidr) {
+            self.denied_destinations.push(c);
+        }
+        self
+    }
+
+    /// Enable allowlist mode - only specified destinations are permitted.
+    /// Call this, then use `allow_destination` to add permitted destinations.
+    pub fn destination_allowlist_mode(&mut self) -> &mut Self {
+        if self.allowed_destinations.is_none() {
+            self.allowed_destinations = Some(Vec::new());
+        }
+        self
+    }
+
+    /// Add a destination to the allow list (only used in allowlist mode).
+    pub fn allow_destination(&mut self, cidr: Cidr) -> &mut Self {
+        if let Some(ref mut allowed) = self.allowed_destinations {
+            allowed.push(cidr);
+        }
+        self
+    }
+
+    /// Add a destination to the allow list (from string like "8.8.8.0/24").
+    pub fn allow_destination_str(&mut self, cidr: &str) -> &mut Self {
+        if let Some(c) = Cidr::parse(cidr) {
+            if let Some(ref mut allowed) = self.allowed_destinations {
+                allowed.push(c);
+            }
+        }
+        self
+    }
+
+    /// Check if destination IP is allowed.
+    #[inline]
+    fn check_destination(&self, dst_ip: Ipv4Addr) -> bool {
+        // Allowlist mode: must match at least one allowed destination
+        if let Some(ref allowed) = self.allowed_destinations {
+            return allowed.iter().any(|cidr| cidr.contains(dst_ip));
+        }
+
+        // Denylist mode: must not match any denied destination
+        !self.denied_destinations.iter().any(|cidr| cidr.contains(dst_ip))
+    }
+
+    /// Check if a TCP connection to the given destination is allowed.
+    #[inline(always)]
+    pub fn check_tcp(&self, dst_port: u16, dst_ip: Ipv4Addr) -> bool {
+        self.tcp_allowed.contains(dst_port) && self.check_destination(dst_ip)
+    }
+
+    /// Check if a UDP packet to the given destination is allowed.
+    #[inline(always)]
+    pub fn check_udp(&self, dst_port: u16, dst_ip: Ipv4Addr) -> bool {
+        self.udp_allowed.contains(dst_port) && self.check_destination(dst_ip)
+    }
+
+    /// Check if ICMP to the given destination is allowed.
+    #[inline(always)]
+    pub fn check_icmp(&self, dst_ip: Ipv4Addr) -> bool {
+        self.icmp_allowed && self.check_destination(dst_ip)
+    }
+}
+
+// ============================================================================
 // Backend Configuration and Factory
 // ============================================================================
 
@@ -205,6 +517,8 @@ pub struct SmoltcpProxyConfig {
     /// Unix socket listeners: maps VM port to Unix socket path on host
     /// When a connection arrives on the Unix socket, it's forwarded to the VM port
     pub unix_listeners: HashMap<u16, PathBuf>,
+    /// Firewall rules for outbound traffic from the VM.
+    pub firewall: FirewallConfig,
 }
 
 impl Default for SmoltcpProxyConfig {
@@ -215,6 +529,7 @@ impl Default for SmoltcpProxyConfig {
             gateway_mac: PROXY_MAC,
             gateway_ip: PROXY_IP,
             unix_listeners: HashMap::new(),
+            firewall: FirewallConfig::default(),
         }
     }
 }
@@ -533,8 +848,18 @@ impl SmoltcpProxyBackend {
 
         let src_ip = IpAddress::from(ipv4.get_source());
         let dst_ip = IpAddress::from(ipv4.get_destination());
+        let dst_ip_v4 = ipv4.get_destination(); // std::net::Ipv4Addr for firewall
         let src_port = tcp.get_source();
         let dst_port = tcp.get_destination();
+
+        // Firewall check
+        if !self.config.firewall.check_tcp(dst_port, dst_ip_v4) {
+            debug!(
+                "Firewall: denied TCP connection to {}:{}",
+                dst_ip_v4, dst_port
+            );
+            return true; // Intercepted (blocked)
+        }
 
         let guest_endpoint = IpEndpoint::new(src_ip, src_port);
         let host_addr: SocketAddr = match dst_ip {
@@ -639,8 +964,15 @@ impl SmoltcpProxyBackend {
 
         let src_ip = IpAddress::from(ipv4.get_source());
         let dst_ip = IpAddress::from(ipv4.get_destination());
+        let dst_ip_v4 = ipv4.get_destination(); // std::net::Ipv4Addr for firewall
         let src_port = udp.get_source();
         let dst_port = udp.get_destination();
+
+        // Firewall check
+        if !self.config.firewall.check_udp(dst_port, dst_ip_v4) {
+            debug!("Firewall: denied UDP packet to {}:{}", dst_ip_v4, dst_port);
+            return true; // Intercepted (blocked)
+        }
 
         let guest_endpoint = IpEndpoint::new(src_ip, src_port);
         let host_addr: SocketAddr = match dst_ip {
@@ -784,6 +1116,14 @@ impl SmoltcpProxyBackend {
             return false;
         }
 
+        let dest_ip = ipv4.get_destination();
+
+        // Firewall check
+        if !self.config.firewall.check_icmp(dest_ip) {
+            debug!("Firewall: denied ICMP echo request to {}", dest_ip);
+            return true; // Intercepted (blocked)
+        }
+
         // Parse echo request fields
         let payload = icmp.payload();
         if payload.len() < 4 {
@@ -795,7 +1135,6 @@ impl SmoltcpProxyBackend {
         let echo_data = Bytes::copy_from_slice(&payload[4..]);
 
         let source_ip = ipv4.get_source();
-        let dest_ip = ipv4.get_destination();
 
         debug!(
             "ICMP: intercepted echo request from {} to {}, id={}, seq={}",
@@ -2117,6 +2456,7 @@ async fn main() {
                 gateway_mac: EthernetAddress([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]),
                 gateway_ip: Ipv4Address::new(192, 168, 100, 1),
                 unix_listeners,
+                firewall: FirewallConfig::allow_all(),
             },
         ))),
         [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00],
