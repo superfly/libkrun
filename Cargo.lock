@@ -4450,6 +4450,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "futures",
  "libc",
  "libkrun",
  "libmimalloc-sys",
@@ -4458,6 +4459,7 @@ dependencies = [
  "pnet",
  "smoltcp",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
