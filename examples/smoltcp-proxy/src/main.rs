@@ -298,6 +298,9 @@ impl AsyncNetBackendFactory for SmoltcpProxyFactory {
                 });
             }
 
+            // Check if ICMP ping forwarding is available
+            check_icmp_available();
+
             let backend = SmoltcpProxyBackend::new_with_channels(
                 self.config,
                 to_guest_tx,
@@ -840,10 +843,19 @@ impl SmoltcpProxyBackend {
         };
 
         if socket_fd < 0 {
-            error!(
-                "ICMP ping task: failed to create socket: {}",
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EACCES) || err.raw_os_error() == Some(libc::EPERM) {
+                // Only log once per session to avoid spam
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "ICMP ping forwarding unavailable: permission denied. \
+                        On Linux, run: sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\""
+                    );
+                }
+            } else {
+                error!("ICMP ping task: failed to create socket: {}", err);
+            }
             return;
         }
 
@@ -1937,6 +1949,50 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
         for flow_id in flow_ids {
             self.close_udp_flow(flow_id);
         }
+    }
+}
+
+/// Check if unprivileged ICMP sockets are available.
+/// Logs a warning with instructions if not configured.
+fn check_icmp_available() {
+    let socket_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+
+    if socket_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EACCES) || err.raw_os_error() == Some(libc::EPERM) {
+            warn!(
+                "ICMP ping forwarding unavailable: permission denied. \
+                Pings from VM will show local latency instead of real network latency."
+            );
+
+            // On Linux, check the current sysctl setting
+            #[cfg(target_os = "linux")]
+            if let Ok(contents) = std::fs::read_to_string("/proc/sys/net/ipv4/ping_group_range") {
+                let parts: Vec<&str> = contents.trim().split_whitespace().collect();
+                if parts.len() == 2 {
+                    if let (Ok(min), Ok(max)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                        if min > max {
+                            info!(
+                                "To enable ICMP forwarding, run: \
+                                sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\""
+                            );
+                        } else {
+                            let gid = unsafe { libc::getegid() };
+                            info!(
+                                "Current ping_group_range is {}-{}, your GID is {}. \
+                                To fix, run: sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"",
+                                min, max, gid
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            warn!("ICMP socket check failed: {}", err);
+        }
+    } else {
+        unsafe { libc::close(socket_fd) };
+        info!("ICMP ping forwarding available");
     }
 }
 
