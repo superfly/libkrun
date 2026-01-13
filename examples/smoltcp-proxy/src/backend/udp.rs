@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use super::tcp::SocketBuffers;
+
 /// Commands sent to host UDP socket tasks.
 pub enum UdpHostCommand {
     Send { data: Bytes, dest: SocketAddr },
@@ -20,4 +22,6 @@ pub struct UdpFlow {
     pub cmd_tx: mpsc::Sender<UdpHostCommand>,
     pub guest_endpoint: IpEndpoint,
     pub last_activity: Instant,
+    /// Lazily-allocated socket buffers (cleaned up on drop)
+    pub buffers: SocketBuffers,
 }

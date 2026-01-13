@@ -5,6 +5,7 @@ use smoltcp::iface::SocketHandle;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
+use super::tcp::SocketBuffers;
 use super::HostCommand;
 
 /// State for a Unix socket inbound connection (host Unix socket -> VM TCP).
@@ -19,6 +20,8 @@ pub struct UnixInboundConnection {
     pub pending_to_vm: VecDeque<Bytes>,
     /// Pending data to send to Unix socket (backpressure when channel is full)
     pub pending_to_unix: Option<Bytes>,
+    /// Lazily-allocated socket buffers (cleaned up on drop)
+    pub buffers: SocketBuffers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

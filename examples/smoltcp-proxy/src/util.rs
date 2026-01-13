@@ -1,6 +1,74 @@
 //! Utility functions for the smoltcp proxy.
 
 use log::{info, warn};
+use std::ptr;
+
+/// A lazily-allocated buffer using mmap.
+///
+/// Physical memory is only consumed when pages are actually touched.
+/// This is useful for smoltcp socket buffers where we want to reserve
+/// large buffer sizes but only pay for memory actually used.
+pub struct LazyBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: The mmap'd memory is owned exclusively by this struct
+unsafe impl Send for LazyBuffer {}
+unsafe impl Sync for LazyBuffer {}
+
+impl LazyBuffer {
+    /// Create a new lazily-allocated buffer of the given size.
+    ///
+    /// The memory is allocated via mmap with MAP_ANON, which means
+    /// physical pages are only allocated when first written to.
+    pub fn new(size: usize) -> Self {
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            ) as *mut u8
+        };
+        assert!(!ptr.is_null() && ptr != libc::MAP_FAILED as *mut u8);
+        Self { ptr, len: size }
+    }
+
+    /// Convert to a 'static mutable slice for use with smoltcp.
+    ///
+    /// # Safety
+    /// The caller must ensure the returned slice is not used after
+    /// `reclaim()` is called with the same pointer.
+    pub fn into_static_slice(self) -> &'static mut [u8] {
+        let ptr = self.ptr;
+        let len = self.len;
+        std::mem::forget(self); // Don't run Drop, we're transferring ownership
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    /// Reclaim memory from a buffer that was converted to a static slice.
+    ///
+    /// # Safety
+    /// - The slice must have been created by `into_static_slice()`
+    /// - The slice must not be used after this call
+    /// - This must only be called once per slice
+    pub unsafe fn reclaim(ptr: *mut u8, len: usize) {
+        if !ptr.is_null() {
+            libc::munmap(ptr as *mut libc::c_void, len);
+        }
+    }
+}
+
+impl Drop for LazyBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
 
 /// Check if unprivileged ICMP sockets are available.
 /// Logs a warning with instructions if not configured.

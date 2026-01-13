@@ -6,7 +6,7 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
-pub use tcp::{DeferredConnection, ProxiedTcpFlow, TcpConnection, TcpConnectionState};
+pub use tcp::{DeferredConnection, ProxiedTcpFlow, SocketBuffers, TcpConnection, TcpConnectionState};
 pub use udp::{UdpFlow, UdpHostCommand};
 pub use unix::{UnixInboundConnection, UnixInboundState};
 
@@ -366,8 +366,9 @@ impl SmoltcpProxyBackend {
         dst_port: u16,
         channels: FlowChannels,
     ) {
-        let tcp_rx_buf = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
-        let tcp_tx_buf = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let (buffers, rx_slice, tx_slice) = SocketBuffers::new(65535);
+        let tcp_rx_buf = smoltcp_tcp::SocketBuffer::new(rx_slice);
+        let tcp_tx_buf = smoltcp_tcp::SocketBuffer::new(tx_slice);
         let mut socket = smoltcp_tcp::Socket::new(tcp_rx_buf, tcp_tx_buf);
 
         socket
@@ -390,6 +391,7 @@ impl SmoltcpProxyBackend {
                 to_handler: channels.to_handler,
                 pending_to_guest: VecDeque::new(),
                 pending_to_handler: None,
+                buffers,
             },
         );
         self.proxied_nat.insert(guest_endpoint, flow_id);
@@ -586,8 +588,9 @@ impl SmoltcpProxyBackend {
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
 
-        let rx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
-        let tx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let (buffers, rx_slice, tx_slice) = SocketBuffers::new(65535);
+        let rx_buffer = smoltcp_tcp::SocketBuffer::new(rx_slice);
+        let tx_buffer = smoltcp_tcp::SocketBuffer::new(tx_slice);
         let mut socket = smoltcp_tcp::Socket::new(rx_buffer, tx_buffer);
 
         socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
@@ -631,6 +634,7 @@ impl SmoltcpProxyBackend {
                 state: TcpConnectionState::Connecting,
                 pending_data: VecDeque::new(),
                 pending_host_send: None,
+                buffers,
             },
         );
         self.tcp_nat.insert(guest_endpoint, conn_id);
@@ -706,13 +710,15 @@ impl SmoltcpProxyBackend {
         let flow_id = self.next_flow_id;
         self.next_flow_id += 1;
 
+        // Use lazy mmap buffers for the payload storage (main memory consumer)
+        let (buffers, rx_payload_slice, tx_payload_slice) = SocketBuffers::new(65535);
         let rx_buffer = smoltcp_udp::PacketBuffer::new(
             vec![smoltcp_udp::PacketMetadata::EMPTY; 64],
-            vec![0; 65535],
+            rx_payload_slice,
         );
         let tx_buffer = smoltcp_udp::PacketBuffer::new(
             vec![smoltcp_udp::PacketMetadata::EMPTY; 64],
-            vec![0; 65535],
+            tx_payload_slice,
         );
         let mut socket = smoltcp_udp::Socket::new(rx_buffer, tx_buffer);
 
@@ -756,6 +762,7 @@ impl SmoltcpProxyBackend {
                 cmd_tx,
                 guest_endpoint,
                 last_activity: Instant::now(),
+                buffers,
             },
         );
         self.udp_nat.insert(guest_endpoint, flow_id);
@@ -1397,8 +1404,9 @@ impl SmoltcpProxyBackend {
     }
 
     fn handle_unix_accept(&mut self, conn_id: u64, vm_port: u16, stream: UnixStream) {
-        let rx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
-        let tx_buffer = smoltcp_tcp::SocketBuffer::new(vec![0; 65535]);
+        let (buffers, rx_slice, tx_slice) = SocketBuffers::new(65535);
+        let rx_buffer = smoltcp_tcp::SocketBuffer::new(rx_slice);
+        let tx_buffer = smoltcp_tcp::SocketBuffer::new(tx_slice);
         let mut socket = smoltcp_tcp::Socket::new(rx_buffer, tx_buffer);
 
         let remote_endpoint = IpEndpoint::new(IpAddress::from(self.config.vm_ip), vm_port);
@@ -1438,6 +1446,7 @@ impl SmoltcpProxyBackend {
                 state: UnixInboundState::Connecting,
                 pending_to_vm: VecDeque::new(),
                 pending_to_unix: None,
+                buffers,
             },
         );
 
