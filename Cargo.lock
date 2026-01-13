@@ -4450,6 +4450,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "libc",
  "libkrun",
  "libmimalloc-sys",
  "log",

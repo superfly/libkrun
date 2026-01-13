@@ -10,6 +10,7 @@ tokio = { version = "1", features = ["rt", "sync", "macros", "time", "net"] }
 bytes = "1"
 smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 pnet = "0.35"
+libc = "0.2"
 log = "0.4"
 tracing-appender = "0.2"
 tracing = "0.1.43"

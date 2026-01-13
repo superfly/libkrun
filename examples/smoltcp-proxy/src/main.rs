@@ -32,6 +32,7 @@ use krun::{
 };
 use log::{debug, error, trace, warn};
 use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::icmp::{IcmpPacket, IcmpTypes};
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::tcp::{TcpFlags, TcpPacket};
@@ -44,7 +45,7 @@ use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
@@ -332,6 +333,14 @@ enum HostEvent {
     UnixData { conn_id: u64, data: Bytes },
     /// Unix socket closed
     UnixClosed { conn_id: u64 },
+    /// ICMP echo reply received from host
+    IcmpReply {
+        dest_ip: Ipv4Addr,   // Original destination (becomes source in reply)
+        source_ip: Ipv4Addr, // Original source (becomes dest in reply)
+        id: u16,
+        sequence: u16,
+        payload: Bytes,
+    },
 }
 
 /// Commands sent to host TCP connection tasks.
@@ -745,6 +754,276 @@ impl SmoltcpProxyBackend {
         true
     }
 
+    /// Try to intercept ICMP echo requests and forward them to the real network.
+    /// Returns true if the packet was an ICMP echo request that was handled.
+    fn try_intercept_icmp(&self, packet: &[u8]) -> bool {
+        let eth = match EthernetPacket::new(packet) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let ipv4 = match Ipv4Packet::new(eth.payload()) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        if ipv4.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
+            return false;
+        }
+
+        let icmp = match IcmpPacket::new(ipv4.payload()) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Only handle echo requests
+        if icmp.get_icmp_type() != IcmpTypes::EchoRequest {
+            return false;
+        }
+
+        // Parse echo request fields
+        let payload = icmp.payload();
+        if payload.len() < 4 {
+            return false;
+        }
+
+        let id = u16::from_be_bytes([payload[0], payload[1]]);
+        let sequence = u16::from_be_bytes([payload[2], payload[3]]);
+        let echo_data = Bytes::copy_from_slice(&payload[4..]);
+
+        let source_ip = ipv4.get_source();
+        let dest_ip = ipv4.get_destination();
+
+        debug!(
+            "ICMP: intercepted echo request from {} to {}, id={}, seq={}",
+            source_ip, dest_ip, id, sequence
+        );
+
+        // Spawn a task to send the ping and wait for reply
+        let events_tx = self.host_events_tx.clone();
+        let wake_tx = self.wake_tx.clone();
+        tokio::task::spawn_local(Self::icmp_ping_task(
+            source_ip,
+            dest_ip,
+            id,
+            sequence,
+            echo_data,
+            events_tx,
+            wake_tx,
+        ));
+
+        true
+    }
+
+    /// Task to send an ICMP echo request via the host and wait for reply.
+    async fn icmp_ping_task(
+        source_ip: Ipv4Addr,
+        dest_ip: Ipv4Addr,
+        id: u16,
+        sequence: u16,
+        data: Bytes,
+        events_tx: mpsc::Sender<HostEvent>,
+        wake_tx: mpsc::Sender<()>,
+    ) {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        use tokio::io::unix::AsyncFd;
+
+        debug!(
+            "ICMP ping task: sending to {}, id={}, seq={}",
+            dest_ip, id, sequence
+        );
+
+        // Create unprivileged ICMP socket (SOCK_DGRAM with IPPROTO_ICMP)
+        // This works on macOS and Linux with proper sysctl settings
+        let socket_fd = unsafe {
+            libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP)
+        };
+
+        if socket_fd < 0 {
+            error!(
+                "ICMP ping task: failed to create socket: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Set non-blocking
+        unsafe {
+            let flags = libc::fcntl(socket_fd, libc::F_GETFL);
+            libc::fcntl(socket_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Build ICMP echo request packet
+        // For unprivileged ICMP sockets, the kernel handles the IP header
+        // We just send: type(1) + code(1) + checksum(2) + id(2) + seq(2) + data
+        let mut icmp_packet = Vec::with_capacity(8 + data.len());
+        icmp_packet.push(8); // Echo request type
+        icmp_packet.push(0); // Code
+        icmp_packet.extend_from_slice(&[0, 0]); // Checksum placeholder
+        icmp_packet.extend_from_slice(&id.to_be_bytes());
+        icmp_packet.extend_from_slice(&sequence.to_be_bytes());
+        icmp_packet.extend_from_slice(&data);
+
+        // Calculate and set checksum
+        let checksum = icmp_checksum(&icmp_packet);
+        icmp_packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        // Destination address
+        let dest_addr = libc::sockaddr_in {
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as u8,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(dest_ip.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+
+        // Send the packet
+        let sent = unsafe {
+            libc::sendto(
+                socket_fd,
+                icmp_packet.as_ptr() as *const libc::c_void,
+                icmp_packet.len(),
+                0,
+                &dest_addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as u32,
+            )
+        };
+
+        if sent < 0 {
+            error!(
+                "ICMP ping task: sendto failed: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::close(socket_fd) };
+            return;
+        }
+
+        debug!("ICMP ping task: sent {} bytes to {}", sent, dest_ip);
+
+        // Wrap socket for async I/O
+        let owned_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(socket_fd) };
+        let async_fd = match AsyncFd::new(owned_fd) {
+            Ok(fd) => fd,
+            Err(e) => {
+                error!("ICMP ping task: failed to create AsyncFd: {}", e);
+                return;
+            }
+        };
+
+        // Wait for reply with timeout
+        let mut recv_buf = vec![0u8; 1500];
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ready = async_fd.readable().await;
+                match ready {
+                    Ok(mut guard) => {
+                        let n = unsafe {
+                            libc::recv(
+                                async_fd.as_raw_fd(),
+                                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                                recv_buf.len(),
+                                0,
+                            )
+                        };
+                        if n > 0 {
+                            return Some(n as usize);
+                        } else if n < 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::WouldBlock {
+                                guard.clear_ready();
+                                continue;
+                            }
+                            error!("ICMP ping task: recv error: {}", err);
+                            return None;
+                        }
+                        guard.clear_ready();
+                    }
+                    Err(e) => {
+                        error!("ICMP ping task: readable error: {}", e);
+                        return None;
+                    }
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Some(n)) => {
+                debug!(
+                    "ICMP ping task: received {} bytes reply from {}",
+                    n, dest_ip
+                );
+
+                // On macOS, unprivileged ICMP sockets return the IP header too.
+                // Check if we got an IPv4 header (version 4) at the start.
+                // The IHL field (lower 4 bits) tells us the header length in 32-bit words.
+                let icmp_offset = if n >= 20 && (recv_buf[0] >> 4) == 4 {
+                    let ihl = (recv_buf[0] & 0x0F) as usize;
+                    let ip_header_len = ihl * 4;
+                    debug!(
+                        "ICMP ping task: detected IPv4 header, IHL={}, header_len={}",
+                        ihl, ip_header_len
+                    );
+                    ip_header_len
+                } else {
+                    0 // No IP header (Linux behavior)
+                };
+
+                // Parse ICMP: type(1) + code(1) + checksum(2) + id(2) + seq(2) + data
+                if n >= icmp_offset + 8 {
+                    let reply_type = recv_buf[icmp_offset];
+                    let reply_id = u16::from_be_bytes([
+                        recv_buf[icmp_offset + 4],
+                        recv_buf[icmp_offset + 5],
+                    ]);
+                    let reply_seq = u16::from_be_bytes([
+                        recv_buf[icmp_offset + 6],
+                        recv_buf[icmp_offset + 7],
+                    ]);
+                    let reply_data = Bytes::copy_from_slice(&recv_buf[icmp_offset + 8..n]);
+
+                    debug!(
+                        "ICMP reply: type={}, id={}, seq={}, data_len={} (expected id={}, seq={})",
+                        reply_type,
+                        reply_id,
+                        reply_seq,
+                        reply_data.len(),
+                        id,
+                        sequence
+                    );
+
+                    // Only forward echo replies (type 0)
+                    // Note: macOS may rewrite id/seq for unprivileged ICMP, so we use
+                    // the original id/seq from the request instead of the reply values
+                    if reply_type == 0 {
+                        let _ = events_tx
+                            .send(HostEvent::IcmpReply {
+                                dest_ip,
+                                source_ip,
+                                id,       // Use original request id
+                                sequence, // Use original request sequence
+                                payload: reply_data,
+                            })
+                            .await;
+                        let _ = wake_tx.try_send(());
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!("ICMP ping task: no reply received");
+            }
+            Err(_) => {
+                debug!(
+                    "ICMP ping task: timeout waiting for reply from {}",
+                    dest_ip
+                );
+            }
+        }
+    }
+
     async fn host_udp_task(
         flow_id: u64,
         events_tx: mpsc::Sender<HostEvent>,
@@ -1070,6 +1349,24 @@ impl SmoltcpProxyBackend {
                 HostEvent::UnixClosed { conn_id } => {
                     debug!("Unix connection {} closed by host", conn_id);
                     self.close_unix_connection(conn_id);
+                }
+                HostEvent::IcmpReply {
+                    dest_ip,
+                    source_ip,
+                    id,
+                    sequence,
+                    payload,
+                } => {
+                    debug!(
+                        "ICMP reply: {} -> {}, id={}, seq={}",
+                        dest_ip, source_ip, id, sequence
+                    );
+                    // Build and send ICMP echo reply to guest
+                    if let Some(packet) = self.build_icmp_reply(dest_ip, source_ip, id, sequence, &payload) {
+                        if self.to_guest_tx.try_send(packet).is_err() {
+                            warn!("ICMP reply: failed to send to guest (channel full)");
+                        }
+                    }
                 }
             }
         }
@@ -1437,6 +1734,74 @@ impl SmoltcpProxyBackend {
             }
         }
     }
+
+    /// Build an ICMP echo reply packet wrapped in Ethernet and IPv4 headers.
+    fn build_icmp_reply(
+        &self,
+        source_ip: Ipv4Addr,
+        dest_ip: Ipv4Addr,
+        id: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<Bytes> {
+        // Build ICMP echo reply (type=0, code=0)
+        let icmp_len = 8 + payload.len();
+        let mut icmp_data = Vec::with_capacity(icmp_len);
+        icmp_data.push(0); // Type: Echo Reply
+        icmp_data.push(0); // Code
+        icmp_data.extend_from_slice(&[0, 0]); // Checksum placeholder
+        icmp_data.extend_from_slice(&id.to_be_bytes());
+        icmp_data.extend_from_slice(&sequence.to_be_bytes());
+        icmp_data.extend_from_slice(payload);
+
+        // Calculate ICMP checksum
+        let checksum = icmp_checksum(&icmp_data);
+        icmp_data[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        // Build IPv4 header
+        let ip_total_len = 20 + icmp_len;
+        let mut ipv4_data = Vec::with_capacity(ip_total_len);
+
+        // IPv4 header (20 bytes, no options)
+        ipv4_data.push(0x45); // Version (4) + IHL (5)
+        ipv4_data.push(0x00); // DSCP + ECN
+        ipv4_data.extend_from_slice(&(ip_total_len as u16).to_be_bytes()); // Total length
+        ipv4_data.extend_from_slice(&[0x00, 0x00]); // Identification
+        ipv4_data.extend_from_slice(&[0x40, 0x00]); // Flags (Don't Fragment) + Fragment Offset
+        ipv4_data.push(64); // TTL
+        ipv4_data.push(1); // Protocol: ICMP
+        ipv4_data.extend_from_slice(&[0x00, 0x00]); // Header checksum placeholder
+        ipv4_data.extend_from_slice(&source_ip.octets()); // Source IP
+        ipv4_data.extend_from_slice(&dest_ip.octets()); // Dest IP
+
+        // Calculate IPv4 header checksum
+        let ipv4_checksum = ipv4_header_checksum(&ipv4_data[..20]);
+        ipv4_data[10..12].copy_from_slice(&ipv4_checksum.to_be_bytes());
+
+        // Append ICMP data
+        ipv4_data.extend_from_slice(&icmp_data);
+
+        // Build Ethernet frame
+        let eth_len = 14 + ipv4_data.len();
+        let mut eth_data = Vec::with_capacity(eth_len);
+
+        // Ethernet header
+        eth_data.extend_from_slice(&self.config.vm_mac.0); // Dest MAC (VM)
+        eth_data.extend_from_slice(&self.config.gateway_mac.0); // Src MAC (Gateway)
+        eth_data.extend_from_slice(&[0x08, 0x00]); // EtherType: IPv4
+
+        // Append IPv4 packet
+        eth_data.extend_from_slice(&ipv4_data);
+
+        debug!(
+            "Built ICMP reply: {} bytes, {} -> {}",
+            eth_data.len(),
+            source_ip,
+            dest_ip
+        );
+
+        Some(Bytes::from(eth_data))
+    }
 }
 
 impl AsyncNetBackend for SmoltcpProxyBackend {
@@ -1465,14 +1830,16 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
             }
         }
 
-        // Try to intercept new TCP connections or UDP packets
+        // Try to intercept new TCP connections, UDP packets, or ICMP
         // TCP returns false even for new SYN (like old proxy) - packet goes to smoltcp
         // UDP returns true - packet is fully handled, not queued to smoltcp
+        // ICMP returns true - we forward ping requests to the real network
         let tcp_intercepted = self.try_intercept_tcp(packet);
         let udp_intercepted = self.try_intercept_udp(packet);
+        let icmp_intercepted = self.try_intercept_icmp(packet);
 
         // Only queue non-intercepted packets to smoltcp (matching old proxy behavior)
-        let packet_was_intercepted = tcp_intercepted || udp_intercepted;
+        let packet_was_intercepted = tcp_intercepted || udp_intercepted || icmp_intercepted;
         if !packet_was_intercepted {
             debug!("Packet not intercepted, queueing to smoltcp");
             self.device.queue_rx(Bytes::copy_from_slice(packet));
@@ -1571,6 +1938,44 @@ impl AsyncNetBackend for SmoltcpProxyBackend {
             self.close_udp_flow(flow_id);
         }
     }
+}
+
+/// Calculate ICMP checksum (RFC 792).
+/// The checksum is the 16-bit one's complement of the one's complement sum
+/// of all 16-bit words in the ICMP header and data.
+fn icmp_checksum(data: &[u8]) -> u16 {
+    internet_checksum(data)
+}
+
+/// Calculate IPv4 header checksum (RFC 791).
+fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    internet_checksum(header)
+}
+
+/// Calculate Internet checksum (RFC 1071).
+/// Used for both ICMP and IPv4 header checksums.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Sum all 16-bit words
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+
+    // Add odd byte if present
+    if i < data.len() {
+        sum += u32::from(data[i]) << 8;
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    // Return one's complement
+    !(sum as u16)
 }
 
 #[derive(Parser, Debug)]
