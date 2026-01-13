@@ -32,7 +32,7 @@ mod util;
 
 use clap::Parser;
 use krun::{VirtioNetBackend, NET_ALL_FEATURES};
-use smoltcp::wire::{EthernetAddress, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv6Address};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,8 +139,10 @@ async fn main() {
             SmoltcpProxyConfig {
                 vm_mac: EthernetAddress([0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]),
                 vm_ip: Ipv4Address::new(192, 168, 100, 2),
+                vm_ip6: Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2),
                 gateway_mac: EthernetAddress([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]),
                 gateway_ip: Ipv4Address::new(192, 168, 100, 1),
+                gateway_ip6: Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
                 unix_listeners,
                 handlers: vec![
                     Arc::new(EchoHandler::new(12345)),

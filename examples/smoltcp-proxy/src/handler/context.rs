@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use pnet::packet::tcp::TcpFlags;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::sync::mpsc;
 
 use crate::util::internet_checksum;
@@ -42,10 +42,10 @@ pub struct PacketContext<'a> {
     pub src_mac: [u8; 6],
     /// Destination MAC address
     pub dst_mac: [u8; 6],
-    /// Source IP address
-    pub src_ip: Ipv4Addr,
-    /// Destination IP address
-    pub dst_ip: Ipv4Addr,
+    /// Source IP address (IPv4 or IPv6)
+    pub src_ip: IpAddr,
+    /// Destination IP address (IPv4 or IPv6)
+    pub dst_ip: IpAddr,
     /// Transport layer protocol and data
     pub transport: TransportProtocol<'a>,
 
@@ -60,6 +60,7 @@ pub struct PacketContext<'a> {
 impl<'a> PacketContext<'a> {
     /// Parse a raw Ethernet frame into a PacketContext.
     ///
+    /// Supports both IPv4 (EtherType 0x0800) and IPv6 (EtherType 0x86DD).
     /// All payload slices are derived from `raw` to ensure proper lifetimes.
     pub fn parse(
         raw: &'a [u8],
@@ -77,12 +78,28 @@ impl<'a> PacketContext<'a> {
         let src_mac = [raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]];
         let dst_mac = [raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]];
 
-        // Check EtherType for IPv4 (0x0800)
-        if raw[12] != 0x08 || raw[13] != 0x00 {
-            return None;
-        }
+        // Check EtherType
+        let ethertype = u16::from_be_bytes([raw[12], raw[13]]);
 
+        match ethertype {
+            0x0800 => Self::parse_ipv4(raw, src_mac, dst_mac, vm_mac, gateway_mac, to_guest),
+            0x86DD => Self::parse_ipv6(raw, src_mac, dst_mac, vm_mac, gateway_mac, to_guest),
+            _ => None,
+        }
+    }
+
+    /// Parse an IPv4 packet.
+    fn parse_ipv4(
+        raw: &'a [u8],
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        vm_mac: [u8; 6],
+        gateway_mac: [u8; 6],
+        to_guest: &'a mpsc::Sender<Bytes>,
+    ) -> Option<Self> {
+        const ETH_HEADER_LEN: usize = 14;
         let ip_start = ETH_HEADER_LEN;
+
         if raw.len() < ip_start + 20 {
             return None;
         }
@@ -94,22 +111,82 @@ impl<'a> PacketContext<'a> {
             return None;
         }
 
-        let src_ip = Ipv4Addr::new(
+        let src_ip = IpAddr::V4(Ipv4Addr::new(
             raw[ip_start + 12],
             raw[ip_start + 13],
             raw[ip_start + 14],
             raw[ip_start + 15],
-        );
-        let dst_ip = Ipv4Addr::new(
+        ));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(
             raw[ip_start + 16],
             raw[ip_start + 17],
             raw[ip_start + 18],
             raw[ip_start + 19],
-        );
+        ));
         let protocol = raw[ip_start + 9];
 
         let transport_start = ip_start + ip_header_len;
+        let transport = Self::parse_transport(raw, transport_start, protocol)?;
 
+        Some(Self {
+            raw,
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            transport,
+            vm_mac,
+            gateway_mac,
+            to_guest,
+        })
+    }
+
+    /// Parse an IPv6 packet.
+    fn parse_ipv6(
+        raw: &'a [u8],
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        vm_mac: [u8; 6],
+        gateway_mac: [u8; 6],
+        to_guest: &'a mpsc::Sender<Bytes>,
+    ) -> Option<Self> {
+        const ETH_HEADER_LEN: usize = 14;
+        const IPV6_HEADER_LEN: usize = 40;
+        let ip_start = ETH_HEADER_LEN;
+
+        if raw.len() < ip_start + IPV6_HEADER_LEN {
+            return None;
+        }
+
+        // Parse IPv6 addresses (16 bytes each)
+        let src_bytes: [u8; 16] = raw[ip_start + 8..ip_start + 24].try_into().ok()?;
+        let dst_bytes: [u8; 16] = raw[ip_start + 24..ip_start + 40].try_into().ok()?;
+
+        let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
+        let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
+
+        // Next Header field (like IPv4 protocol field)
+        // Note: This doesn't handle extension headers - assumes next header is transport
+        let next_header = raw[ip_start + 6];
+
+        let transport_start = ip_start + IPV6_HEADER_LEN;
+        let transport = Self::parse_transport(raw, transport_start, next_header)?;
+
+        Some(Self {
+            raw,
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            transport,
+            vm_mac,
+            gateway_mac,
+            to_guest,
+        })
+    }
+
+    /// Parse transport layer protocol (shared between IPv4 and IPv6).
+    fn parse_transport(raw: &'a [u8], transport_start: usize, protocol: u8) -> Option<TransportProtocol<'a>> {
         let transport = match protocol {
             // TCP (protocol 6)
             6 => {
@@ -167,8 +244,8 @@ impl<'a> PacketContext<'a> {
                     payload,
                 }
             }
-            // ICMP (protocol 1)
-            1 => {
+            // ICMP (protocol 1) and ICMPv6 (protocol 58)
+            1 | 58 => {
                 if raw.len() < transport_start + 8 {
                     return None;
                 }
@@ -186,22 +263,29 @@ impl<'a> PacketContext<'a> {
             other => TransportProtocol::Other { protocol: other },
         };
 
-        Some(Self {
-            raw,
-            src_mac,
-            dst_mac,
-            src_ip,
-            dst_ip,
-            transport,
-            vm_mac,
-            gateway_mac,
-            to_guest,
-        })
+        Some(transport)
+    }
+
+    /// Returns true if this is an IPv4 packet.
+    pub fn is_ipv4(&self) -> bool {
+        matches!(self.src_ip, IpAddr::V4(_))
+    }
+
+    /// Returns true if this is an IPv6 packet.
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self.src_ip, IpAddr::V6(_))
     }
 
     /// Build a UDP response packet to send back to the guest.
     /// Swaps src/dst and wraps payload in UDP/IP/Ethernet headers.
+    /// Note: Currently only supports IPv4 responses.
     pub fn build_udp_response(&self, payload: &[u8]) -> Bytes {
+        // Only support IPv4 for now
+        let (src_v4, dst_v4) = match (self.dst_ip, self.src_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => (src, dst),
+            _ => return Bytes::new(), // IPv6 response not yet implemented
+        };
+
         let (src_port, dst_port) = match &self.transport {
             TransportProtocol::Udp {
                 src_port, dst_port, ..
@@ -218,11 +302,18 @@ impl<'a> PacketContext<'a> {
         udp_header.extend_from_slice(&[0, 0]); // Checksum (optional for IPv4)
         udp_header.extend_from_slice(payload);
 
-        self.build_ip_response(17, &udp_header) // 17 = UDP
+        self.build_ipv4_response(17, &udp_header, src_v4, dst_v4)
     }
 
     /// Build an ICMP echo reply packet.
+    /// Note: Currently only supports IPv4 responses.
     pub fn build_icmp_echo_reply(&self, id: u16, sequence: u16, data: &[u8]) -> Bytes {
+        // Only support IPv4 for now
+        let (src_v4, dst_v4) = match (self.dst_ip, self.src_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => (src, dst),
+            _ => return Bytes::new(), // IPv6 response not yet implemented
+        };
+
         let mut icmp = Vec::with_capacity(8 + data.len());
         icmp.push(0); // Type: Echo Reply
         icmp.push(0); // Code
@@ -235,11 +326,18 @@ impl<'a> PacketContext<'a> {
         let checksum = internet_checksum(&icmp);
         icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
 
-        self.build_ip_response(1, &icmp) // 1 = ICMP
+        self.build_ipv4_response(1, &icmp, src_v4, dst_v4)
     }
 
     /// Build a TCP RST packet to reject a connection.
+    /// Note: Currently only supports IPv4 responses.
     pub fn build_tcp_rst(&self) -> Bytes {
+        // Only support IPv4 for now
+        let (src_v4, dst_v4) = match (self.dst_ip, self.src_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => (src, dst),
+            _ => return Bytes::new(), // IPv6 response not yet implemented
+        };
+
         let (src_port, dst_port, their_seq, their_ack) = match &self.transport {
             TransportProtocol::Tcp {
                 src_port,
@@ -268,14 +366,14 @@ impl<'a> PacketContext<'a> {
         tcp[18..20].copy_from_slice(&0u16.to_be_bytes()); // Urgent pointer
 
         // TCP checksum requires pseudo-header
-        let checksum = self.tcp_checksum(&tcp);
+        let checksum = Self::tcp_checksum_v4(&tcp, src_v4, dst_v4);
         tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
 
-        self.build_ip_response(6, &tcp) // 6 = TCP
+        self.build_ipv4_response(6, &tcp, src_v4, dst_v4)
     }
 
-    /// Build an IP response packet (helper for other builders).
-    fn build_ip_response(&self, protocol: u8, payload: &[u8]) -> Bytes {
+    /// Build an IPv4 response packet (helper for other builders).
+    fn build_ipv4_response(&self, protocol: u8, payload: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Bytes {
         let ip_total_len = 20 + payload.len();
         let mut ip = Vec::with_capacity(ip_total_len);
 
@@ -288,8 +386,8 @@ impl<'a> PacketContext<'a> {
         ip.push(64); // TTL
         ip.push(protocol);
         ip.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
-        ip.extend_from_slice(&self.dst_ip.octets()); // Src = original dst
-        ip.extend_from_slice(&self.src_ip.octets()); // Dst = original src
+        ip.extend_from_slice(&src_ip.octets());
+        ip.extend_from_slice(&dst_ip.octets());
 
         // Calculate IP checksum
         let checksum = internet_checksum(&ip[..20]);
@@ -308,11 +406,11 @@ impl<'a> PacketContext<'a> {
         Bytes::from(eth)
     }
 
-    /// Calculate TCP checksum with pseudo-header.
-    fn tcp_checksum(&self, tcp_segment: &[u8]) -> u16 {
+    /// Calculate TCP checksum with IPv4 pseudo-header.
+    fn tcp_checksum_v4(tcp_segment: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> u16 {
         let mut pseudo = Vec::with_capacity(12 + tcp_segment.len());
-        pseudo.extend_from_slice(&self.dst_ip.octets()); // Src in response
-        pseudo.extend_from_slice(&self.src_ip.octets()); // Dst in response
+        pseudo.extend_from_slice(&src_ip.octets());
+        pseudo.extend_from_slice(&dst_ip.octets());
         pseudo.push(0);
         pseudo.push(6); // TCP protocol
         pseudo.extend_from_slice(&(tcp_segment.len() as u16).to_be_bytes());
@@ -345,12 +443,15 @@ impl<'a> PacketContext<'a> {
         matches!(&self.transport, TransportProtocol::Tcp { flags, .. } if *flags == TcpFlags::SYN)
     }
 
-    /// Check if this is an ICMP echo request.
+    /// Check if this is an ICMP/ICMPv6 echo request.
     pub fn is_icmp_echo_request(&self) -> bool {
-        matches!(
-            &self.transport,
-            TransportProtocol::Icmp { icmp_type: 8, .. }
-        )
+        match (&self.src_ip, &self.transport) {
+            // ICMPv4 echo request: type 8
+            (IpAddr::V4(_), TransportProtocol::Icmp { icmp_type: 8, .. }) => true,
+            // ICMPv6 echo request: type 128
+            (IpAddr::V6(_), TransportProtocol::Icmp { icmp_type: 128, .. }) => true,
+            _ => false,
+        }
     }
 
     /// Check if this is a DNS query (UDP port 53).

@@ -39,8 +39,23 @@ pub struct IcmpInfo<'a> {
 
 impl IcmpInfo<'_> {
     /// Check if this is an echo request (ping).
+    /// Returns true for ICMPv4 type 8 or ICMPv6 type 128.
     #[inline]
     pub fn is_echo_request(&self) -> bool {
+        // ICMPv4 echo request: type 8
+        // ICMPv6 echo request: type 128
+        self.icmp_type == 8 || self.icmp_type == 128
+    }
+
+    /// Check if this is an ICMPv4 echo request (type 8).
+    #[inline]
+    pub fn is_echo_request_v4(&self) -> bool {
         self.icmp_type == 8
+    }
+
+    /// Check if this is an ICMPv6 echo request (type 128).
+    #[inline]
+    pub fn is_echo_request_v6(&self) -> bool {
+        self.icmp_type == 128
     }
 }

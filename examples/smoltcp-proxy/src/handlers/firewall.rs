@@ -1,30 +1,40 @@
 //! Firewall handler and configuration.
 //!
 //! Provides O(1) port-based filtering with CIDR destination rules.
+//! Supports both IPv4 and IPv6 addresses.
 
 use log::debug;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::handler::{
     HandlerResult, IcmpInfo, PacketContext, PacketHandler, PacketVerdict, TcpInfo, UdpInfo,
 };
 
-/// A CIDR block for IP filtering.
+/// A CIDR block for IP filtering. Supports both IPv4 and IPv6.
+///
+/// An IPv4 CIDR only matches IPv4 addresses, and an IPv6 CIDR only matches IPv6 addresses.
 #[derive(Clone, Copy, Debug)]
-pub struct Cidr {
-    /// Network address
-    network: u32,
-    /// Precomputed mask (e.g., /24 = 0xFFFFFF00)
-    mask: u32,
-    /// Prefix length (for display)
-    #[allow(dead_code)]
-    prefix_len: u8,
+pub enum Cidr {
+    /// IPv4 CIDR (e.g., 10.0.0.0/8)
+    V4 {
+        network: u32,
+        mask: u32,
+        #[allow(dead_code)]
+        prefix_len: u8,
+    },
+    /// IPv6 CIDR (e.g., 2001:db8::/32)
+    V6 {
+        network: u128,
+        mask: u128,
+        #[allow(dead_code)]
+        prefix_len: u8,
+    },
 }
 
 impl Cidr {
-    /// Create a CIDR from an IP and prefix length.
-    /// Example: `Cidr::new([10, 0, 0, 0], 8)` for 10.0.0.0/8
-    pub fn new(ip: [u8; 4], prefix_len: u8) -> Self {
+    /// Create an IPv4 CIDR from octets and prefix length.
+    /// Example: `Cidr::v4([10, 0, 0, 0], 8)` for 10.0.0.0/8
+    pub fn v4(ip: [u8; 4], prefix_len: u8) -> Self {
         let prefix_len = prefix_len.min(32);
         let mask = if prefix_len == 0 {
             0
@@ -32,49 +42,121 @@ impl Cidr {
             u32::MAX << (32 - prefix_len)
         };
         let network = u32::from_be_bytes(ip) & mask;
-        Self {
+        Self::V4 {
             network,
             mask,
             prefix_len,
         }
     }
 
-    /// Create from Ipv4Addr and prefix length.
-    pub fn from_addr(ip: Ipv4Addr, prefix_len: u8) -> Self {
-        Self::new(ip.octets(), prefix_len)
+    /// Create an IPv6 CIDR from octets and prefix length.
+    /// Example: `Cidr::v6([0x20, 0x01, 0x0d, 0xb8, ...], 32)` for 2001:db8::/32
+    pub fn v6(ip: [u8; 16], prefix_len: u8) -> Self {
+        let prefix_len = prefix_len.min(128);
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix_len)
+        };
+        let network = u128::from_be_bytes(ip) & mask;
+        Self::V6 {
+            network,
+            mask,
+            prefix_len,
+        }
     }
 
-    /// Parse from string like "10.0.0.0/8" or "192.168.1.1" (single host).
+    /// Create from an IpAddr and prefix length.
+    pub fn from_addr(ip: IpAddr, prefix_len: u8) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::v4(v4.octets(), prefix_len),
+            IpAddr::V6(v6) => Self::v6(v6.octets(), prefix_len),
+        }
+    }
+
+    /// Create from Ipv4Addr and prefix length.
+    pub fn from_ipv4(ip: Ipv4Addr, prefix_len: u8) -> Self {
+        Self::v4(ip.octets(), prefix_len)
+    }
+
+    /// Create from Ipv6Addr and prefix length.
+    pub fn from_ipv6(ip: Ipv6Addr, prefix_len: u8) -> Self {
+        Self::v6(ip.octets(), prefix_len)
+    }
+
+    /// Parse from string like "10.0.0.0/8", "192.168.1.1", "2001:db8::/32", or "::1".
     pub fn parse(s: &str) -> Option<Self> {
         let (ip_str, prefix_len) = if let Some((ip, prefix)) = s.split_once('/') {
-            (ip, prefix.parse().ok()?)
+            // Prefix must be a valid number
+            let len: u8 = prefix.parse().ok()?;
+            (ip, Some(len))
         } else {
-            (s, 32) // Single host
+            (s, None)
         };
 
-        let parts: Vec<u8> = ip_str.split('.').filter_map(|p| p.parse().ok()).collect();
-
-        if parts.len() != 4 {
-            return None;
+        // Try parsing as IPv6 first (contains ':')
+        if ip_str.contains(':') {
+            let ip: Ipv6Addr = ip_str.parse().ok()?;
+            return Some(Self::v6(ip.octets(), prefix_len.unwrap_or(128)));
         }
 
-        Some(Self::new(
-            [parts[0], parts[1], parts[2], parts[3]],
-            prefix_len,
-        ))
+        // Try parsing as IPv4
+        let ip: Ipv4Addr = ip_str.parse().ok()?;
+        Some(Self::v4(ip.octets(), prefix_len.unwrap_or(32)))
     }
 
     /// Check if an IP address matches this CIDR.
+    /// Returns false if address families don't match (IPv4 CIDR vs IPv6 address).
     #[inline(always)]
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        let ip_bits = u32::from_be_bytes(ip.octets());
-        (ip_bits & self.mask) == self.network
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (Cidr::V4 { network, mask, .. }, IpAddr::V4(v4)) => {
+                let ip_bits = u32::from_be_bytes(v4.octets());
+                (ip_bits & mask) == *network
+            }
+            (Cidr::V6 { network, mask, .. }, IpAddr::V6(v6)) => {
+                let ip_bits = u128::from_be_bytes(v6.octets());
+                (ip_bits & mask) == *network
+            }
+            // IPv4 CIDR doesn't match IPv6 address and vice versa
+            _ => false,
+        }
     }
 
-    /// Check if an IP (as u32 in network byte order) matches this CIDR.
+    /// Check if an IPv4 address matches this CIDR.
+    /// Returns false if this is an IPv6 CIDR.
     #[inline(always)]
-    pub fn contains_u32(&self, ip_bits: u32) -> bool {
-        (ip_bits & self.mask) == self.network
+    pub fn contains_v4(&self, ip: Ipv4Addr) -> bool {
+        match self {
+            Cidr::V4 { network, mask, .. } => {
+                let ip_bits = u32::from_be_bytes(ip.octets());
+                (ip_bits & mask) == *network
+            }
+            Cidr::V6 { .. } => false,
+        }
+    }
+
+    /// Check if an IPv6 address matches this CIDR.
+    /// Returns false if this is an IPv4 CIDR.
+    #[inline(always)]
+    pub fn contains_v6(&self, ip: Ipv6Addr) -> bool {
+        match self {
+            Cidr::V6 { network, mask, .. } => {
+                let ip_bits = u128::from_be_bytes(ip.octets());
+                (ip_bits & mask) == *network
+            }
+            Cidr::V4 { .. } => false,
+        }
+    }
+
+    /// Returns true if this is an IPv4 CIDR.
+    pub fn is_v4(&self) -> bool {
+        matches!(self, Cidr::V4 { .. })
+    }
+
+    /// Returns true if this is an IPv6 CIDR.
+    pub fn is_v6(&self) -> bool {
+        matches!(self, Cidr::V6 { .. })
     }
 }
 
@@ -289,7 +371,7 @@ impl FirewallConfig {
 
     /// Check if destination IP is allowed.
     #[inline]
-    fn check_destination(&self, dst_ip: Ipv4Addr) -> bool {
+    fn check_destination(&self, dst_ip: IpAddr) -> bool {
         // Allowlist mode: must match at least one allowed destination
         if let Some(ref allowed) = self.allowed_destinations {
             return allowed.iter().any(|cidr| cidr.contains(dst_ip));
@@ -304,19 +386,19 @@ impl FirewallConfig {
 
     /// Check if a TCP connection to the given destination is allowed.
     #[inline(always)]
-    pub fn check_tcp(&self, dst_port: u16, dst_ip: Ipv4Addr) -> bool {
+    pub fn check_tcp(&self, dst_port: u16, dst_ip: IpAddr) -> bool {
         self.tcp_allowed.contains(dst_port) && self.check_destination(dst_ip)
     }
 
     /// Check if a UDP packet to the given destination is allowed.
     #[inline(always)]
-    pub fn check_udp(&self, dst_port: u16, dst_ip: Ipv4Addr) -> bool {
+    pub fn check_udp(&self, dst_port: u16, dst_ip: IpAddr) -> bool {
         self.udp_allowed.contains(dst_port) && self.check_destination(dst_ip)
     }
 
-    /// Check if ICMP to the given destination is allowed.
+    /// Check if ICMP/ICMPv6 to the given destination is allowed.
     #[inline(always)]
-    pub fn check_icmp(&self, dst_ip: Ipv4Addr) -> bool {
+    pub fn check_icmp(&self, dst_ip: IpAddr) -> bool {
         self.icmp_allowed && self.check_destination(dst_ip)
     }
 }
@@ -392,69 +474,133 @@ mod tests {
     mod cidr {
         use super::*;
 
-        #[test]
-        fn test_cidr_new_slash_8() {
-            let cidr = Cidr::new([10, 0, 0, 0], 8);
-            assert!(cidr.contains([10, 0, 0, 1].into()));
-            assert!(cidr.contains([10, 255, 255, 255].into()));
-            assert!(!cidr.contains([11, 0, 0, 1].into()));
-            assert!(!cidr.contains([9, 255, 255, 255].into()));
+        // Helper to create IpAddr::V4 from octets
+        fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+            IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+        }
+
+        // Helper to create IpAddr::V6 from segments
+        fn v6(segments: [u16; 8]) -> IpAddr {
+            IpAddr::V6(Ipv6Addr::new(
+                segments[0], segments[1], segments[2], segments[3],
+                segments[4], segments[5], segments[6], segments[7],
+            ))
         }
 
         #[test]
-        fn test_cidr_new_slash_24() {
-            let cidr = Cidr::new([192, 168, 1, 0], 24);
-            assert!(cidr.contains([192, 168, 1, 1].into()));
-            assert!(cidr.contains([192, 168, 1, 255].into()));
-            assert!(!cidr.contains([192, 168, 2, 1].into()));
-            assert!(!cidr.contains([192, 168, 0, 255].into()));
+        fn test_cidr_v4_slash_8() {
+            let cidr = Cidr::v4([10, 0, 0, 0], 8);
+            assert!(cidr.contains(v4(10, 0, 0, 1)));
+            assert!(cidr.contains(v4(10, 255, 255, 255)));
+            assert!(!cidr.contains(v4(11, 0, 0, 1)));
+            assert!(!cidr.contains(v4(9, 255, 255, 255)));
         }
 
         #[test]
-        fn test_cidr_new_slash_32() {
-            let cidr = Cidr::new([8, 8, 8, 8], 32);
-            assert!(cidr.contains([8, 8, 8, 8].into()));
-            assert!(!cidr.contains([8, 8, 8, 9].into()));
-            assert!(!cidr.contains([8, 8, 8, 7].into()));
+        fn test_cidr_v4_slash_24() {
+            let cidr = Cidr::v4([192, 168, 1, 0], 24);
+            assert!(cidr.contains(v4(192, 168, 1, 1)));
+            assert!(cidr.contains(v4(192, 168, 1, 255)));
+            assert!(!cidr.contains(v4(192, 168, 2, 1)));
+            assert!(!cidr.contains(v4(192, 168, 0, 255)));
         }
 
         #[test]
-        fn test_cidr_new_slash_0() {
-            let cidr = Cidr::new([0, 0, 0, 0], 0);
-            // /0 matches everything
-            assert!(cidr.contains([0, 0, 0, 0].into()));
-            assert!(cidr.contains([255, 255, 255, 255].into()));
-            assert!(cidr.contains([10, 20, 30, 40].into()));
+        fn test_cidr_v4_slash_32() {
+            let cidr = Cidr::v4([8, 8, 8, 8], 32);
+            assert!(cidr.contains(v4(8, 8, 8, 8)));
+            assert!(!cidr.contains(v4(8, 8, 8, 9)));
+            assert!(!cidr.contains(v4(8, 8, 8, 7)));
         }
 
         #[test]
-        fn test_cidr_new_slash_16() {
-            let cidr = Cidr::new([172, 16, 0, 0], 16);
-            assert!(cidr.contains([172, 16, 0, 1].into()));
-            assert!(cidr.contains([172, 16, 255, 255].into()));
-            assert!(!cidr.contains([172, 17, 0, 0].into()));
-            assert!(!cidr.contains([172, 15, 255, 255].into()));
+        fn test_cidr_v4_slash_0() {
+            let cidr = Cidr::v4([0, 0, 0, 0], 0);
+            // /0 matches all IPv4
+            assert!(cidr.contains(v4(0, 0, 0, 0)));
+            assert!(cidr.contains(v4(255, 255, 255, 255)));
+            assert!(cidr.contains(v4(10, 20, 30, 40)));
+            // But not IPv6
+            assert!(!cidr.contains(v6([0, 0, 0, 0, 0, 0, 0, 1])));
         }
 
         #[test]
-        fn test_cidr_from_addr() {
-            let cidr = Cidr::from_addr([192, 168, 100, 0].into(), 24);
-            assert!(cidr.contains([192, 168, 100, 50].into()));
-            assert!(!cidr.contains([192, 168, 101, 50].into()));
+        fn test_cidr_v4_slash_16() {
+            let cidr = Cidr::v4([172, 16, 0, 0], 16);
+            assert!(cidr.contains(v4(172, 16, 0, 1)));
+            assert!(cidr.contains(v4(172, 16, 255, 255)));
+            assert!(!cidr.contains(v4(172, 17, 0, 0)));
+            assert!(!cidr.contains(v4(172, 15, 255, 255)));
         }
 
         #[test]
-        fn test_cidr_parse_with_prefix() {
+        fn test_cidr_v6_slash_64() {
+            let cidr = Cidr::parse("2001:db8::/32").unwrap();
+            assert!(cidr.contains(v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1])));
+            assert!(cidr.contains(v6([0x2001, 0x0db8, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff])));
+            assert!(!cidr.contains(v6([0x2001, 0x0db9, 0, 0, 0, 0, 0, 1])));
+            // IPv4 doesn't match IPv6 CIDR
+            assert!(!cidr.contains(v4(10, 0, 0, 1)));
+        }
+
+        #[test]
+        fn test_cidr_v6_slash_128() {
+            let cidr = Cidr::parse("::1/128").unwrap();
+            assert!(cidr.contains(v6([0, 0, 0, 0, 0, 0, 0, 1])));
+            assert!(!cidr.contains(v6([0, 0, 0, 0, 0, 0, 0, 2])));
+        }
+
+        #[test]
+        fn test_cidr_v6_link_local() {
+            let cidr = Cidr::parse("fe80::/10").unwrap();
+            assert!(cidr.contains(v6([0xfe80, 0, 0, 0, 0, 0, 0, 1])));
+            assert!(cidr.contains(v6([0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff])));
+            assert!(!cidr.contains(v6([0xfec0, 0, 0, 0, 0, 0, 0, 1])));
+        }
+
+        #[test]
+        fn test_cidr_from_addr_v4() {
+            let cidr = Cidr::from_addr(v4(192, 168, 100, 0), 24);
+            assert!(cidr.contains(v4(192, 168, 100, 50)));
+            assert!(!cidr.contains(v4(192, 168, 101, 50)));
+        }
+
+        #[test]
+        fn test_cidr_from_addr_v6() {
+            let cidr = Cidr::from_addr(v6([0x2001, 0x0db8, 0xabcd, 0, 0, 0, 0, 0]), 48);
+            assert!(cidr.contains(v6([0x2001, 0x0db8, 0xabcd, 0, 0, 0, 0, 1])));
+            assert!(!cidr.contains(v6([0x2001, 0x0db8, 0xabce, 0, 0, 0, 0, 1])));
+        }
+
+        #[test]
+        fn test_cidr_parse_ipv4_with_prefix() {
             let cidr = Cidr::parse("10.0.0.0/8").unwrap();
-            assert!(cidr.contains([10, 1, 2, 3].into()));
-            assert!(!cidr.contains([11, 0, 0, 0].into()));
+            assert!(cidr.is_v4());
+            assert!(cidr.contains(v4(10, 1, 2, 3)));
+            assert!(!cidr.contains(v4(11, 0, 0, 0)));
         }
 
         #[test]
-        fn test_cidr_parse_single_host() {
+        fn test_cidr_parse_ipv4_single_host() {
             let cidr = Cidr::parse("1.2.3.4").unwrap();
-            assert!(cidr.contains([1, 2, 3, 4].into()));
-            assert!(!cidr.contains([1, 2, 3, 5].into()));
+            assert!(cidr.is_v4());
+            assert!(cidr.contains(v4(1, 2, 3, 4)));
+            assert!(!cidr.contains(v4(1, 2, 3, 5)));
+        }
+
+        #[test]
+        fn test_cidr_parse_ipv6_with_prefix() {
+            let cidr = Cidr::parse("2001:db8::/32").unwrap();
+            assert!(cidr.is_v6());
+            assert!(cidr.contains(v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1])));
+        }
+
+        #[test]
+        fn test_cidr_parse_ipv6_single_host() {
+            let cidr = Cidr::parse("::1").unwrap();
+            assert!(cidr.is_v6());
+            assert!(cidr.contains(v6([0, 0, 0, 0, 0, 0, 0, 1])));
+            assert!(!cidr.contains(v6([0, 0, 0, 0, 0, 0, 0, 2])));
         }
 
         #[test]
@@ -473,27 +619,37 @@ mod tests {
             let class_c = Cidr::parse("192.168.0.0/16").unwrap();
 
             // Class A: 10.0.0.0 - 10.255.255.255
-            assert!(class_a.contains([10, 0, 0, 1].into()));
-            assert!(class_a.contains([10, 255, 255, 255].into()));
+            assert!(class_a.contains(v4(10, 0, 0, 1)));
+            assert!(class_a.contains(v4(10, 255, 255, 255)));
 
             // Class B: 172.16.0.0 - 172.31.255.255
-            assert!(class_b.contains([172, 16, 0, 1].into()));
-            assert!(class_b.contains([172, 31, 255, 255].into()));
-            assert!(!class_b.contains([172, 32, 0, 0].into()));
+            assert!(class_b.contains(v4(172, 16, 0, 1)));
+            assert!(class_b.contains(v4(172, 31, 255, 255)));
+            assert!(!class_b.contains(v4(172, 32, 0, 0)));
 
             // Class C: 192.168.0.0 - 192.168.255.255
-            assert!(class_c.contains([192, 168, 0, 1].into()));
-            assert!(class_c.contains([192, 168, 255, 255].into()));
-            assert!(!class_c.contains([192, 169, 0, 0].into()));
+            assert!(class_c.contains(v4(192, 168, 0, 1)));
+            assert!(class_c.contains(v4(192, 168, 255, 255)));
+            assert!(!class_c.contains(v4(192, 169, 0, 0)));
         }
 
         #[test]
-        fn test_cidr_contains_u32() {
-            let cidr = Cidr::new([192, 168, 1, 0], 24);
-            let ip_in = u32::from_be_bytes([192, 168, 1, 100]);
-            let ip_out = u32::from_be_bytes([192, 168, 2, 100]);
-            assert!(cidr.contains_u32(ip_in));
-            assert!(!cidr.contains_u32(ip_out));
+        fn test_cidr_contains_v4_method() {
+            let cidr = Cidr::v4([192, 168, 1, 0], 24);
+            assert!(cidr.contains_v4(Ipv4Addr::new(192, 168, 1, 100)));
+            assert!(!cidr.contains_v4(Ipv4Addr::new(192, 168, 2, 100)));
+        }
+
+        #[test]
+        fn test_cidr_v4_does_not_match_v6() {
+            let cidr_v4 = Cidr::v4([0, 0, 0, 0], 0);
+            let cidr_v6 = Cidr::parse("::/0").unwrap();
+
+            // IPv4 CIDR doesn't match IPv6 addresses
+            assert!(!cidr_v4.contains(v6([0, 0, 0, 0, 0, 0, 0, 1])));
+
+            // IPv6 CIDR doesn't match IPv4 addresses
+            assert!(!cidr_v6.contains(v4(10, 0, 0, 1)));
         }
     }
 
@@ -590,22 +746,27 @@ mod tests {
     mod firewall_config {
         use super::*;
 
+        // Helper to create IpAddr::V4 from octets
+        fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+            IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+        }
+
         #[test]
         fn test_allow_all() {
             let fw = FirewallConfig::allow_all();
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(22, [10, 0, 0, 1].into()));
-            assert!(fw.check_udp(53, [1, 1, 1, 1].into()));
-            assert!(fw.check_icmp([8, 8, 8, 8].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(22, ip(10, 0, 0, 1)));
+            assert!(fw.check_udp(53, ip(1, 1, 1, 1)));
+            assert!(fw.check_icmp(ip(8, 8, 8, 8)));
         }
 
         #[test]
         fn test_deny_all() {
             let fw = FirewallConfig::deny_all();
-            assert!(!fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(22, [10, 0, 0, 1].into()));
-            assert!(!fw.check_udp(53, [1, 1, 1, 1].into()));
-            assert!(!fw.check_icmp([8, 8, 8, 8].into()));
+            assert!(!fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(22, ip(10, 0, 0, 1)));
+            assert!(!fw.check_udp(53, ip(1, 1, 1, 1)));
+            assert!(!fw.check_icmp(ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -613,10 +774,10 @@ mod tests {
             let mut fw = FirewallConfig::deny_all();
             fw.allow_tcp(80).allow_tcp(443);
 
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(443, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(22, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(8080, [8, 8, 8, 8].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(443, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(22, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(8080, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -624,11 +785,11 @@ mod tests {
             let mut fw = FirewallConfig::deny_all();
             fw.allow_tcp_range(8080, 8090);
 
-            assert!(!fw.check_tcp(8079, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(8080, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(8085, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(8090, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(8091, [8, 8, 8, 8].into()));
+            assert!(!fw.check_tcp(8079, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(8080, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(8085, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(8090, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(8091, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -636,8 +797,8 @@ mod tests {
             let mut fw = FirewallConfig::allow_all();
             fw.deny_tcp(22);
 
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(22, [8, 8, 8, 8].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(22, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -645,9 +806,9 @@ mod tests {
             let mut fw = FirewallConfig::deny_all();
             fw.allow_udp(53).allow_udp(123);
 
-            assert!(fw.check_udp(53, [8, 8, 8, 8].into()));
-            assert!(fw.check_udp(123, [8, 8, 8, 8].into()));
-            assert!(!fw.check_udp(80, [8, 8, 8, 8].into()));
+            assert!(fw.check_udp(53, ip(8, 8, 8, 8)));
+            assert!(fw.check_udp(123, ip(8, 8, 8, 8)));
+            assert!(!fw.check_udp(80, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -655,8 +816,8 @@ mod tests {
             let mut fw = FirewallConfig::deny_all();
             fw.allow_udp_range(10000, 10010);
 
-            assert!(fw.check_udp(10005, [8, 8, 8, 8].into()));
-            assert!(!fw.check_udp(9999, [8, 8, 8, 8].into()));
+            assert!(fw.check_udp(10005, ip(8, 8, 8, 8)));
+            assert!(!fw.check_udp(9999, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -664,8 +825,8 @@ mod tests {
             let mut fw = FirewallConfig::allow_all();
             fw.deny_udp(53);
 
-            assert!(fw.check_udp(80, [8, 8, 8, 8].into()));
-            assert!(!fw.check_udp(53, [8, 8, 8, 8].into()));
+            assert!(fw.check_udp(80, ip(8, 8, 8, 8)));
+            assert!(!fw.check_udp(53, ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -673,7 +834,7 @@ mod tests {
             let mut fw = FirewallConfig::deny_all();
             fw.allow_icmp();
 
-            assert!(fw.check_icmp([8, 8, 8, 8].into()));
+            assert!(fw.check_icmp(ip(8, 8, 8, 8)));
         }
 
         #[test]
@@ -681,22 +842,22 @@ mod tests {
             let mut fw = FirewallConfig::allow_all();
             fw.deny_icmp();
 
-            assert!(!fw.check_icmp([8, 8, 8, 8].into()));
+            assert!(!fw.check_icmp(ip(8, 8, 8, 8)));
         }
 
         #[test]
         fn test_deny_destination() {
             let mut fw = FirewallConfig::allow_all();
-            fw.deny_destination(Cidr::new([10, 0, 0, 0], 8));
+            fw.deny_destination(Cidr::v4([10, 0, 0, 0], 8));
 
             // Port allowed, but destination blocked
-            assert!(!fw.check_tcp(80, [10, 0, 0, 1].into()));
-            assert!(!fw.check_udp(53, [10, 255, 255, 255].into()));
-            assert!(!fw.check_icmp([10, 1, 2, 3].into()));
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
+            assert!(!fw.check_udp(53, ip(10, 255, 255, 255)));
+            assert!(!fw.check_icmp(ip(10, 1, 2, 3)));
 
             // Other destinations still allowed
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_udp(53, [1, 1, 1, 1].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_udp(53, ip(1, 1, 1, 1)));
         }
 
         #[test]
@@ -704,8 +865,8 @@ mod tests {
             let mut fw = FirewallConfig::allow_all();
             fw.deny_destination_str("192.168.0.0/16");
 
-            assert!(!fw.check_tcp(80, [192, 168, 1, 1].into()));
-            assert!(fw.check_tcp(80, [192, 169, 1, 1].into()));
+            assert!(!fw.check_tcp(80, ip(192, 168, 1, 1)));
+            assert!(fw.check_tcp(80, ip(192, 169, 1, 1)));
         }
 
         #[test]
@@ -716,13 +877,13 @@ mod tests {
                 .deny_destination_str("192.168.0.0/16");
 
             // All private networks blocked
-            assert!(!fw.check_tcp(80, [10, 0, 0, 1].into()));
-            assert!(!fw.check_tcp(80, [172, 16, 0, 1].into()));
-            assert!(!fw.check_tcp(80, [192, 168, 0, 1].into()));
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
+            assert!(!fw.check_tcp(80, ip(172, 16, 0, 1)));
+            assert!(!fw.check_tcp(80, ip(192, 168, 0, 1)));
 
             // Public IPs allowed
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(80, [1, 1, 1, 1].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(80, ip(1, 1, 1, 1)));
         }
 
         #[test]
@@ -733,12 +894,12 @@ mod tests {
                 .allow_destination_str("1.1.1.0/24");
 
             // Only allowed destinations work
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(80, [1, 1, 1, 1].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(80, ip(1, 1, 1, 1)));
 
             // Everything else blocked
-            assert!(!fw.check_tcp(80, [9, 9, 9, 9].into()));
-            assert!(!fw.check_tcp(80, [10, 0, 0, 1].into()));
+            assert!(!fw.check_tcp(80, ip(9, 9, 9, 9)));
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
         }
 
         #[test]
@@ -747,8 +908,8 @@ mod tests {
             fw.destination_allowlist_mode();
 
             // Empty allowlist means nothing is allowed
-            assert!(!fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(!fw.check_tcp(80, [10, 0, 0, 1].into()));
+            assert!(!fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
         }
 
         #[test]
@@ -759,23 +920,59 @@ mod tests {
                 .deny_destination_str("10.0.0.0/8");
 
             // Port allowed, destination allowed
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_tcp(443, [8, 8, 8, 8].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_tcp(443, ip(8, 8, 8, 8)));
 
             // Port allowed, destination blocked
-            assert!(!fw.check_tcp(80, [10, 0, 0, 1].into()));
-            assert!(!fw.check_tcp(443, [10, 0, 0, 1].into()));
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
+            assert!(!fw.check_tcp(443, ip(10, 0, 0, 1)));
 
             // Port blocked, destination allowed
-            assert!(!fw.check_tcp(22, [8, 8, 8, 8].into()));
+            assert!(!fw.check_tcp(22, ip(8, 8, 8, 8)));
         }
 
         #[test]
         fn test_default_is_allow_all() {
             let fw = FirewallConfig::default();
-            assert!(fw.check_tcp(80, [8, 8, 8, 8].into()));
-            assert!(fw.check_udp(53, [8, 8, 8, 8].into()));
-            assert!(fw.check_icmp([8, 8, 8, 8].into()));
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            assert!(fw.check_udp(53, ip(8, 8, 8, 8)));
+            assert!(fw.check_icmp(ip(8, 8, 8, 8)));
+        }
+
+        #[test]
+        fn test_ipv6_destination_deny() {
+            let mut fw = FirewallConfig::allow_all();
+            fw.deny_destination_str("2001:db8::/32");
+
+            // IPv6 destination blocked
+            let blocked_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            assert!(!fw.check_tcp(80, blocked_v6));
+
+            // Other IPv6 allowed
+            let allowed_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db9, 0, 0, 0, 0, 0, 1));
+            assert!(fw.check_tcp(80, allowed_v6));
+
+            // IPv4 still works
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+        }
+
+        #[test]
+        fn test_mixed_v4_v6_destinations() {
+            let mut fw = FirewallConfig::allow_all();
+            fw.deny_destination_str("10.0.0.0/8")
+                .deny_destination_str("fe80::/10"); // link-local IPv6
+
+            // IPv4 private blocked
+            assert!(!fw.check_tcp(80, ip(10, 0, 0, 1)));
+
+            // IPv6 link-local blocked
+            let link_local = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+            assert!(!fw.check_tcp(80, link_local));
+
+            // Others allowed
+            assert!(fw.check_tcp(80, ip(8, 8, 8, 8)));
+            let global_v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            assert!(fw.check_tcp(80, global_v6));
         }
     }
 

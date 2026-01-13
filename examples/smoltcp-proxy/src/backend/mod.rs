@@ -26,7 +26,7 @@ use smoltcp::iface::{Interface, SocketSet};
 use smoltcp::socket::tcp as smoltcp_tcp;
 use smoltcp::socket::udp as smoltcp_udp;
 use smoltcp::time::Instant as SmoltcpInstant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -57,6 +57,10 @@ pub const PROXY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x01, 
 pub const VM_IP: Ipv4Address = Ipv4Address::new(192, 168, 100, 2);
 /// Default proxy/gateway IP address
 pub const PROXY_IP: Ipv4Address = Ipv4Address::new(192, 168, 100, 1);
+/// Default VM IPv6 address
+pub const VM_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+/// Default proxy/gateway IPv6 address
+pub const PROXY_IP6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
 
 /// Commands sent to host TCP connection tasks.
 pub enum HostCommand {
@@ -116,8 +120,10 @@ pub enum HostEvent {
 pub struct SmoltcpProxyConfig {
     pub vm_mac: EthernetAddress,
     pub vm_ip: Ipv4Address,
+    pub vm_ip6: Ipv6Address,
     pub gateway_mac: EthernetAddress,
     pub gateway_ip: Ipv4Address,
+    pub gateway_ip6: Ipv6Address,
     /// Unix socket listeners: maps VM port to Unix socket path on host
     pub unix_listeners: HashMap<u16, PathBuf>,
     /// Packet handlers - processed in order before NAT.
@@ -129,8 +135,10 @@ impl Default for SmoltcpProxyConfig {
         Self {
             vm_mac: VM_MAC,
             vm_ip: VM_IP,
+            vm_ip6: VM_IP6,
             gateway_mac: PROXY_MAC,
             gateway_ip: PROXY_IP,
+            gateway_ip6: PROXY_IP6,
             unix_listeners: HashMap::new(),
             handlers: Vec::new(),
         }
@@ -295,12 +303,19 @@ impl SmoltcpProxyBackend {
         iface.update_ip_addrs(|addrs| {
             addrs
                 .push(IpCidr::new(IpAddress::from(config.gateway_ip), 24))
-                .expect("failed to add IP address");
+                .expect("failed to add IPv4 address");
+            addrs
+                .push(IpCidr::new(IpAddress::from(config.gateway_ip6), 64))
+                .expect("failed to add IPv6 address");
         });
         iface
             .routes_mut()
             .add_default_ipv4_route(config.gateway_ip)
-            .expect("failed to add default route");
+            .expect("failed to add default IPv4 route");
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(config.gateway_ip6)
+            .expect("failed to add default IPv6 route");
 
         let sockets = SocketSet::new(vec![]);
         let handlers = std::mem::take(&mut config.handlers);
