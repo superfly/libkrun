@@ -2376,6 +2376,7 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 #[derive(Default)]
 pub struct Builder {
     config: ContextConfig,
+    kernel_cmdline: Vec<String>,
 }
 
 impl Builder {
@@ -2392,6 +2393,7 @@ impl Builder {
                 shutdown_efd,
                 ..Default::default()
             },
+            ..Default::default()
         }
     }
 
@@ -2572,9 +2574,15 @@ impl Builder {
         self
     }
 
+    pub fn set_kernel_cmdline(&mut self, cmdline: Vec<&str>) -> &mut Self {
+        self.kernel_cmdline = cmdline.into_iter().map(|s| s.to_owned()).collect();
+        self
+    }
+
     pub fn build(self) -> Context {
         Context {
             config: self.config,
+            kernel_cmdline: self.kernel_cmdline,
         }
     }
 }
@@ -2588,6 +2596,7 @@ pub enum BuildError {
 
 pub struct Context {
     config: ContextConfig,
+    kernel_cmdline: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2656,17 +2665,26 @@ impl Context {
             return Err(StartError::MissingTeeConfig);
         }
 
-        let kernel_cmdline = KernelCmdlineConfig {
-            cmdline: vec![
-                DEFAULT_KERNEL_CMDLINE.to_owned(),
-                format!("init={INIT_PATH}"),
-                ctx_cfg.get_exec_path(),
-                ctx_cfg.get_workdir(),
-                ctx_cfg.get_block_root(),
-                ctx_cfg.get_rlimits(),
-                ctx_cfg.get_env(),
-            ],
-            args: vec![format!(" -- {}", ctx_cfg.get_args())],
+        let kernel_cmdline = if self.kernel_cmdline.is_empty() {
+            KernelCmdlineConfig {
+                cmdline: vec![
+                    DEFAULT_KERNEL_CMDLINE.to_owned(),
+                    format!("init={INIT_PATH}"),
+                    ctx_cfg.get_exec_path(),
+                    ctx_cfg.get_workdir(),
+                    ctx_cfg.get_block_root(),
+                    ctx_cfg.get_rlimits(),
+                    ctx_cfg.get_env(),
+                ],
+                args: vec![format!(" -- {}", ctx_cfg.get_args())],
+            }
+        } else {
+            let mut cmdline = self.kernel_cmdline;
+            cmdline.push(ctx_cfg.get_env());
+            KernelCmdlineConfig {
+                cmdline,
+                args: vec![format!(" -- {}", ctx_cfg.get_args())],
+            }
         };
 
         ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline)?;

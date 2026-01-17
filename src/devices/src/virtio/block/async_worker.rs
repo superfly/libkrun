@@ -249,7 +249,9 @@ impl AsyncBlockWorker {
                 let write_latency = metrics_clone.write_latency_us.load(Ordering::Relaxed);
 
                 let concurrent_reads = metrics_clone.concurrent_reads.load(Ordering::Relaxed);
-                let peak_reads = metrics_clone.peak_concurrent_reads.swap(0, Ordering::Relaxed);
+                let peak_reads = metrics_clone
+                    .peak_concurrent_reads
+                    .swap(0, Ordering::Relaxed);
 
                 let delta_reads = reads - last_reads;
                 let delta_writes = writes - last_writes;
@@ -258,10 +260,18 @@ impl AsyncBlockWorker {
                 let delta_read_latency = read_latency - last_read_latency;
                 let delta_write_latency = write_latency - last_write_latency;
 
-                let avg_read_latency_us = if delta_reads > 0 { delta_read_latency / delta_reads } else { 0 };
-                let avg_write_latency_us = if delta_writes > 0 { delta_write_latency / delta_writes } else { 0 };
+                let avg_read_latency_us = if delta_reads > 0 {
+                    delta_read_latency / delta_reads
+                } else {
+                    0
+                };
+                let avg_write_latency_us = if delta_writes > 0 {
+                    delta_write_latency / delta_writes
+                } else {
+                    0
+                };
 
-                info!(
+                trace!(
                     "async-blk metrics: in_flight={} concurrent_reads={} peak_reads={} reads={}/s writes={}/s flushes={} read={:.1}MB/s write={:.1}MB/s avg_read_lat={:.1}ms avg_write_lat={:.1}ms",
                     in_flight,
                     concurrent_reads,
@@ -311,7 +321,8 @@ impl AsyncBlockWorker {
         let queue_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(queue_evt.as_raw_fd())) };
         let stop_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(stop_fd.as_raw_fd())) };
 
-        let async_queue_fd = AsyncFd::new(queue_fd_dup).expect("failed to create AsyncFd for queue");
+        let async_queue_fd =
+            AsyncFd::new(queue_fd_dup).expect("failed to create AsyncFd for queue");
         let async_stop_fd = AsyncFd::new(stop_fd_dup).expect("failed to create AsyncFd for stop");
 
         log::debug!("async block worker: AsyncFd configured, entering main loop");
@@ -630,7 +641,10 @@ fn pop_and_parse_requests(queue: &mut Queue, mem: &GuestMemoryMmap) -> Vec<Parse
         queue.disable_notification(mem).unwrap();
 
         while let Some(head) = queue.pop(mem) {
-            trace!("async block worker: popped request, head index={}", head.index);
+            trace!(
+                "async block worker: popped request, head index={}",
+                head.index
+            );
             let index = head.index;
 
             // Parse the request
@@ -674,7 +688,10 @@ fn spawn_read_task(
     let mut peak = metrics.peak_concurrent_reads.load(Ordering::Relaxed);
     while concurrent > peak {
         match metrics.peak_concurrent_reads.compare_exchange_weak(
-            peak, concurrent, Ordering::Relaxed, Ordering::Relaxed
+            peak,
+            concurrent,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
         ) {
             Ok(_) => break,
             Err(p) => peak = p,
@@ -683,7 +700,8 @@ fn spawn_read_task(
 
     tokio::task::spawn_local(async move {
         let start = Instant::now();
-        let (status, len, req_type) = process_request_async_with_metrics(&disk, parsed.request).await;
+        let (status, len, req_type) =
+            process_request_async_with_metrics(&disk, parsed.request).await;
         let elapsed_us = start.elapsed().as_micros() as u64;
 
         // Update metrics
@@ -691,7 +709,9 @@ fn spawn_read_task(
             RequestType::Read => {
                 metrics.reads.fetch_add(1, Ordering::Relaxed);
                 metrics.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-                metrics.read_latency_us.fetch_add(elapsed_us, Ordering::Relaxed);
+                metrics
+                    .read_latency_us
+                    .fetch_add(elapsed_us, Ordering::Relaxed);
             }
             RequestType::Other => {}
             _ => {}
@@ -746,23 +766,26 @@ fn start_write_batch(
     }
 
     // Collect writes to actually process (the deduplicated ones)
-    let mut to_process: Vec<&QueuedWrite> = dedup_map
-        .values()
-        .map(|&(_, idx)| &writes[idx])
-        .collect();
+    let mut to_process: Vec<&QueuedWrite> =
+        dedup_map.values().map(|&(_, idx)| &writes[idx]).collect();
 
     // Sort by offset for better sequential I/O
     to_process.sort_by_key(|w| w.offset);
 
     // Track which writes were deduplicated (not in to_process)
-    let processed_indices: std::collections::HashSet<usize> = dedup_map.values().map(|&(_, idx)| idx).collect();
+    let processed_indices: std::collections::HashSet<usize> =
+        dedup_map.values().map(|&(_, idx)| idx).collect();
 
-    debug!("start_write_batch: after dedup, {} writes to process, {} deduplicated",
-           to_process.len(), writes.len() - to_process.len());
+    debug!(
+        "start_write_batch: after dedup, {} writes to process, {} deduplicated",
+        to_process.len(),
+        writes.len() - to_process.len()
+    );
 
     // Prepare batch data
     // Each entry: (offset, bufs, index, status_ptr)
-    let mut batch_writes: Vec<(u64, Vec<VolatileSliceGuard>)> = Vec::with_capacity(to_process.len());
+    let mut batch_writes: Vec<(u64, Vec<VolatileSliceGuard>)> =
+        Vec::with_capacity(to_process.len());
     let mut batch_meta: Vec<(u16, *mut u8)> = Vec::with_capacity(to_process.len());
 
     for w in &to_process {
@@ -793,7 +816,8 @@ fn start_write_batch(
         let batch_results = disk.write_batch(batch_writes).await;
         let elapsed_us = start.elapsed().as_micros() as u64;
 
-        let mut results: Vec<(u16, u8, u32, *mut u8)> = Vec::with_capacity(batch_meta.len() + deduped_completions.len());
+        let mut results: Vec<(u16, u8, u32, *mut u8)> =
+            Vec::with_capacity(batch_meta.len() + deduped_completions.len());
         let mut total_bytes: u64 = 0;
 
         match batch_results {
@@ -945,14 +969,28 @@ async fn process_request_async_with_metrics<B: AsyncBlockBackend>(
 ) -> (u8, u32, RequestType) {
     let (result, req_type) = match request {
         Request::Read { bufs, offset } => {
-            log::debug!("process_request_async: READ offset={} num_bufs={}", offset, bufs.len());
+            log::debug!(
+                "process_request_async: READ offset={} num_bufs={}",
+                offset,
+                bufs.len()
+            );
             let res = disk.read_vectored_at(bufs, offset).await;
-            log::debug!("process_request_async: READ completed, result={:?}", res.as_ref().map(|n| *n));
+            log::debug!(
+                "process_request_async: READ completed, result={:?}",
+                res.as_ref().map(|n| *n)
+            );
             (res.map(|n| n as u32), RequestType::Read)
         }
         Request::Write { bufs, offset } => {
-            log::trace!("process_request_async: WRITE offset={} num_bufs={}", offset, bufs.len());
-            (disk.write_vectored_at(bufs, offset).await.map(|n| n as u32), RequestType::Write)
+            log::trace!(
+                "process_request_async: WRITE offset={} num_bufs={}",
+                offset,
+                bufs.len()
+            );
+            (
+                disk.write_vectored_at(bufs, offset).await.map(|n| n as u32),
+                RequestType::Write,
+            )
         }
         Request::Flush => {
             log::trace!("process_request_async: FLUSH");
@@ -978,12 +1016,27 @@ async fn process_request_async_with_metrics<B: AsyncBlockBackend>(
             (Ok(len as u32), RequestType::Other)
         }
         Request::Discard { offset, len } => {
-            log::trace!("process_request_async: DISCARD offset={} len={}", offset, len);
-            (disk.discard(offset, len).await.map(|_| 0), RequestType::Other)
+            log::trace!(
+                "process_request_async: DISCARD offset={} len={}",
+                offset,
+                len
+            );
+            (
+                disk.discard(offset, len).await.map(|_| 0),
+                RequestType::Other,
+            )
         }
         Request::WriteZeroes { offset, len, unmap } => {
-            log::trace!("process_request_async: WRITE_ZEROES offset={} len={} unmap={}", offset, len, unmap);
-            (disk.write_zeroes(offset, len, unmap).await.map(|_| 0), RequestType::Other)
+            log::trace!(
+                "process_request_async: WRITE_ZEROES offset={} len={} unmap={}",
+                offset,
+                len,
+                unmap
+            );
+            (
+                disk.write_zeroes(offset, len, unmap).await.map(|_| 0),
+                RequestType::Other,
+            )
         }
     };
 
@@ -1151,7 +1204,10 @@ mod tests {
             offset: u64,
         ) -> BoxFuture<'_, io::Result<usize>> {
             let total_len: usize = bufs.iter().map(|b| b.len()).sum();
-            self.record(OpEvent::ReadStart { offset, len: total_len });
+            self.record(OpEvent::ReadStart {
+                offset,
+                len: total_len,
+            });
 
             Box::pin(async move {
                 let data = self.data.read().unwrap();
@@ -1179,7 +1235,10 @@ mod tests {
             offset: u64,
         ) -> BoxFuture<'_, io::Result<usize>> {
             let total_len: usize = bufs.iter().map(|b| b.len()).sum();
-            self.record(OpEvent::WriteStart { offset, len: total_len });
+            self.record(OpEvent::WriteStart {
+                offset,
+                len: total_len,
+            });
             self.writes_in_progress.fetch_add(1, Ordering::SeqCst);
 
             Box::pin(async move {
@@ -1248,7 +1307,12 @@ mod tests {
             })
         }
 
-        fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> BoxFuture<'_, io::Result<()>> {
+        fn write_zeroes(
+            &self,
+            offset: u64,
+            len: u64,
+            unmap: bool,
+        ) -> BoxFuture<'_, io::Result<()>> {
             self.record(OpEvent::WriteZeroes { offset, len, unmap });
             Box::pin(async move {
                 let mut data = self.data.write().unwrap();
@@ -1297,10 +1361,34 @@ mod tests {
 
         // Verify events
         let events = backend.events();
-        assert!(matches!(events[0], OpEvent::WriteStart { offset: 0, len: 512 }));
-        assert!(matches!(events[1], OpEvent::WriteEnd { offset: 0, len: 512 }));
-        assert!(matches!(events[2], OpEvent::ReadStart { offset: 0, len: 512 }));
-        assert!(matches!(events[3], OpEvent::ReadEnd { offset: 0, len: 512 }));
+        assert!(matches!(
+            events[0],
+            OpEvent::WriteStart {
+                offset: 0,
+                len: 512
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            OpEvent::WriteEnd {
+                offset: 0,
+                len: 512
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            OpEvent::ReadStart {
+                offset: 0,
+                len: 512
+            }
+        ));
+        assert!(matches!(
+            events[3],
+            OpEvent::ReadEnd {
+                offset: 0,
+                len: 512
+            }
+        ));
     }
 
     #[test]
@@ -1353,7 +1441,13 @@ mod tests {
 
         // Verify event
         let events = backend.events();
-        assert!(events.iter().any(|e| matches!(e, OpEvent::Discard { offset: 256, len: 512 })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OpEvent::Discard {
+                offset: 256,
+                len: 512
+            }
+        )));
     }
 
     #[test]
@@ -1386,7 +1480,14 @@ mod tests {
 
         // Verify event
         let events = backend.events();
-        assert!(events.iter().any(|e| matches!(e, OpEvent::WriteZeroes { offset: 128, len: 256, unmap: false })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            OpEvent::WriteZeroes {
+                offset: 128,
+                len: 256,
+                unmap: false
+            }
+        )));
     }
 
     // ========================================================================
@@ -1507,8 +1608,14 @@ mod tests {
 
         // Verify events show interleaved operations
         let events = backend.events();
-        let read_starts = events.iter().filter(|e| matches!(e, OpEvent::ReadStart { .. })).count();
-        let write_starts = events.iter().filter(|e| matches!(e, OpEvent::WriteStart { .. })).count();
+        let read_starts = events
+            .iter()
+            .filter(|e| matches!(e, OpEvent::ReadStart { .. }))
+            .count();
+        let write_starts = events
+            .iter()
+            .filter(|e| matches!(e, OpEvent::WriteStart { .. }))
+            .count();
         assert_eq!(read_starts, 4);
         assert_eq!(write_starts, 4);
     }
@@ -1522,11 +1629,11 @@ mod tests {
     fn test_write_deduplication_logic() {
         // Simulate the deduplication logic from start_write_batch
         let writes = vec![
-            (0u64, 512usize, 1u64),   // offset=0, len=512, seq=1
-            (512, 512, 2),            // offset=512, len=512, seq=2
-            (0, 512, 3),              // offset=0, len=512, seq=3 (should override seq=1)
-            (1024, 512, 4),           // offset=1024, len=512, seq=4
-            (512, 512, 5),            // offset=512, len=512, seq=5 (should override seq=2)
+            (0u64, 512usize, 1u64), // offset=0, len=512, seq=1
+            (512, 512, 2),          // offset=512, len=512, seq=2
+            (0, 512, 3),            // offset=0, len=512, seq=3 (should override seq=1)
+            (1024, 512, 4),         // offset=1024, len=512, seq=4
+            (512, 512, 5),          // offset=512, len=512, seq=5 (should override seq=2)
         ];
 
         let mut dedup_map: HashMap<(u64, usize), (u64, usize)> = HashMap::new();
@@ -1548,8 +1655,8 @@ mod tests {
         assert_eq!(dedup_map.len(), 3);
 
         // Check that we kept the right ones (highest seq for each offset/len)
-        assert_eq!(dedup_map.get(&(0, 512)), Some(&(3, 2)));    // seq=3, idx=2
-        assert_eq!(dedup_map.get(&(512, 512)), Some(&(5, 4)));  // seq=5, idx=4
+        assert_eq!(dedup_map.get(&(0, 512)), Some(&(3, 2))); // seq=3, idx=2
+        assert_eq!(dedup_map.get(&(512, 512)), Some(&(5, 4))); // seq=5, idx=4
         assert_eq!(dedup_map.get(&(1024, 512)), Some(&(4, 3))); // seq=4, idx=3
     }
 
@@ -1557,9 +1664,9 @@ mod tests {
     #[test]
     fn test_write_dedup_different_sizes() {
         let writes = vec![
-            (0u64, 512usize, 1u64),   // offset=0, len=512, seq=1
-            (0, 1024, 2),             // offset=0, len=1024, seq=2 (different size, not deduped)
-            (0, 512, 3),              // offset=0, len=512, seq=3 (overrides seq=1)
+            (0u64, 512usize, 1u64), // offset=0, len=512, seq=1
+            (0, 1024, 2),           // offset=0, len=1024, seq=2 (different size, not deduped)
+            (0, 512, 3),            // offset=0, len=512, seq=3 (overrides seq=1)
         ];
 
         let mut dedup_map: HashMap<(u64, usize), (u64, usize)> = HashMap::new();
@@ -1568,14 +1675,16 @@ mod tests {
             let key = (offset, len);
             match dedup_map.get(&key) {
                 Some(&(existing_seq, _)) if existing_seq >= seq => {}
-                _ => { dedup_map.insert(key, (seq, idx)); }
+                _ => {
+                    dedup_map.insert(key, (seq, idx));
+                }
             }
         }
 
         // Should have 2 unique writes (different sizes)
         assert_eq!(dedup_map.len(), 2);
-        assert_eq!(dedup_map.get(&(0, 512)), Some(&(3, 2)));    // seq=3
-        assert_eq!(dedup_map.get(&(0, 1024)), Some(&(2, 1)));   // seq=2
+        assert_eq!(dedup_map.get(&(0, 512)), Some(&(3, 2))); // seq=3
+        assert_eq!(dedup_map.get(&(0, 1024)), Some(&(2, 1))); // seq=2
     }
 
     /// Test write queue draining and batching
@@ -1651,8 +1760,12 @@ mod tests {
                     .await
                     .unwrap()
             });
-            assert_eq!(buf, vec![*expected_pattern; 512],
-                "Data mismatch at offset {}", offset);
+            assert_eq!(
+                buf,
+                vec![*expected_pattern; 512],
+                "Data mismatch at offset {}",
+                offset
+            );
         }
     }
 
@@ -1761,9 +1874,8 @@ mod tests {
             offset: 0,
         };
 
-        let (status, len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert_eq!(len, 512);
@@ -1786,9 +1898,8 @@ mod tests {
             offset: 0,
         };
 
-        let (status, len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert_eq!(len, 512);
@@ -1809,9 +1920,8 @@ mod tests {
 
         let request = Request::Flush;
 
-        let (status, len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert_eq!(len, 0);
@@ -1838,9 +1948,8 @@ mod tests {
             buf: make_guard(&mut buf),
         };
 
-        let (status, len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert_eq!(len, backend.image_id.len() as u32);
@@ -1867,9 +1976,8 @@ mod tests {
             len: 512,
         };
 
-        let (status, _len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, _len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert!(matches!(req_type, RequestType::Other));
@@ -1901,9 +2009,8 @@ mod tests {
             unmap: true,
         };
 
-        let (status, _len, req_type) = rt.block_on(async {
-            process_request_async_with_metrics(&backend, request).await
-        });
+        let (status, _len, req_type) =
+            rt.block_on(async { process_request_async_with_metrics(&backend, request).await });
 
         assert_eq!(status, VIRTIO_BLK_S_OK as u8);
         assert!(matches!(req_type, RequestType::Other));
