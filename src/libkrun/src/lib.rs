@@ -2483,6 +2483,16 @@ impl Builder {
         self
     }
 
+    #[cfg(not(feature = "tee"))]
+    pub fn add_virtiofs(&mut self, tag: &str, host_path: &str) -> &mut Self {
+        self.config.vmr.add_fs_device(FsDeviceConfig {
+            fs_id: tag.to_string(),
+            shared_dir: host_path.to_string(),
+            shm_size: None,
+        });
+        self
+    }
+
     #[cfg(feature = "blk")]
     pub fn root_block_cfg(&mut self, block_cfg: BlockDeviceConfig) -> &mut Self {
         self.config.root_block_cfg = Some(block_cfg);
@@ -2550,6 +2560,89 @@ impl Builder {
     pub fn gpu_shm_size(&mut self, shm_size: usize) -> &mut Self {
         self.config.gpu_shm_size = Some(shm_size);
         self
+    }
+
+    pub fn console_output(&mut self, path: PathBuf) -> &mut Self {
+        self.config.console_output = Some(path);
+        self
+    }
+
+    /// Disable the implicit console that is created by default.
+    /// Use this when configuring console ports explicitly.
+    pub fn disable_implicit_console(&mut self) -> &mut Self {
+        self.config.vmr.disable_implicit_console = true;
+        self
+    }
+
+    /// Add a multiport virtio console and return its ID.
+    /// Use the returned ID with `add_console_port_inout` to add ports.
+    pub fn add_virtio_console_multiport(&mut self) -> usize {
+        let console_id = self.config.vmr.virtio_consoles.len();
+        self.config
+            .vmr
+            .virtio_consoles
+            .push(VirtioConsoleConfigMode::Explicit(Vec::new()));
+        console_id
+    }
+
+    /// Add a console port with explicit input/output file descriptors.
+    /// Use -1 for input_fd or output_fd to disable that direction.
+    /// Returns Ok if successful, Err if the console_id is invalid.
+    pub fn add_console_port_inout(
+        &mut self,
+        console_id: usize,
+        name: &str,
+        input_fd: i32,
+        output_fd: i32,
+    ) -> Result<&mut Self, ()> {
+        match self.config.vmr.virtio_consoles.get_mut(console_id) {
+            Some(VirtioConsoleConfigMode::Explicit(ports)) => {
+                ports.push(PortConfig::InOut {
+                    name: name.to_string(),
+                    input_fd,
+                    output_fd,
+                });
+                Ok(self)
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// Add the primary console port with explicit FDs and fixed terminal size.
+    /// This should be the first port added to the console for proper kernel interaction.
+    /// Use -1 for input_fd or output_fd to disable that direction.
+    pub fn add_console_port(
+        &mut self,
+        console_id: usize,
+        input_fd: i32,
+        output_fd: i32,
+    ) -> Result<&mut Self, ()> {
+        self.add_console_port_sized(console_id, input_fd, output_fd, 80, 24)
+    }
+
+    /// Add the primary console port with explicit FDs and specified terminal size.
+    /// This should be the first port added to the console for proper kernel interaction.
+    /// Use -1 for input_fd or output_fd to disable that direction.
+    pub fn add_console_port_sized(
+        &mut self,
+        console_id: usize,
+        input_fd: i32,
+        output_fd: i32,
+        cols: u16,
+        rows: u16,
+    ) -> Result<&mut Self, ()> {
+        match self.config.vmr.virtio_consoles.get_mut(console_id) {
+            Some(VirtioConsoleConfigMode::Explicit(ports)) => {
+                ports.push(PortConfig::Console {
+                    input_fd,
+                    output_fd,
+                    cols,
+                    rows,
+                });
+                Ok(self)
+            }
+            _ => Err(()),
+        }
     }
 
     pub fn vmm_uid(&mut self, vmm_uid: libc::uid_t) -> &mut Self {

@@ -117,6 +117,8 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    VcpuSetVtimerOffset,
+    VcpuGetVtimerOffset,
     VmCreate,
 }
 
@@ -146,6 +148,8 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuSetVtimerOffset => write!(f, "Error setting HVF vCPU vtimer offset"),
+            VcpuGetVtimerOffset => write!(f, "Error getting HVF vCPU vtimer offset"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
@@ -163,6 +167,10 @@ pub trait Vcpus {
     fn get_pending_irq(&self, vcpuid: u64) -> u32;
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64>;
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
+    /// Get the virtual timer offset (CNTVOFF_EL2) for cross-timestamping.
+    /// Returns the offset that converts host counter to guest counter:
+    /// guest_counter = host_counter - vtimer_offset
+    fn get_vtimer_offset(&self, vcpuid: u64) -> Option<u64>;
 }
 
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
@@ -202,6 +210,31 @@ pub fn vcpu_set_vtimer_mask(vcpuid: u64, masked: bool) -> Result<(), Error> {
         Err(Error::VcpuSetVtimerMask)
     } else {
         Ok(())
+    }
+}
+
+/// Set the virtual timer offset (CNTVOFF_EL2) for a vCPU.
+/// This controls the value the guest sees when reading CNTVCT_EL0:
+/// guest_cntvct = host_cntvct - vtimer_offset
+pub fn vcpu_set_vtimer_offset(vcpuid: u64, offset: u64) -> Result<(), Error> {
+    let ret = unsafe { hv_vcpu_set_vtimer_offset(vcpuid, offset) };
+
+    if ret != HV_SUCCESS {
+        Err(Error::VcpuSetVtimerOffset)
+    } else {
+        Ok(())
+    }
+}
+
+/// Get the virtual timer offset (CNTVOFF_EL2) for a vCPU.
+pub fn vcpu_get_vtimer_offset(vcpuid: u64) -> Result<u64, Error> {
+    let mut offset: u64 = 0;
+    let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut offset) };
+
+    if ret != HV_SUCCESS {
+        Err(Error::VcpuGetVtimerOffset)
+    } else {
+        Ok(offset)
     }
 }
 

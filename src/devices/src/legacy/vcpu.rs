@@ -109,6 +109,11 @@ impl VcpuList {
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
+
+        // On macOS with HVF, hv_vcpu_get_vtimer_offset() returns 0, meaning HVF
+        // doesn't virtualize the counter - the guest sees the raw host counter.
+        // We don't need to track an offset for cross-timestamping since we just
+        // return the host counter directly in READ_CROSS responses.
     }
 }
 
@@ -260,5 +265,12 @@ impl Vcpus for VcpuList {
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
         }
+    }
+
+    fn get_vtimer_offset(&self, _vcpuid: u64) -> Option<u64> {
+        // On macOS with HVF, hv_vcpu_get_vtimer_offset() returns 0, meaning HVF
+        // doesn't virtualize the counter - the guest sees the raw host counter.
+        // We return None to indicate no offset is applied.
+        None
     }
 }

@@ -207,6 +207,8 @@ pub enum StartMicrovmError {
     RegisterNetDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
+    /// Cannot initialize a MMIO Rtc device or add a device to the MMIO Bus.
+    RegisterRtcDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Snd device or add a device to the MMIO Bus.
     RegisterSndDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
@@ -451,6 +453,14 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO Rng Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            RegisterRtcDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize a MMIO Rtc Device or add a device to the MMIO Bus. {err_msg}"
                 )
             }
             RegisterSndDevice(ref err) => {
@@ -977,6 +987,13 @@ pub fn build_microvm(
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+    attach_rtc_device(
+        &mut vmm,
+        event_manager,
+        intc.clone(),
+        #[cfg(target_os = "macos")]
+        vcpu_list.clone(),
+    )?;
     let mut console_id = 0;
     if !vm_resources.disable_implicit_console {
         attach_console_devices(
@@ -2096,6 +2113,24 @@ fn create_explicit_ports(
                 },
                 terminal: None,
             },
+            PortConfig::Console {
+                input_fd,
+                output_fd,
+                cols,
+                rows,
+            } => PortDescription::console(
+                if *input_fd < 0 {
+                    None
+                } else {
+                    Some(port_io::input_to_raw_fd_dup(*input_fd).unwrap())
+                },
+                if *output_fd < 0 {
+                    None
+                } else {
+                    Some(port_io::output_to_raw_fd_dup(*output_fd).unwrap())
+                },
+                port_io::term_fixed_size(*cols, *rows),
+            ),
         };
 
         ports.push(port_desc);
@@ -2242,6 +2277,32 @@ fn attach_rng_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+fn attach_rtc_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    #[cfg(target_os = "macos")] vcpu_list: Arc<VcpuList>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let rtc = Arc::new(Mutex::new(devices::virtio::Rtc::new().unwrap()));
+
+    // Set vcpus reference for cross-timestamping support (macOS only)
+    #[cfg(target_os = "macos")]
+    rtc.lock().unwrap().set_vcpus(vcpu_list);
+
+    event_manager
+        .add_subscriber(rtc.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(rtc.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), rtc).map_err(RegisterRtcDevice)?;
 
     Ok(())
 }

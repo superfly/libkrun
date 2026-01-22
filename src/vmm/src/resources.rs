@@ -107,6 +107,14 @@ pub enum PortConfig {
         input_fd: RawFd,
         output_fd: RawFd,
     },
+    /// Console port with explicit FDs and fixed terminal size.
+    /// Use this for the primary console port when not connected to a TTY.
+    Console {
+        input_fd: RawFd,
+        output_fd: RawFd,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// A data structure that encapsulates the device configurations
