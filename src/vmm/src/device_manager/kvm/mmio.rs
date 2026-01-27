@@ -118,6 +118,14 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Returns the count of virtio devices currently registered.
+    pub fn virtio_device_count(&self) -> usize {
+        self.id_to_dev_info
+            .keys()
+            .filter(|(dt, _)| matches!(dt, DeviceType::Virtio(_)))
+            .count()
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,

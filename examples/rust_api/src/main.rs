@@ -320,13 +320,10 @@ async fn main() -> anyhow::Result<()> {
         direct_io: false,
     });
 
-    let ctx = builder.build();
+    let ctx = builder.build()?;
 
-    let ctx_result = tokio::task::spawn_blocking(move || {
-        println!("entering krun vm");
-        ctx.start_enter()
-    })
-    .await?;
+    println!("entering krun vm");
+    let ctx_result = ctx.run();
 
     info!("VM is done, res: {ctx_result:?}");
 

@@ -2,8 +2,6 @@
 extern crate log;
 
 use crossbeam_channel::unbounded;
-#[cfg(feature = "blk")]
-use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "blk")]
@@ -16,8 +14,8 @@ use krun_display::DisplayBackend;
 pub use devices::virtio::block::device::BlockDeviceType;
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{
-    AsyncBlockBackend, AsyncBlockBackendFactory, BlockBackend, BoxFuture, IoVector, IoVectorMut,
-    SendBoxFuture, VolatileSlice, VolatileSliceGuard,
+    AsyncBlockBackend, AsyncBlockBackendFactory, BlockBackend, BoxFuture, ImageType, IoVector,
+    IoVectorMut, SendBoxFuture, SyncMode, VolatileSlice, VolatileSliceGuard,
 };
 #[cfg(feature = "net")]
 pub use devices::virtio::net::device::VirtioNetBackend;
@@ -26,6 +24,10 @@ pub use devices::virtio::net::{
     AsyncNetBackend, AsyncNetBackendFactory, BoxFuture as NetBoxFuture, NetBackendHandle,
     SendBoxFuture as NetSendBoxFuture,
 };
+pub use devices::virtio::port_io::{PortInput, PortOutput};
+#[cfg(not(feature = "tee"))]
+pub use devices::virtio::rng::{OsRngBackend, RngBackend};
+pub use devices::virtio::PortDescription;
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
@@ -50,10 +52,8 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use utils::eventfd::EventFd;
 use vmm::builder::StartMicrovmError;
-use vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
-    VmResources,
-};
+pub use vmm::resources::VirtioConsoleConfigMode;
+use vmm::resources::{DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VmResources};
 #[cfg(feature = "blk")]
 pub use vmm::vmm_config::block::{BlockConfigError, BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -2188,10 +2188,9 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
 
 #[no_mangle]
 pub extern "C" fn krun_disable_implicit_console(ctx_id: u32) -> i32 {
-    with_builder(ctx_id, |cfg| {
-        cfg.config.vmr.disable_implicit_console = true;
-
-        KRUN_SUCCESS
+    with_builder(ctx_id, |cfg| match cfg.disable_implicit_console() {
+        Ok(_) => KRUN_SUCCESS,
+        Err(_) => -libc::EINVAL,
     })
 }
 
@@ -2341,9 +2340,15 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     take_builder(ctx_id, |builder| {
-        let ctx = builder.build();
+        let ctx = match builder.build() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                error!("{e}");
+                return -libc::EINVAL;
+            }
+        };
 
-        match ctx.start_enter() {
+        match ctx.run() {
             Ok(_) => 0,
             Err(e) => {
                 error!("{e}");
@@ -2373,10 +2378,21 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
     })
 }
 
+/// Information about a console device for computing port paths.
+#[derive(Debug, Clone)]
+pub struct ConsoleDeviceInfo {
+    /// The console ID (index in the virtio_consoles array)
+    pub console_id: usize,
+    /// The virtio device index (the X in /dev/vportXpY)
+    pub device_index: u32,
+}
+
 #[derive(Default)]
 pub struct Builder {
     config: ContextConfig,
     kernel_cmdline: Vec<String>,
+    /// Number of console devices added (for computing device paths)
+    console_count: u32,
 }
 
 impl Builder {
@@ -2493,6 +2509,66 @@ impl Builder {
         self
     }
 
+    #[cfg(not(feature = "tee"))]
+    pub fn set_rng_backend(&mut self, backend: Box<dyn RngBackend>) -> &mut Self {
+        self.config.vmr.rng_backend = Some(backend);
+        self
+    }
+
+    /// Compute the virtio device index for the next console to be added.
+    ///
+    /// The device index determines the X in /dev/vportXpY.
+    /// Device order: balloon(1) + rng(1) + rtc(1) + implicit_console(0 or 1) + consoles_added
+    fn next_console_device_index(&self) -> u32 {
+        let mut idx: u32 = 0;
+
+        // balloon (non-TEE only)
+        #[cfg(not(feature = "tee"))]
+        {
+            idx += 1;
+        }
+
+        // rng (non-TEE only)
+        #[cfg(not(feature = "tee"))]
+        {
+            idx += 1;
+        }
+
+        // rtc
+        idx += 1;
+
+        // implicit console (if not disabled)
+        if !self.config.vmr.disable_implicit_console {
+            idx += 1;
+        }
+
+        // consoles already added
+        idx += self.console_count;
+
+        idx
+    }
+
+    /// Add a virtio-console with custom port implementations.
+    ///
+    /// Returns a vector of device paths for each port (e.g., "/dev/vport3p0", "/dev/vport3p1").
+    /// Use these paths to configure your containers before calling `build()`.
+    pub fn add_console(&mut self, ports: Vec<PortDescription>) -> Vec<String> {
+        let device_idx = self.next_console_device_index();
+        let num_ports = ports.len();
+
+        self.config
+            .vmr
+            .virtio_consoles
+            .push(VirtioConsoleConfigMode::Custom(ports));
+
+        self.console_count += 1;
+
+        // Return the expected device paths
+        (0..num_ports)
+            .map(|port_idx| format!("/dev/vport{}p{}", device_idx, port_idx))
+            .collect()
+    }
+
     #[cfg(feature = "blk")]
     pub fn root_block_cfg(&mut self, block_cfg: BlockDeviceConfig) -> &mut Self {
         self.config.root_block_cfg = Some(block_cfg);
@@ -2569,40 +2645,111 @@ impl Builder {
 
     /// Disable the implicit console that is created by default.
     /// Use this when configuring console ports explicitly.
-    pub fn disable_implicit_console(&mut self) -> &mut Self {
+    ///
+    /// **Must be called before adding any console devices**, otherwise the device
+    /// paths returned by `add_console()` / `add_virtio_console_multiport()` would
+    /// be invalidated.
+    ///
+    /// Returns an error if console devices have already been added.
+    pub fn disable_implicit_console(&mut self) -> Result<&mut Self, BuilderError> {
+        if self.console_count > 0 {
+            return Err(BuilderError::ConsoleAlreadyAdded);
+        }
         self.config.vmr.disable_implicit_console = true;
-        self
+        Ok(self)
     }
 
-    /// Add a multiport virtio console and return its ID.
-    /// Use the returned ID with `add_console_port_inout` to add ports.
-    pub fn add_virtio_console_multiport(&mut self) -> usize {
+    /// Add a multiport virtio console and return info for computing port paths.
+    ///
+    /// Use `console_port_path(info.device_index, port_index)` to get the path for each port.
+    /// Ports are added with `add_console_port_*` methods using file descriptors.
+    pub fn add_virtio_console_multiport(&mut self) -> ConsoleDeviceInfo {
         let console_id = self.config.vmr.virtio_consoles.len();
+        let device_index = self.next_console_device_index();
+
         self.config
             .vmr
             .virtio_consoles
             .push(VirtioConsoleConfigMode::Explicit(Vec::new()));
-        console_id
+
+        self.console_count += 1;
+
+        ConsoleDeviceInfo {
+            console_id,
+            device_index,
+        }
+    }
+
+    /// Add a multiport virtio console for custom PortInput/PortOutput implementations.
+    ///
+    /// Use `console_port_path(info.device_index, port_index)` to get the path for each port.
+    /// Ports are added with `add_console_port_description`.
+    pub fn add_virtio_console_multiport_custom(&mut self) -> ConsoleDeviceInfo {
+        let console_id = self.config.vmr.virtio_consoles.len();
+        let device_index = self.next_console_device_index();
+
+        self.config
+            .vmr
+            .virtio_consoles
+            .push(VirtioConsoleConfigMode::Custom(Vec::new()));
+
+        self.console_count += 1;
+
+        ConsoleDeviceInfo {
+            console_id,
+            device_index,
+        }
+    }
+
+    /// Add a port with custom PortInput/PortOutput implementations.
+    ///
+    /// The console must have been created with `add_virtio_console_multiport_custom`.
+    /// Returns the port path on success.
+    pub fn add_console_port_description(
+        &mut self,
+        info: &ConsoleDeviceInfo,
+        port: PortDescription,
+    ) -> Option<String> {
+        self.config
+            .vmr
+            .virtio_consoles
+            .get_mut(info.console_id)
+            .and_then(|config_mode| match config_mode {
+                VirtioConsoleConfigMode::Custom(ports) => {
+                    let port_index = ports.len();
+                    ports.push(port);
+                    Some(Self::console_port_path(info.device_index, port_index))
+                }
+                _ => None,
+            })
+    }
+
+    /// Get the device path for a console port.
+    ///
+    /// Use the `device_index` from `ConsoleDeviceInfo` and the port index (0-based).
+    pub fn console_port_path(device_index: u32, port_index: usize) -> String {
+        format!("/dev/vport{}p{}", device_index, port_index)
     }
 
     /// Add a console port with explicit input/output file descriptors.
     /// Use -1 for input_fd or output_fd to disable that direction.
-    /// Returns Ok if successful, Err if the console_id is invalid.
+    /// Returns the port path on success.
     pub fn add_console_port_inout(
         &mut self,
-        console_id: usize,
+        info: &ConsoleDeviceInfo,
         name: &str,
         input_fd: i32,
         output_fd: i32,
-    ) -> Result<&mut Self, ()> {
-        match self.config.vmr.virtio_consoles.get_mut(console_id) {
+    ) -> Result<String, ()> {
+        match self.config.vmr.virtio_consoles.get_mut(info.console_id) {
             Some(VirtioConsoleConfigMode::Explicit(ports)) => {
+                let port_index = ports.len();
                 ports.push(PortConfig::InOut {
                     name: name.to_string(),
                     input_fd,
                     output_fd,
                 });
-                Ok(self)
+                Ok(Self::console_port_path(info.device_index, port_index))
             }
             _ => Err(()),
         }
@@ -2611,35 +2758,38 @@ impl Builder {
     /// Add the primary console port with explicit FDs and fixed terminal size.
     /// This should be the first port added to the console for proper kernel interaction.
     /// Use -1 for input_fd or output_fd to disable that direction.
+    /// Returns the port path on success.
     pub fn add_console_port(
         &mut self,
-        console_id: usize,
+        info: &ConsoleDeviceInfo,
         input_fd: i32,
         output_fd: i32,
-    ) -> Result<&mut Self, ()> {
-        self.add_console_port_sized(console_id, input_fd, output_fd, 80, 24)
+    ) -> Result<String, ()> {
+        self.add_console_port_sized(info, input_fd, output_fd, 80, 24)
     }
 
     /// Add the primary console port with explicit FDs and specified terminal size.
     /// This should be the first port added to the console for proper kernel interaction.
     /// Use -1 for input_fd or output_fd to disable that direction.
+    /// Returns the port path on success.
     pub fn add_console_port_sized(
         &mut self,
-        console_id: usize,
+        info: &ConsoleDeviceInfo,
         input_fd: i32,
         output_fd: i32,
         cols: u16,
         rows: u16,
-    ) -> Result<&mut Self, ()> {
-        match self.config.vmr.virtio_consoles.get_mut(console_id) {
+    ) -> Result<String, ()> {
+        match self.config.vmr.virtio_consoles.get_mut(info.console_id) {
             Some(VirtioConsoleConfigMode::Explicit(ports)) => {
+                let port_index = ports.len();
                 ports.push(PortConfig::Console {
                     input_fd,
                     output_fd,
                     cols,
                     rows,
                 });
-                Ok(self)
+                Ok(Self::console_port_path(info.device_index, port_index))
             }
             _ => Err(()),
         }
@@ -2672,55 +2822,7 @@ impl Builder {
         self
     }
 
-    pub fn build(self) -> Context {
-        Context {
-            config: self.config,
-            kernel_cmdline: self.kernel_cmdline,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BuildError {
-    #[cfg(feature = "net")]
-    #[error(transparent)]
-    NetworkInterface(#[from] NetworkInterfaceError),
-}
-
-pub struct Context {
-    config: ContextConfig,
-    kernel_cmdline: Vec<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StartError {
-    #[error("could not setup event manager: {0:?}")]
-    EventManager(polly::event_manager::Error),
-    #[error(transparent)]
-    FirmwareLoad(#[from] libloading::Error),
-    #[error("could not find or load firmware {KRUNFW_NAME}")]
-    MissingFirmware,
-    #[cfg(feature = "blk")]
-    #[error(transparent)]
-    BlockConfig(#[from] BlockConfigError),
-    #[error("{0:?}")]
-    TeeConfig(vmm::resources::Error),
-    #[error("missing tee config")]
-    MissingTeeConfig,
-    #[error(transparent)]
-    KernelCmdline(#[from] vmm::vmm_config::kernel_cmdline::KernelCmdlineConfigError),
-    #[error("could not setuid: {0}")]
-    Setuid(std::io::Error),
-    #[error("could not setgid: {0}")]
-    Setgid(std::io::Error),
-    #[error(transparent)]
-    Microvm(#[from] StartMicrovmError),
-    #[error("{0:?}")]
-    EventManagerRun(polly::event_manager::Error),
-}
-
-impl Context {
-    pub fn start_enter(self) -> Result<(), StartError> {
+    pub fn build(self) -> Result<Context, StartError> {
         let mut event_manager = EventManager::new().map_err(StartError::EventManager)?;
 
         let mut ctx_cfg = self.config;
@@ -2742,12 +2844,6 @@ impl Context {
             ctx_cfg.vmr.add_block_device(block_cfg)?;
         }
 
-        /*
-         * Before krun_start_enter() is called in an encrypted context, the TEE
-         * config must have been set via krun_set_tee_config_file(). If the TEE
-         * config is not set by this point, print the relevant error message and
-         * fail.
-         */
         #[cfg(feature = "tee")]
         if let Some(tee_config) = ctx_cfg.get_tee_config_file() {
             ctx_cfg
@@ -2829,9 +2925,6 @@ impl Context {
 
         if vsock_set {
             if vsock_config.enable_tsi {
-                // We only support using TSI for AF_UNIX in a containerized context,
-                // so only enable it when we have a single virtio-fs device pointing
-                // to root.
                 #[cfg(not(feature = "tee"))]
                 if ctx_cfg.vmr.fs.len() == 1 && ctx_cfg.vmr.fs[0].shared_dir == "/" {
                     vsock_config.enable_tsi_unix = true;
@@ -2868,8 +2961,8 @@ impl Context {
 
         let (sender, _receiver) = unbounded();
 
-        let vmm = vmm::builder::build_microvm(
-            &ctx_cfg.vmr,
+        let built_vm = vmm::builder::build_microvm(
+            &mut ctx_cfg.vmr,
             &mut event_manager,
             ctx_cfg.shutdown_efd,
             sender,
@@ -2877,19 +2970,87 @@ impl Context {
 
         #[cfg(target_os = "macos")]
         if ctx_cfg.gpu_virgl_flags.is_some() {
-            vmm::worker::start_worker_thread(vmm.clone(), _receiver).unwrap();
+            vmm::worker::start_worker_thread(built_vm.vmm().clone(), _receiver).unwrap();
         }
 
         #[cfg(target_arch = "x86_64")]
         if ctx_cfg.vmr.split_irqchip {
-            vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+            vmm::worker::start_worker_thread(built_vm.vmm().clone(), _receiver.clone()).unwrap();
         }
 
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+        vmm::worker::start_worker_thread(built_vm.vmm().clone(), _receiver.clone()).unwrap();
 
+        Ok(Context {
+            built_vm,
+            event_manager,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    #[cfg(feature = "net")]
+    #[error(transparent)]
+    NetworkInterface(#[from] NetworkInterfaceError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuilderError {
+    #[error("cannot disable implicit console after adding console devices (would invalidate device paths)")]
+    ConsoleAlreadyAdded,
+}
+
+pub struct Context {
+    built_vm: vmm::builder::BuiltVm,
+    event_manager: EventManager,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error("could not setup event manager: {0:?}")]
+    EventManager(polly::event_manager::Error),
+    #[error(transparent)]
+    FirmwareLoad(#[from] libloading::Error),
+    #[error("could not find or load firmware {KRUNFW_NAME}")]
+    MissingFirmware,
+    #[cfg(feature = "blk")]
+    #[error(transparent)]
+    BlockConfig(#[from] BlockConfigError),
+    #[error("{0:?}")]
+    TeeConfig(vmm::resources::Error),
+    #[error("missing tee config")]
+    MissingTeeConfig,
+    #[error(transparent)]
+    KernelCmdline(#[from] vmm::vmm_config::kernel_cmdline::KernelCmdlineConfigError),
+    #[error("could not setuid: {0}")]
+    Setuid(std::io::Error),
+    #[error("could not setgid: {0}")]
+    Setgid(std::io::Error),
+    #[error(transparent)]
+    Microvm(#[from] StartMicrovmError),
+    #[error("{0:?}")]
+    EventManagerRun(polly::event_manager::Error),
+}
+
+impl Context {
+    /// Access device information (console port paths, etc.).
+    ///
+    /// This returns the actual device paths from the built VM.
+    pub fn device_info(&self) -> &vmm::resources::VmDeviceInfo {
+        &self.built_vm.device_info
+    }
+
+    /// Start the VM and run the event loop. This blocks until the VM exits.
+    pub fn run(mut self) -> Result<(), StartError> {
+        // Start the vCPUs
+        self.built_vm.run()?;
+
+        // Run the event loop
         loop {
-            event_manager.run().map_err(StartError::EventManagerRun)?;
+            self.event_manager
+                .run()
+                .map_err(StartError::EventManagerRun)?;
         }
     }
 }

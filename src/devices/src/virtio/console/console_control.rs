@@ -101,6 +101,7 @@ impl ConsoleControl {
     }
 
     pub fn port_open(&self, port_id: u32, open: bool) {
+        debug!("pushing PORT_OPEN message (port id: {port_id})");
         self.push_msg(VirtioConsoleControl {
             id: port_id,
             event: VIRTIO_CONSOLE_PORT_OPEN,

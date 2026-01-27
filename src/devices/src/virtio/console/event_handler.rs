@@ -41,7 +41,13 @@ impl Console {
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        debug!("console: activate event");
+        debug!(
+            "console: activate event (ports: {:?})",
+            self.ports
+                .iter()
+                .map(|port| (port.port_id, port.name.to_owned()))
+                .collect::<Vec<_>>()
+        );
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume console activate event: {e:?}");
         }
@@ -129,7 +135,9 @@ impl Subscriber for Console {
                 self.read_control_queue_event(event);
                 raise_irq |= self.process_control_rx();
             } else if source == control_rxq {
+                // Guest provided new buffers to control RX queue - try to deliver pending messages
                 raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
+                    && self.process_control_rx()
             }
             /* Guest signaled input/output on port */
             else if let Some(queue_index) = self

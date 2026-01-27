@@ -123,11 +123,16 @@ impl Console {
     }
 
     pub(crate) fn process_control_rx(&mut self) -> bool {
-        log::trace!("process_control_rx");
+        log::trace!("process_control_rx called");
         let DeviceState::Activated(ref mem, _) = self.device_state else {
             unreachable!()
         };
         let mut raise_irq = false;
+
+        log::trace!(
+            "control_rx queue has buffers: {}",
+            !self.queues[CONTROL_RXQ_INDEX].is_empty(mem)
+        );
 
         while let Some(head) = self.queues[CONTROL_RXQ_INDEX].pop(mem) {
             if let Some(buf) = self.control.queue_pop() {
@@ -197,6 +202,14 @@ impl Console {
                     }
                 }
                 control_event::VIRTIO_CONSOLE_PORT_READY => {
+                    debug!(
+                        "sending PORT_READY {cmd:?} (ports: {:?})",
+                        self.ports
+                            .iter()
+                            .map(|port| (port.port_id, port.name.to_owned()))
+                            .collect::<Vec<_>>()
+                    );
+
                     if cmd.value != 1 {
                         log::error!("Port initialization failed: {cmd:?}");
                         continue;

@@ -70,9 +70,9 @@ enum PortState {
 }
 
 pub(crate) struct Port {
-    port_id: u32,
+    pub(crate) port_id: u32,
     /// Empty if no name given
-    name: Cow<'static, str>,
+    pub(crate) name: Cow<'static, str>,
     state: PortState,
     input: Option<Arc<Mutex<Box<dyn PortInput + Send>>>>,
     output: Option<Arc<Mutex<Box<dyn PortOutput + Send>>>>,

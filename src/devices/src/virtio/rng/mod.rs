@@ -4,6 +4,26 @@ mod event_handler;
 pub use self::defs::uapi::VIRTIO_ID_RNG as TYPE_RNG;
 pub use self::device::Rng;
 
+use rand::{rngs::OsRng, TryRngCore};
+use std::io;
+
+/// Trait for RNG backends that provide random bytes to the virtio-rng device.
+pub trait RngBackend: Send {
+    /// Fill the provided buffer with random bytes.
+    fn fill_bytes(&mut self, buf: &mut [u8]) -> io::Result<()>;
+}
+
+/// Default RNG backend using the operating system's random number generator.
+pub struct OsRngBackend;
+
+impl RngBackend for OsRngBackend {
+    fn fill_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        OsRng
+            .try_fill_bytes(buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
 mod defs {
     pub const RNG_DEV_ID: &str = "virtio_rng";
     pub const NUM_QUEUES: usize = 1;

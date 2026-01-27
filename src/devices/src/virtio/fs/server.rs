@@ -1054,27 +1054,72 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn getlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
-        if let Err(e) = self.fs.getlk() {
-            reply_error(e, in_header.unique, w)
-        } else {
-            Ok(0)
+    fn getlk(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.getlk(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh.into(),
+            owner,
+            lk,
+            lk_flags,
+        ) {
+            Ok(result_lock) => {
+                let out = LkOut { lk: result_lock };
+                reply_ok(Some(out), None, in_header.unique, w)
+            }
+            Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
-    fn setlk(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
-        if let Err(e) = self.fs.setlk() {
-            reply_error(e, in_header.unique, w)
-        } else {
-            Ok(0)
+    fn setlk(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.setlk(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh.into(),
+            owner,
+            lk,
+            lk_flags,
+        ) {
+            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 
-    fn setlkw(&self, in_header: InHeader, mut _r: Reader, w: Writer) -> Result<usize> {
-        if let Err(e) = self.fs.setlkw() {
-            reply_error(e, in_header.unique, w)
-        } else {
-            Ok(0)
+    fn setlkw(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+        let LkIn {
+            fh,
+            owner,
+            lk,
+            lk_flags,
+            ..
+        } = r.read_obj().map_err(Error::DecodeMessage)?;
+
+        match self.fs.setlkw(
+            Context::from(in_header),
+            in_header.nodeid.into(),
+            fh.into(),
+            owner,
+            lk,
+            lk_flags,
+        ) {
+            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
+            Err(e) => reply_error(e, in_header.unique, w),
         }
     }
 

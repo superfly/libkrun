@@ -13,7 +13,7 @@ pub use self::port::PortDescription;
 
 mod defs {
     pub const CONSOLE_DEV_ID: &str = "virtio_console";
-    pub const QUEUE_SIZE: u16 = 32;
+    pub const QUEUE_SIZE: u16 = 256;
 
     pub mod uapi {
         /// The device conforms to the virtio spec version 1.0.

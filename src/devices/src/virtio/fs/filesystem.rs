@@ -21,6 +21,7 @@ use super::bindings;
 use super::fuse;
 
 pub use super::fuse::FsOptions;
+pub use fuse::FileLock;
 pub use fuse::OpenOptions;
 pub use fuse::RemovemappingOne;
 pub use fuse::SetattrValid;
@@ -1166,18 +1167,51 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
-    /// TODO: support this
-    fn getlk(&self) -> io::Result<()> {
+    /// Test for a POSIX file lock.
+    ///
+    /// This is used to test if a lock could be placed on the file. If the lock would conflict
+    /// with an existing lock, information about the conflicting lock is returned. Otherwise,
+    /// the `type_` field of the returned `FileLock` should be set to `F_UNLCK`.
+    fn getlk(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<FileLock> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlk(&self) -> io::Result<()> {
+    /// Acquire, modify, or release a POSIX file lock.
+    ///
+    /// This is used to acquire, modify, or release a POSIX file lock. If the lock cannot be
+    /// acquired immediately, the method should return an `EAGAIN` error.
+    fn setlk(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
-    /// TODO: support this
-    fn setlkw(&self) -> io::Result<()> {
+    /// Acquire, modify, or release a POSIX file lock and wait.
+    ///
+    /// This is the same as `setlk`, except that it will block until the lock can be acquired.
+    fn setlkw(
+        &self,
+        ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        owner: u64,
+        lock: FileLock,
+        flags: u32,
+    ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 

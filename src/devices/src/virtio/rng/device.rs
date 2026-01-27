@@ -1,11 +1,10 @@
-use rand::{rngs::OsRng, TryRngCore};
 use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceState, Queue as VirtQueue, RngError, VirtioDevice,
 };
-use super::{defs, defs::uapi};
+use super::{defs, defs::uapi, OsRngBackend, RngBackend};
 use crate::virtio::InterruptTransport;
 
 // Request queue.
@@ -21,10 +20,14 @@ pub struct Rng {
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    backend: Box<dyn RngBackend>,
 }
 
 impl Rng {
-    pub(crate) fn with_queues(queues: Vec<VirtQueue>) -> super::Result<Rng> {
+    fn with_queues_and_backend(
+        queues: Vec<VirtQueue>,
+        backend: Box<dyn RngBackend>,
+    ) -> super::Result<Rng> {
         let mut queue_events = Vec::new();
         for _ in 0..queues.len() {
             queue_events
@@ -38,15 +41,22 @@ impl Rng {
             acked_features: 0,
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(RngError::EventFd)?,
             device_state: DeviceState::Inactive,
+            backend,
         })
     }
 
+    /// Create a new RNG device with the default OS random number generator.
     pub fn new() -> super::Result<Rng> {
+        Self::with_backend(Box::new(OsRngBackend))
+    }
+
+    /// Create a new RNG device with a custom backend.
+    pub fn with_backend(backend: Box<dyn RngBackend>) -> super::Result<Rng> {
         let queues: Vec<VirtQueue> = defs::QUEUE_SIZES
             .iter()
             .map(|&max_size| VirtQueue::new(max_size))
             .collect();
-        Self::with_queues(queues)
+        Self::with_queues_and_backend(queues, backend)
     }
 
     pub fn id(&self) -> &str {
@@ -68,7 +78,7 @@ impl Rng {
             let mut written = 0;
             for desc in head.into_iter() {
                 let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
+                if let Err(e) = self.backend.fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
                     self.queues[REQ_INDEX].go_to_previous_position();
                     break;

@@ -158,14 +158,10 @@ async fn main() {
         NET_ALL_FEATURES,
     );
 
-    let ctx = builder.build();
+    let ctx = builder.build().expect("failed to build VM");
 
-    let ctx_result = tokio::task::spawn_blocking(move || {
-        println!("entering krun vm");
-        ctx.start_enter()
-    })
-    .await
-    .unwrap();
+    println!("entering krun vm");
+    let ctx_result = ctx.run();
 
     info!("VM is done, res: {ctx_result:?}");
 }

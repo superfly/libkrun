@@ -24,7 +24,8 @@ use super::{Error, Vmm};
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmResources,
+    ConsolePortInfo, DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode,
+    VmDeviceInfo, VmResources,
 };
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
@@ -572,12 +573,42 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
+/// A built microVM ready to run. Access `device_info` before calling `run()`.
+pub struct BuiltVm {
+    vmm: Arc<Mutex<Vmm>>,
+    vcpus: Option<Vec<Vcpu>>,
+    /// Device information populated during build - access this before calling `run()`.
+    pub device_info: VmDeviceInfo,
+}
+
+impl BuiltVm {
+    /// Returns a reference to the VMM.
+    pub fn vmm(&self) -> &Arc<Mutex<Vmm>> {
+        &self.vmm
+    }
+
+    /// Start the vCPUs and run the microVM.
+    ///
+    /// After calling this, the VM is running. Returns the VMM handle.
+    pub fn run(&mut self) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+        let vcpus = self.vcpus.take().ok_or(StartMicrovmError::MicroVMAlreadyRunning)?;
+        self.vmm
+            .lock()
+            .expect("Poisoned vmm lock")
+            .start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+        Ok(self.vmm.clone())
+    }
+}
+
 pub fn build_microvm(
-    vm_resources: &super::resources::VmResources,
+    vm_resources: &mut super::resources::VmResources,
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
-) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+) -> std::result::Result<BuiltVm, StartMicrovmError> {
+    let mut device_info = VmDeviceInfo::default();
+
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -986,7 +1017,12 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
-    attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+    attach_rng_device(
+        &mut vmm,
+        event_manager,
+        intc.clone(),
+        vm_resources.rng_backend.take(),
+    )?;
     attach_rtc_device(
         &mut vmm,
         event_manager,
@@ -1003,11 +1039,12 @@ pub fn build_microvm(
             vm_resources,
             None,
             console_id,
+            &mut device_info,
         )?;
         console_id += 1;
     }
 
-    for console_cfg in vm_resources.virtio_consoles.iter() {
+    for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
         attach_console_devices(
             &mut vmm,
             event_manager,
@@ -1015,6 +1052,7 @@ pub fn build_microvm(
             vm_resources,
             Some(console_cfg),
             console_id,
+            &mut device_info,
         )?;
         console_id += 1;
     }
@@ -1136,9 +1174,6 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    vmm.start_vcpus(vcpus)
-        .map_err(StartMicrovmError::Internal)?;
-
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1147,7 +1182,11 @@ pub fn build_microvm(
         .add_subscriber(vmm.clone())
         .map_err(StartMicrovmError::RegisterEvent)?;
 
-    Ok(vmm)
+    Ok(BuiltVm {
+        vmm,
+        vcpus: Some(vcpus),
+        device_info,
+    })
 }
 
 fn load_external_kernel(
@@ -2144,8 +2183,9 @@ fn attach_console_devices(
     event_manager: &mut EventManager,
     intc: IrqChip,
     vm_resources: &VmResources,
-    cfg: Option<&VirtioConsoleConfigMode>,
+    cfg: Option<VirtioConsoleConfigMode>,
     id_number: u32,
+    device_info: &mut VmDeviceInfo,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -2153,14 +2193,33 @@ fn attach_console_devices(
 
     let ports = match cfg {
         None => autoconfigure_console_ports(vmm, vm_resources, None, creating_implicit_console)?,
-        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => autoconfigure_console_ports(
+        Some(VirtioConsoleConfigMode::Autoconfigure(ref autocfg)) => autoconfigure_console_ports(
             vmm,
             vm_resources,
             Some(autocfg),
             creating_implicit_console,
         )?,
-        Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
+        Some(VirtioConsoleConfigMode::Explicit(ref ports)) => create_explicit_ports(vmm, ports)?,
+        Some(VirtioConsoleConfigMode::Custom(ports)) => ports,
     };
+
+    // Record the device index before registering (this is the X in /dev/vportXpY)
+    let device_idx = vmm.mmio_device_manager.virtio_device_count();
+
+    // Record port information for each port
+    for (port_idx, port) in ports.iter().enumerate() {
+        let name = if port.name.is_empty() {
+            None
+        } else {
+            Some(port.name.to_string())
+        };
+        device_info.console_ports.push(ConsolePortInfo {
+            console_id: id_number,
+            port_id: port_idx as u32,
+            device_path: format!("/dev/vport{}p{}", device_idx, port_idx),
+            name,
+        });
+    }
 
     let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
 
@@ -2264,10 +2323,16 @@ fn attach_rng_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    rng_backend: Option<Box<dyn devices::virtio::RngBackend>>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let rng = Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap()));
+    let rng = match rng_backend {
+        Some(backend) => Arc::new(Mutex::new(
+            devices::virtio::Rng::with_backend(backend).unwrap(),
+        )),
+        None => Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap())),
+    };
 
     event_manager
         .add_subscriber(rng.clone())

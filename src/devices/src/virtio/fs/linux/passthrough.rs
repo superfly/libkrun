@@ -846,6 +846,27 @@ fn forget_one(
             }
         }
     }
+
+}
+
+/// Convert FUSE lock start/end to flock l_len.
+/// FUSE uses end=0 or end=u64::MAX to mean "until EOF", which maps to l_len=0 in flock.
+fn fuse_lock_to_len(start: u64, end: u64) -> libc::off_t {
+    if end == 0 || end == u64::MAX {
+        0 // l_len=0 means "until EOF"
+    } else {
+        (end.saturating_sub(start).saturating_add(1)) as libc::off_t
+    }
+}
+
+/// Convert flock l_start/l_len back to FUSE end field.
+/// l_len=0 means "until EOF", which we represent as end=u64::MAX.
+fn flock_len_to_end(start: u64, len: libc::off_t) -> u64 {
+    if len == 0 {
+        u64::MAX // "until EOF"
+    } else {
+        start.saturating_add(len as u64).saturating_sub(1)
+    }
 }
 
 impl FileSystem for PassthroughFs {
@@ -2176,6 +2197,122 @@ impl FileSystem for PassthroughFs {
                 Ok(Vec::new())
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        }
+    }
+
+    fn getlk(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _owner: u64,
+        lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<fuse::FileLock> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let fd = data.file.read().unwrap().as_raw_fd();
+
+        let mut flock = libc::flock {
+            l_type: lock.type_ as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: lock.start as libc::off_t,
+            l_len: fuse_lock_to_len(lock.start, lock.end),
+            l_pid: 0,
+        };
+
+        // Safe because this only modifies flock and we check the return value.
+        let res = unsafe { libc::fcntl(fd, libc::F_GETLK, &mut flock) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(fuse::FileLock {
+            start: flock.l_start as u64,
+            end: flock_len_to_end(flock.l_start as u64, flock.l_len),
+            type_: flock.l_type as u32,
+            pid: flock.l_pid as u32,
+        })
+    }
+
+    fn setlk(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _owner: u64,
+        lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let fd = data.file.read().unwrap().as_raw_fd();
+
+        let flock = libc::flock {
+            l_type: lock.type_ as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: lock.start as libc::off_t,
+            l_len: fuse_lock_to_len(lock.start, lock.end),
+            l_pid: 0,
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::fcntl(fd, libc::F_SETLK, &flock) };
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn setlkw(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _owner: u64,
+        lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
+        let data = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let fd = data.file.read().unwrap().as_raw_fd();
+
+        let flock = libc::flock {
+            l_type: lock.type_ as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: lock.start as libc::off_t,
+            l_len: fuse_lock_to_len(lock.start, lock.end),
+            l_pid: 0,
+        };
+
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::fcntl(fd, libc::F_SETLKW, &flock) };
+        if res < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }

@@ -37,6 +37,26 @@ use krun_display::DisplayBackend;
 
 type Result<E> = std::result::Result<(), E>;
 
+/// Information about a virtio-console port device path.
+#[derive(Debug, Clone)]
+pub struct ConsolePortInfo {
+    /// Console device index (for multiple console devices)
+    pub console_id: u32,
+    /// Port index within the console device
+    pub port_id: u32,
+    /// Expected device path inside the VM (e.g., "/dev/vport3p0")
+    pub device_path: String,
+    /// Port name if one was configured
+    pub name: Option<String>,
+}
+
+/// Information about VM devices, populated during build.
+#[derive(Debug, Clone, Default)]
+pub struct VmDeviceInfo {
+    /// Information about virtio-console ports
+    pub console_ports: Vec<ConsolePortInfo>,
+}
+
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug)]
 pub enum Error {
@@ -95,6 +115,8 @@ pub struct DefaultVirtioConsoleConfig {
 pub enum VirtioConsoleConfigMode {
     Autoconfigure(DefaultVirtioConsoleConfig),
     Explicit(Vec<PortConfig>),
+    /// Custom port descriptions with user-provided PortInput/PortOutput implementations.
+    Custom(Vec<devices::virtio::PortDescription>),
 }
 
 pub enum PortConfig {
@@ -182,6 +204,9 @@ pub struct VmResources {
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
+    /// Custom RNG backend
+    #[cfg(not(feature = "tee"))]
+    pub rng_backend: Option<Box<dyn devices::virtio::RngBackend>>,
 }
 
 impl VmResources {
@@ -425,6 +450,8 @@ mod tests {
             kernel_console: None,
             #[cfg(feature = "blk")]
             block: Default::default(),
+            #[cfg(not(feature = "tee"))]
+            rng_backend: None,
         }
     }
 
