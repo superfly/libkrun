@@ -17,6 +17,8 @@ input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
 nitro = []
 test_utils = []
+# Embed the init binary in the library. Disable this if you provide a custom init.
+embedded_init = []
 
 [dependencies]
 bitflags = "1.2.0"

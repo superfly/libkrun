@@ -17,6 +17,8 @@ snd = []
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = []
 nitro = [ "dep:nitro", "dep:nitro-enclaves" ]
+# Embed the init binary. Disable if you provide a custom init.
+embedded_init = ["devices/embedded_init"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"

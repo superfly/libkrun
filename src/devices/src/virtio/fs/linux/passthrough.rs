@@ -33,7 +33,11 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 
+#[cfg(feature = "embedded_init")]
 static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
+
+#[cfg(not(feature = "embedded_init"))]
+static INIT_BINARY: &[u8] = &[];
 
 type Inode = u64;
 type Handle = u64;

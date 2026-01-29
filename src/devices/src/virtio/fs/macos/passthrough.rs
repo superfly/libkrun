@@ -35,7 +35,11 @@ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 
 const UID_MAX: u32 = u32::MAX - 1;
 
+#[cfg(feature = "embedded_init")]
 static INIT_BINARY: &[u8] = include_bytes!("../../../../../../init/init");
+
+#[cfg(not(feature = "embedded_init"))]
+static INIT_BINARY: &[u8] = &[];
 
 type Inode = u64;
 type Handle = u64;
