@@ -2047,8 +2047,9 @@ fn autoconfigure_console_ports(
             }
         };
 
-        let console_output = if output_is_terminal && output_fd >= 0 {
-            Some(port_io::output_to_raw_fd_dup(output_fd).unwrap())
+        let console_output = if output_fd >= 0 {
+            // Use blocking mode to avoid making caller's stdio non-blocking
+            Some(port_io::output_to_raw_fd_dup_blocking(output_fd).unwrap())
         } else {
             Some(port_io::output_to_log_as_err())
         };

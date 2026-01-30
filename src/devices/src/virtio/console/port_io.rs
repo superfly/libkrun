@@ -44,11 +44,11 @@ pub fn input_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortInput + Send>, nix::
 }
 
 pub fn stdout() -> Result<Box<dyn PortOutput + Send>, nix::Error> {
-    output_to_raw_fd_dup(STDOUT_FILENO)
+    output_to_raw_fd_dup_blocking(STDOUT_FILENO)
 }
 
 pub fn stderr() -> Result<Box<dyn PortOutput + Send>, nix::Error> {
-    output_to_raw_fd_dup(STDERR_FILENO)
+    output_to_raw_fd_dup_blocking(STDERR_FILENO)
 }
 
 pub fn term_fd(
@@ -77,6 +77,15 @@ pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, nix::Error>
 pub fn output_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(fd)?;
     make_non_blocking(&fd)?;
+    Ok(Box::new(PortOutputFd(fd)))
+}
+
+/// Like output_to_raw_fd_dup but keeps the fd in blocking mode.
+/// Use this for stdout/stderr to avoid making the caller's stdio non-blocking.
+pub fn output_to_raw_fd_dup_blocking(fd: RawFd) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
+    let fd = dup_raw_fd_into_owned(fd)?;
+    // Don't set non-blocking - the dup'd fd shares the file description,
+    // so setting O_NONBLOCK would affect the original fd too.
     Ok(Box::new(PortOutputFd(fd)))
 }
 

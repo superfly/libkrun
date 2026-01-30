@@ -24,7 +24,7 @@ pub use devices::virtio::net::{
     AsyncNetBackend, AsyncNetBackendFactory, BoxFuture as NetBoxFuture, NetBackendHandle,
     SendBoxFuture as NetSendBoxFuture,
 };
-pub use devices::virtio::port_io::{PortInput, PortOutput};
+pub use devices::virtio::port_io::{self, PortInput, PortOutput};
 #[cfg(not(feature = "tee"))]
 pub use devices::virtio::rng::{OsRngBackend, RngBackend};
 pub use devices::virtio::PortDescription;
@@ -2548,11 +2548,12 @@ impl Builder {
         idx
     }
 
-    /// Add a virtio-console with custom port implementations.
+    /// Add a virtio-console with all ports at once.
     ///
     /// Returns a vector of device paths for each port (e.g., "/dev/vport3p0", "/dev/vport3p1").
-    /// Use these paths to configure your containers before calling `build()`.
-    pub fn add_console(&mut self, ports: Vec<PortDescription>) -> Vec<String> {
+    ///
+    /// For incremental port addition, use `add_virtio_console()` followed by `add_port()`.
+    pub fn add_virtio_console_with_ports(&mut self, ports: Vec<PortDescription>) -> Vec<String> {
         let device_idx = self.next_console_device_index();
         let num_ports = ports.len();
 
@@ -2647,7 +2648,7 @@ impl Builder {
     /// Use this when configuring console ports explicitly.
     ///
     /// **Must be called before adding any console devices**, otherwise the device
-    /// paths returned by `add_console()` / `add_virtio_console_multiport()` would
+    /// paths returned by `add_virtio_console()` / `add_virtio_console_with_ports()` would
     /// be invalidated.
     ///
     /// Returns an error if console devices have already been added.
@@ -2662,29 +2663,8 @@ impl Builder {
     /// Add a multiport virtio console and return info for computing port paths.
     ///
     /// Use `console_port_path(info.device_index, port_index)` to get the path for each port.
-    /// Ports are added with `add_console_port_*` methods using file descriptors.
-    pub fn add_virtio_console_multiport(&mut self) -> ConsoleDeviceInfo {
-        let console_id = self.config.vmr.virtio_consoles.len();
-        let device_index = self.next_console_device_index();
-
-        self.config
-            .vmr
-            .virtio_consoles
-            .push(VirtioConsoleConfigMode::Explicit(Vec::new()));
-
-        self.console_count += 1;
-
-        ConsoleDeviceInfo {
-            console_id,
-            device_index,
-        }
-    }
-
-    /// Add a multiport virtio console for custom PortInput/PortOutput implementations.
-    ///
-    /// Use `console_port_path(info.device_index, port_index)` to get the path for each port.
-    /// Ports are added with `add_console_port_description`.
-    pub fn add_virtio_console_multiport_custom(&mut self) -> ConsoleDeviceInfo {
+    /// Ports are added with `add_port()` or the convenience methods `add_port_fd()` / `add_port_console_fd()`.
+    pub fn add_virtio_console(&mut self) -> ConsoleDeviceInfo {
         let console_id = self.config.vmr.virtio_consoles.len();
         let device_index = self.next_console_device_index();
 
@@ -2701,15 +2681,10 @@ impl Builder {
         }
     }
 
-    /// Add a port with custom PortInput/PortOutput implementations.
+    /// Add a port with a custom PortDescription.
     ///
-    /// The console must have been created with `add_virtio_console_multiport_custom`.
-    /// Returns the port path on success.
-    pub fn add_console_port_description(
-        &mut self,
-        info: &ConsoleDeviceInfo,
-        port: PortDescription,
-    ) -> Option<String> {
+    /// Returns the port path on success (e.g., "/dev/vport3p0").
+    pub fn add_port(&mut self, info: &ConsoleDeviceInfo, port: PortDescription) -> Option<String> {
         self.config
             .vmr
             .virtio_consoles
@@ -2724,75 +2699,70 @@ impl Builder {
             })
     }
 
-    /// Get the device path for a console port.
+    /// Add a port using file descriptors for input/output.
     ///
-    /// Use the `device_index` from `ConsoleDeviceInfo` and the port index (0-based).
-    pub fn console_port_path(device_index: u32, port_index: usize) -> String {
-        format!("/dev/vport{}p{}", device_index, port_index)
-    }
-
-    /// Add a console port with explicit input/output file descriptors.
-    /// Use -1 for input_fd or output_fd to disable that direction.
-    /// Returns the port path on success.
-    pub fn add_console_port_inout(
+    /// Use -1 for `input_fd` or `output_fd` to disable that direction.
+    /// Returns the port path on success (e.g., "/dev/vport3p0").
+    pub fn add_port_fd(
         &mut self,
         info: &ConsoleDeviceInfo,
         name: &str,
         input_fd: i32,
         output_fd: i32,
-    ) -> Result<String, ()> {
-        match self.config.vmr.virtio_consoles.get_mut(info.console_id) {
-            Some(VirtioConsoleConfigMode::Explicit(ports)) => {
-                let port_index = ports.len();
-                ports.push(PortConfig::InOut {
-                    name: name.to_string(),
-                    input_fd,
-                    output_fd,
-                });
-                Ok(Self::console_port_path(info.device_index, port_index))
-            }
-            _ => Err(()),
-        }
+    ) -> Option<String> {
+        let port = PortDescription {
+            name: name.to_string().into(),
+            input: if input_fd < 0 {
+                None
+            } else {
+                Some(port_io::input_to_raw_fd_dup(input_fd).ok()?)
+            },
+            output: if output_fd < 0 {
+                None
+            } else {
+                Some(port_io::output_to_raw_fd_dup_blocking(output_fd).ok()?)
+            },
+            terminal: None,
+        };
+        self.add_port(info, port)
     }
 
-    /// Add the primary console port with explicit FDs and fixed terminal size.
-    /// This should be the first port added to the console for proper kernel interaction.
-    /// Use -1 for input_fd or output_fd to disable that direction.
-    /// Returns the port path on success.
-    pub fn add_console_port(
-        &mut self,
-        info: &ConsoleDeviceInfo,
-        input_fd: i32,
-        output_fd: i32,
-    ) -> Result<String, ()> {
-        self.add_console_port_sized(info, input_fd, output_fd, 80, 24)
-    }
-
-    /// Add the primary console port with explicit FDs and specified terminal size.
-    /// This should be the first port added to the console for proper kernel interaction.
-    /// Use -1 for input_fd or output_fd to disable that direction.
-    /// Returns the port path on success.
-    pub fn add_console_port_sized(
+    /// Add a console port with file descriptors and fixed terminal size.
+    ///
+    /// This creates a port marked as a console (receives VIRTIO_CONSOLE_CONSOLE_PORT message),
+    /// which the guest kernel recognizes as /dev/hvcN.
+    ///
+    /// Use -1 for `input_fd` or `output_fd` to disable that direction.
+    /// Returns the port path on success (e.g., "/dev/vport3p0").
+    pub fn add_port_console_fd(
         &mut self,
         info: &ConsoleDeviceInfo,
         input_fd: i32,
         output_fd: i32,
         cols: u16,
         rows: u16,
-    ) -> Result<String, ()> {
-        match self.config.vmr.virtio_consoles.get_mut(info.console_id) {
-            Some(VirtioConsoleConfigMode::Explicit(ports)) => {
-                let port_index = ports.len();
-                ports.push(PortConfig::Console {
-                    input_fd,
-                    output_fd,
-                    cols,
-                    rows,
-                });
-                Ok(Self::console_port_path(info.device_index, port_index))
-            }
-            _ => Err(()),
-        }
+    ) -> Option<String> {
+        let port = PortDescription::console(
+            if input_fd < 0 {
+                None
+            } else {
+                Some(port_io::input_to_raw_fd_dup(input_fd).ok()?)
+            },
+            if output_fd < 0 {
+                None
+            } else {
+                Some(port_io::output_to_raw_fd_dup_blocking(output_fd).ok()?)
+            },
+            port_io::term_fixed_size(cols, rows),
+        );
+        self.add_port(info, port)
+    }
+
+    /// Get the device path for a console port.
+    ///
+    /// Use the `device_index` from `ConsoleDeviceInfo` and the port index (0-based).
+    pub fn console_port_path(device_index: u32, port_index: usize) -> String {
+        format!("/dev/vport{}p{}", device_index, port_index)
     }
 
     pub fn vmm_uid(&mut self, vmm_uid: libc::uid_t) -> &mut Self {
