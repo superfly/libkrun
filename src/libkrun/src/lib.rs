@@ -48,8 +48,7 @@ use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
 use utils::eventfd::EventFd;
 use vmm::builder::StartMicrovmError;
 pub use vmm::resources::VirtioConsoleConfigMode;
@@ -3011,6 +3010,14 @@ impl Context {
         &self.built_vm.device_info
     }
 
+    /// Returns a `VmHandle` that can be used to pause/resume the VM from another thread.
+    /// Must be called before `run()`, since `run()` consumes `self`.
+    pub fn vm_handle(&self) -> VmHandle {
+        VmHandle {
+            vmm: self.built_vm.vmm().clone(),
+        }
+    }
+
     /// Start the VM and run the event loop. This blocks until the VM exits.
     pub fn run(mut self) -> Result<(), StartError> {
         // Start the vCPUs
@@ -3022,5 +3029,109 @@ impl Context {
                 .run()
                 .map_err(StartError::EventManagerRun)?;
         }
+    }
+}
+
+/// Handle for controlling a running VM from another thread.
+///
+/// Obtain via `Context::vm_handle()` before calling `Context::run()`.
+#[derive(Clone)]
+pub struct VmHandle {
+    vmm: Arc<Mutex<vmm::Vmm>>,
+}
+
+impl VmHandle {
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    fn snapshot_err_to_start_error(e: vmm::snapshot::SnapshotError) -> StartError {
+        StartError::Microvm(vmm::builder::StartMicrovmError::Internal(
+            vmm::Error::EventFd(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )),
+        ))
+    }
+
+    /// Pause all vCPUs. Blocks until all vCPUs have acknowledged the pause.
+    pub fn pause(&self) -> Result<(), StartError> {
+        self.vmm
+            .lock()
+            .expect("Poisoned vmm lock")
+            .pause_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))
+    }
+
+    /// Resume all vCPUs. Blocks until all vCPUs have acknowledged the resume.
+    pub fn resume(&self) -> Result<(), StartError> {
+        self.vmm
+            .lock()
+            .expect("Poisoned vmm lock")
+            .resume_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))
+    }
+
+    /// Create a full snapshot of the VM. Pauses vCPUs, takes snapshot, resumes vCPUs.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+        vmm.pause_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        let result = vmm
+            .create_snapshot(path)
+            .map_err(Self::snapshot_err_to_start_error);
+        vmm.resume_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        result
+    }
+
+    /// Restore a full snapshot into the running VM. Pauses vCPUs, restores, resumes vCPUs.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+        vmm.pause_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        let result = vmm
+            .restore_snapshot(path)
+            .map_err(Self::snapshot_err_to_start_error);
+        vmm.resume_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        result
+    }
+
+    /// Enable dirty page tracking for incremental snapshots.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn enable_dirty_tracking(&self) -> Result<(), StartError> {
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+        vmm.enable_dirty_tracking()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))
+    }
+
+    /// Create an incremental snapshot (dirty pages only).
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn incremental_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+        vmm.pause_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        let result = vmm
+            .create_incremental_snapshot(path)
+            .map_err(Self::snapshot_err_to_start_error);
+        vmm.resume_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        result
+    }
+
+    /// Restore an incremental snapshot into the running VM.
+    ///
+    /// This applies dirty pages and state on top of the current memory image.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_incremental_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+        vmm.pause_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        let result = vmm
+            .restore_incremental_snapshot(path)
+            .map_err(Self::snapshot_err_to_start_error);
+        vmm.resume_vcpus()
+            .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))?;
+        result
     }
 }

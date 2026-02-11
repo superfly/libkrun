@@ -16,11 +16,17 @@ extern crate log;
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+/// Dirty page bitmap for incremental snapshots.
+#[cfg(target_os = "macos")]
+pub mod dirty_bitmap;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+/// VM snapshot and restore support.
+#[cfg(target_os = "macos")]
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
@@ -41,13 +47,11 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
@@ -63,6 +67,8 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use vm_memory::Address;
 use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
@@ -124,6 +130,8 @@ pub enum Error {
     VcpuEvent(vstate::Error),
     /// Cannot create a vCPU handle.
     VcpuHandle(vstate::Error),
+    /// vCPU pause failed.
+    VcpuPause,
     /// vCPU resume failed.
     VcpuResume,
     /// Cannot spawn a new Vcpu thread.
@@ -160,6 +168,7 @@ impl Display for Error {
             Vcpu(e) => write!(f, "Vcpu error: {e}"),
             VcpuEvent(e) => write!(f, "Cannot send event to vCPU. {e:?}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
+            VcpuPause => write!(f, "vCPUs pause failed."),
             VcpuResume => write!(f, "vCPUs resume failed."),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
@@ -207,6 +216,8 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    #[cfg(target_os = "macos")]
+    dirty_bitmaps: Vec<dirty_bitmap::DirtyBitmap>,
 }
 
 impl Vmm {
@@ -240,8 +251,48 @@ impl Vmm {
         Ok(())
     }
 
+    /// Sends a pause command to all vcpus and waits for confirmation.
+    pub fn pause_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::Pause)
+                .map_err(Error::VcpuEvent)?;
+        }
+        for handle in self.vcpus_handles.iter() {
+            match handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(1000))
+            {
+                Ok(VcpuResponse::Paused) => (),
+                _ => return Err(Error::VcpuPause),
+            }
+        }
+        Ok(())
+    }
+
+    /// Save all vCPU states. vCPUs must already be paused.
+    #[cfg(target_os = "macos")]
+    pub fn save_vcpu_states(&self) -> Result<Vec<hvf::Aarch64VcpuState>> {
+        let mut states = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in self.vcpus_handles.iter() {
+            states.push(handle.save_state().map_err(Error::Vcpu)?);
+        }
+        Ok(states)
+    }
+
+    /// Restore all vCPU states. vCPUs must already be paused.
+    #[cfg(target_os = "macos")]
+    pub fn restore_vcpu_states(&self, states: Vec<hvf::Aarch64VcpuState>) -> Result<()> {
+        if states.len() != self.vcpus_handles.len() {
+            return Err(Error::VcpuPause);
+        }
+        for (handle, state) in self.vcpus_handles.iter().zip(states.into_iter()) {
+            handle.restore_state(state).map_err(Error::Vcpu)?;
+        }
+        Ok(())
+    }
+
     /// Sends a resume command to the vcpus.
-    #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
         for handle in self.vcpus_handles.iter() {
             handle
@@ -257,11 +308,6 @@ impl Vmm {
                 _ => return Err(Error::VcpuResume),
             }
         }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn resume_vcpus(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -337,9 +383,231 @@ impl Vmm {
         Ok(())
     }
 
-    /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
+    /// Returns a reference to the guest memory.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
+    }
+
+    /// Returns a reference to the arch memory info.
+    pub fn arch_memory_info(&self) -> &ArchMemoryInfo {
+        &self.arch_memory_info
+    }
+
+    /// Create a full snapshot of the VM. vCPUs must already be paused.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn create_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        let device_states = self
+            .mmio_device_manager
+            .save_all_device_states()
+            .map_err(|e| {
+                snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
+            })?;
+
+        snapshot::create_full_snapshot(
+            path,
+            &self.guest_memory,
+            vcpu_states,
+            device_states,
+            false, // TODO: get nested_enabled from VM config
+        )
+    }
+
+    /// Restore a full snapshot into the running VM. vCPUs must already be paused.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let vmstate = snapshot::load_vmstate(&path.join("vmstate"))?;
+        snapshot::validate_header_for_vm(
+            &vmstate.header,
+            &self.guest_memory,
+            self.vcpus_handles.len(),
+        )?;
+
+        snapshot::load_memory(&self.guest_memory, &path.join("memory"))?;
+        self.mmio_device_manager
+            .restore_all_device_states(&vmstate.device_states)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to restore device states: {e}"
+                ))
+            })?;
+        self.restore_vcpu_states(vmstate.vcpu_states).map_err(|e| {
+            snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// Enable dirty page tracking. vCPUs must be paused.
+    /// After this call, all RAM writes will be tracked via write-protect faults.
+    #[cfg(target_os = "macos")]
+    pub fn enable_dirty_tracking(&mut self) -> Result<()> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+        self.dirty_bitmaps.clear();
+        let mut ram_regions = Vec::new();
+        for region in self.guest_memory.iter() {
+            let base = region.start_addr().raw_value();
+            let size = region.len();
+            self.dirty_bitmaps
+                .push(dirty_bitmap::DirtyBitmap::new(base, size));
+            ram_regions.push((base, size));
+
+            Vm::protect_memory(base, size, true, false, true).map_err(Error::Vm)?;
+        }
+
+        let bitmaps_ptr = &self.dirty_bitmaps as *const Vec<dirty_bitmap::DirtyBitmap>;
+        for handle in self.vcpus_handles.iter() {
+            let bitmaps_ptr_copy = bitmaps_ptr as usize;
+            let ram_regions_clone = ram_regions.clone();
+
+            let callback: hvf::DirtyCallback = Box::new(move |page_addr| {
+                let bitmaps =
+                    unsafe { &*(bitmaps_ptr_copy as *const Vec<dirty_bitmap::DirtyBitmap>) };
+                for bitmap in bitmaps.iter() {
+                    if bitmap.contains(page_addr) {
+                        bitmap.mark_dirty(page_addr);
+                        return;
+                    }
+                }
+            });
+
+            let config = crate::vstate::DirtyTrackingConfig {
+                ram_regions: ram_regions_clone,
+                dirty_callback: callback,
+            };
+
+            handle
+                .send_event(VcpuEvent::EnableDirtyTracking(Box::new(config)))
+                .map_err(Error::VcpuEvent)?;
+        }
+
+        Ok(())
+    }
+
+    /// Disable dirty page tracking. vCPUs must be paused.
+    #[cfg(target_os = "macos")]
+    pub fn disable_dirty_tracking(&mut self) -> Result<()> {
+        use vm_memory::{GuestMemory, GuestMemoryRegion};
+
+        for region in self.guest_memory.iter() {
+            let base = region.start_addr().raw_value();
+            let size = region.len();
+            Vm::protect_memory(base, size, true, true, true).map_err(Error::Vm)?;
+        }
+
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::DisableDirtyTracking)
+                .map_err(Error::VcpuEvent)?;
+        }
+
+        self.dirty_bitmaps.clear();
+        Ok(())
+    }
+
+    /// Create an incremental snapshot (dirty pages only). vCPUs must be paused.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn create_incremental_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        use vm_memory::{GuestAddress, GuestMemory, GuestMemoryRegion};
+
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        let device_states = self
+            .mmio_device_manager
+            .save_all_device_states()
+            .map_err(|e| {
+                snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
+            })?;
+
+        let mut dirty_pages = Vec::new();
+        for bitmap in &self.dirty_bitmaps {
+            let dirty_addrs = bitmap.drain_dirty_pages();
+            for addr in dirty_addrs {
+                let host_ptr = self
+                    .guest_memory
+                    .get_host_address(GuestAddress(addr))
+                    .map_err(|e| {
+                        snapshot::SnapshotError::Serialize(format!(
+                            "Invalid guest address for dirty page 0x{addr:x}: {e}"
+                        ))
+                    })?;
+                let page_data = unsafe {
+                    std::slice::from_raw_parts(host_ptr, dirty_bitmap::PAGE_SIZE as usize)
+                };
+                dirty_pages.push(snapshot::DirtyPage {
+                    guest_addr: addr,
+                    data: page_data.to_vec(),
+                });
+            }
+        }
+
+        for region in self.guest_memory.iter() {
+            let base = region.start_addr().raw_value();
+            let size = region.len();
+            Vm::protect_memory(base, size, true, false, true).map_err(|e| {
+                snapshot::SnapshotError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{e}"),
+                ))
+            })?;
+        }
+
+        let incremental = snapshot::IncrementalSnapshot {
+            header: snapshot::SnapshotHeader {
+                magic: snapshot::SNAPSHOT_MAGIC,
+                version: snapshot::SNAPSHOT_VERSION,
+                vcpu_count: vcpu_states.len() as u32,
+                ram_regions: snapshot::ram_layout(&self.guest_memory),
+                nested_enabled: false,
+            },
+            vcpu_states,
+            device_states,
+            dirty_pages,
+        };
+
+        snapshot::save_incremental_snapshot(&incremental, path)
+    }
+
+    /// Restore an incremental snapshot. vCPUs must already be paused.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_incremental_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let incremental = snapshot::load_incremental_snapshot(path)?;
+        snapshot::validate_header_for_vm(
+            &incremental.header,
+            &self.guest_memory,
+            self.vcpus_handles.len(),
+        )?;
+
+        snapshot::apply_dirty_pages(&self.guest_memory, &incremental.dirty_pages)?;
+        self.mmio_device_manager
+            .restore_all_device_states(&incremental.device_states)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to restore device states: {e}"
+                ))
+            })?;
+        self.restore_vcpu_states(incremental.vcpu_states)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+            })?;
+        Ok(())
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.

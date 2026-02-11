@@ -45,7 +45,7 @@ impl std::fmt::Debug for Error {
 
 /// A trait to express the ability to respond to I/O event readiness
 /// using callbacks.
-pub trait Subscriber {
+pub trait Subscriber: Send {
     /// Callback called when an event is available.
     ///
     /// # Arguments

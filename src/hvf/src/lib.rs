@@ -22,6 +22,9 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+#[cfg(feature = "snapshot")]
+use serde::{Deserialize, Serialize};
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
 use log::debug;
@@ -100,21 +103,78 @@ const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
 
+/// Apple Silicon page size (16KB).
+const PAGE_SIZE_16K: u64 = 16384;
+
+#[cfg(feature = "snapshot")]
+mod serde_array_u64_35 {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u64; 35], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple(35)?;
+        for item in value {
+            tuple.serialize_element(item)?;
+        }
+        tuple.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u64; 35], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct U64ArrayVisitor;
+
+        impl<'de> Visitor<'de> for U64ArrayVisitor {
+            type Value = [u64; 35];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array with exactly 35 u64 values")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = [0u64; 35];
+                for (i, slot) in values.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+                if seq.next_element::<u64>()?.is_some() {
+                    return Err(de::Error::invalid_length(36, &self));
+                }
+                Ok(values)
+            }
+        }
+
+        deserializer.deserialize_tuple(35, U64ArrayVisitor)
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
     MemoryMap,
+    MemoryProtect,
     MemoryUnmap,
     NestedCheck,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
+    VcpuReadSimdFpRegister,
     VcpuReadSystemRegister,
     VcpuRequestExit,
     VcpuRun,
     VcpuSetPendingIrq,
     VcpuSetRegister,
+    VcpuSetSimdFpRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
     VcpuSetVtimerOffset,
@@ -130,6 +190,7 @@ impl Display for Error {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
+            MemoryProtect => write!(f, "Error changing memory protection in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
@@ -138,11 +199,13 @@ impl Display for Error {
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
+            VcpuReadSimdFpRegister => write!(f, "Error reading HVF vCPU SIMD/FP register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
+            VcpuSetSimdFpRegister => write!(f, "Error setting HVF vCPU SIMD/FP register"),
             VcpuSetSystemRegister(reg, val) => write!(
                 f,
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
@@ -326,6 +389,159 @@ impl HvfVm {
             Ok(())
         }
     }
+
+    /// Change memory protection flags for a guest memory region.
+    pub fn protect_memory(
+        guest_addr: u64,
+        size: u64,
+        read: bool,
+        write: bool,
+        exec: bool,
+    ) -> Result<(), Error> {
+        let mut flags: u64 = 0;
+        if read {
+            flags |= HV_MEMORY_READ as u64;
+        }
+        if write {
+            flags |= HV_MEMORY_WRITE as u64;
+        }
+        if exec {
+            flags |= HV_MEMORY_EXEC as u64;
+        }
+        let ret = unsafe { hv_vm_protect(guest_addr, size.try_into().unwrap(), flags) };
+        if ret != HV_SUCCESS {
+            Err(Error::MemoryProtect)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// System registers that should be saved/restored for vCPU snapshot.
+/// These cover EL1 core regs, thread regs, timer regs, PAC keys, and debug regs.
+pub const SAVEABLE_SYS_REGS: &[u16] = &[
+    // EL1 core registers
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    // Thread registers
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    // Timer registers
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_TVAL_EL0,
+    // PAC keys
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
+    // Debug registers
+    hv_sys_reg_t_HV_SYS_REG_MDCCINT_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR2_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR2_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR2_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR2_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR3_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR4_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR4_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR4_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR4_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR5_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBVR6_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGBCR6_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWVR6_EL1,
+    hv_sys_reg_t_HV_SYS_REG_DBGWCR6_EL1,
+];
+
+/// Additional EL2 system registers to save/restore when nested virtualization is enabled.
+pub const SAVEABLE_SYS_REGS_EL2: &[u16] = &[
+    hv_sys_reg_t_HV_SYS_REG_HCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CPTR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VTCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL2,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_HPFAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_MDCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VMPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_CTL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_CVAL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_TVAL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTVOFF_EL2,
+];
+
+/// Complete vCPU state for snapshot/restore.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "snapshot", derive(Serialize, Deserialize))]
+pub struct Aarch64VcpuState {
+    /// X0-X30, PC, FPCR, FPSR, CPSR (35 registers total, indexed by HV_REG_* constants)
+    #[cfg_attr(feature = "snapshot", serde(with = "serde_array_u64_35"))]
+    pub gp_regs: [u64; 35],
+    /// Q0-Q31 SIMD/FP registers
+    pub simd_fp_regs: [u128; 32],
+    /// System registers as (reg_id, value) pairs
+    pub sys_regs: Vec<(u16, u64)>,
+    /// Virtual timer offset
+    pub vtimer_offset: u64,
+    /// Whether the virtual timer interrupt was masked
+    pub vtimer_masked: bool,
+    /// Whether a PC advance was pending at the time of save
+    pub pending_advance_pc: bool,
 }
 
 #[derive(Debug)]
@@ -333,6 +549,9 @@ pub enum VcpuExit<'a> {
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
+    /// A write fault on a write-protected RAM page (dirty tracking).
+    /// Contains the faulting guest physical address.
+    DirtyPageFault(u64),
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
@@ -352,6 +571,9 @@ struct MmioRead {
     srt: u32,
 }
 
+/// Callback type for dirty page tracking. Takes the faulting guest physical address.
+pub type DirtyCallback = Box<dyn Fn(u64) + Send>;
+
 pub struct HvfVcpu<'a> {
     vcpuid: hv_vcpu_t,
     vcpu_exit: &'a hv_vcpu_exit_t,
@@ -361,6 +583,14 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    /// When true, RAM write faults are treated as dirty page faults
+    /// rather than MMIO accesses.
+    pub dirty_tracking_enabled: bool,
+    /// Guest physical address ranges that are RAM: (start, size) pairs.
+    /// Used to distinguish RAM faults from MMIO faults when dirty tracking is on.
+    pub ram_regions: Vec<(u64, u64)>,
+    /// Callback invoked when a dirty page fault occurs.
+    pub dirty_callback: Option<DirtyCallback>,
 }
 
 impl HvfVcpu<'_> {
@@ -408,6 +638,9 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            dirty_tracking_enabled: false,
+            ram_regions: Vec::new(),
+            dirty_callback: None,
         })
     }
 
@@ -510,7 +743,15 @@ impl HvfVcpu<'_> {
         self.vcpuid
     }
 
-    fn read_reg(&self, reg: u32) -> Result<u64, Error> {
+    pub fn pending_advance_pc(&self) -> bool {
+        self.pending_advance_pc
+    }
+
+    pub fn vtimer_masked(&self) -> bool {
+        self.vtimer_masked
+    }
+
+    pub fn read_reg(&self, reg: u32) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
         if ret != HV_SUCCESS {
@@ -529,7 +770,7 @@ impl HvfVcpu<'_> {
         }
     }
 
-    fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
+    pub fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
         if ret != HV_SUCCESS {
@@ -537,6 +778,125 @@ impl HvfVcpu<'_> {
         } else {
             Ok(val)
         }
+    }
+
+    pub fn write_sys_reg(&self, reg: u16, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetSystemRegister(reg, val))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Read a SIMD/FP register (Q0-Q31). Returns a 128-bit value.
+    pub fn read_simd_fp_reg(&self, reg: u32) -> Result<u128, Error> {
+        let val: u128 = 0;
+        let ret = unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuReadSimdFpRegister)
+        } else {
+            Ok(val)
+        }
+    }
+
+    /// Write a SIMD/FP register (Q0-Q31) with a 128-bit value.
+    pub fn write_simd_fp_reg(&self, reg: u32, val: u128) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_simd_fp_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetSimdFpRegister)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Save the complete vCPU state. The vCPU must be paused (not running) when this is called.
+    pub fn save_state(&self) -> Result<Aarch64VcpuState, Error> {
+        assert!(
+            self.pending_mmio_read.is_none(),
+            "Cannot save state with pending MMIO read"
+        );
+
+        // Save GP registers: X0-X30, PC, FPCR, FPSR, CPSR
+        let mut gp_regs = [0u64; 35];
+        for i in 0..35u32 {
+            gp_regs[i as usize] = self.read_reg(i)?;
+        }
+
+        // Save SIMD/FP registers: Q0-Q31
+        let mut simd_fp_regs = [0u128; 32];
+        for i in 0..32u32 {
+            simd_fp_regs[i as usize] = self.read_simd_fp_reg(i)?;
+        }
+
+        // Save system registers
+        let mut sys_regs = Vec::with_capacity(
+            SAVEABLE_SYS_REGS.len()
+                + if self.nested_enabled {
+                    SAVEABLE_SYS_REGS_EL2.len()
+                } else {
+                    0
+                },
+        );
+        for &reg in SAVEABLE_SYS_REGS {
+            let val = self.read_sys_reg(reg)?;
+            sys_regs.push((reg, val));
+        }
+        if self.nested_enabled {
+            for &reg in SAVEABLE_SYS_REGS_EL2 {
+                let val = self.read_sys_reg(reg)?;
+                sys_regs.push((reg, val));
+            }
+        }
+
+        // Save vtimer offset
+        let vtimer_offset = vcpu_get_vtimer_offset(self.vcpuid)?;
+
+        Ok(Aarch64VcpuState {
+            gp_regs,
+            simd_fp_regs,
+            sys_regs,
+            vtimer_offset,
+            vtimer_masked: self.vtimer_masked,
+            pending_advance_pc: self.pending_advance_pc,
+        })
+    }
+
+    /// Restore vCPU state from a snapshot. The vCPU must be paused (not running).
+    pub fn restore_state(&mut self, state: &Aarch64VcpuState) -> Result<(), Error> {
+        // Restore GP registers
+        for i in 0..35u32 {
+            self.write_reg(i, state.gp_regs[i as usize])?;
+        }
+
+        // Restore SIMD/FP registers
+        for i in 0..32u32 {
+            self.write_simd_fp_reg(i, state.simd_fp_regs[i as usize])?;
+        }
+
+        // Restore system registers
+        for &(reg, val) in &state.sys_regs {
+            self.write_sys_reg(reg, val)?;
+        }
+
+        // Restore vtimer offset
+        vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset)?;
+
+        // Restore vtimer mask state
+        if state.vtimer_masked {
+            vcpu_set_vtimer_mask(self.vcpuid, true)?;
+        }
+        self.vtimer_masked = state.vtimer_masked;
+        self.pending_advance_pc = state.pending_advance_pc;
+
+        Ok(())
+    }
+
+    /// Check if a guest physical address falls within a RAM region.
+    fn is_ram_address(&self, pa: u64) -> bool {
+        self.ram_regions
+            .iter()
+            .any(|&(start, size)| pa >= start && pa < start + size)
     }
 
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
@@ -646,6 +1006,29 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::Breakpoint)
             }
             EC_DATAABORT => {
+                let pa = self.vcpu_exit.exception.physical_address;
+
+                // When dirty tracking is enabled, check if this is a write fault
+                // to RAM (permission fault from write-protected pages) vs a true MMIO access.
+                if self.dirty_tracking_enabled && self.is_ram_address(pa) {
+                    // This is a RAM write fault from dirty tracking.
+                    // Mark the page dirty via callback.
+                    let page_start = pa & !(PAGE_SIZE_16K - 1);
+                    if let Some(ref callback) = self.dirty_callback {
+                        callback(page_start);
+                    }
+                    // Re-enable writes on this page so the instruction can retry.
+                    let _ = HvfVm::protect_memory(
+                        page_start,
+                        PAGE_SIZE_16K,
+                        true, // read
+                        true, // write
+                        true, // exec
+                    );
+                    // DON'T set pending_advance_pc — we want to retry the instruction.
+                    return Ok(VcpuExit::DirtyPageFault(pa));
+                }
+
                 let isv: bool = (syndrome & (1 << 24)) != 0;
                 let iswrite: bool = ((syndrome >> 6) & 1) != 0;
                 let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
@@ -659,7 +1042,6 @@ impl HvfVcpu<'_> {
                     syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
                 );
 
-                let pa = self.vcpu_exit.exception.physical_address;
                 self.pending_advance_pc = true;
 
                 if iswrite {

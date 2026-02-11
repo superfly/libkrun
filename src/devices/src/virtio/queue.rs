@@ -378,6 +378,24 @@ impl Queue {
         min(self.size, self.max_size)
     }
 
+    pub fn next_avail(&self) -> Wrapping<u16> {
+        self.next_avail
+    }
+
+    pub fn next_used(&self) -> Wrapping<u16> {
+        self.next_used
+    }
+
+    /// Set the next available descriptor index (for restore).
+    pub fn set_next_avail(&mut self, idx: u16) {
+        self.next_avail = Wrapping(idx);
+    }
+
+    /// Set the next used descriptor index (for restore).
+    pub fn set_next_used(&mut self, idx: u16) {
+        self.next_used = Wrapping(idx);
+    }
+
     pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
         let queue_size = u64::from(self.actual_size());
         let desc_table = self.desc_table;

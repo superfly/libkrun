@@ -14,6 +14,7 @@ use std::io;
 use std::result;
 use std::sync::{Arc, Mutex};
 
+use crate::snapshot::Snapshottable;
 use crate::virtio::AsAny;
 
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
@@ -29,6 +30,14 @@ pub trait BusDevice: AsAny + Send {
     /// Triggers the `irq_mask` interrupt on this device
     fn interrupt(&self, irq_mask: u32) -> io::Result<()> {
         Ok(())
+    }
+    /// Returns a reference to this device as a Snapshottable, if it supports snapshots.
+    fn as_snapshottable(&self) -> Option<&dyn Snapshottable> {
+        None
+    }
+    /// Returns a mutable reference to this device as a Snapshottable, if it supports snapshots.
+    fn as_snapshottable_mut(&mut self) -> Option<&mut dyn Snapshottable> {
+        None
     }
 }
 

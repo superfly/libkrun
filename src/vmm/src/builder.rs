@@ -24,8 +24,8 @@ use super::{Error, Vmm};
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::resources::{
-    ConsolePortInfo, DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode,
-    VmDeviceInfo, VmResources,
+    ConsolePortInfo, DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode, VmDeviceInfo,
+    VmResources,
 };
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
@@ -591,7 +591,10 @@ impl BuiltVm {
     ///
     /// After calling this, the VM is running. Returns the VMM handle.
     pub fn run(&mut self) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
-        let vcpus = self.vcpus.take().ok_or(StartMicrovmError::MicroVMAlreadyRunning)?;
+        let vcpus = self
+            .vcpus
+            .take()
+            .ok_or(StartMicrovmError::MicroVMAlreadyRunning)?;
         self.vmm
             .lock()
             .expect("Poisoned vmm lock")
@@ -1007,6 +1010,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(target_os = "macos")]
+        dirty_bitmaps: Vec::new(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

@@ -15,8 +15,9 @@ use super::device_status;
 use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
+use crate::snapshot::{SnapshotError, Snapshottable};
 use utils::{byte_order, eventfd::EventFd};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -468,6 +469,122 @@ impl BusDevice for MmioTransport {
         // write() is safe to unwrap because the inner syscall is tailored to be safe as well.
         self.interrupt.event().write(1).unwrap();
         Ok(())
+    }
+
+    fn as_snapshottable(&self) -> Option<&dyn Snapshottable> {
+        Some(self)
+    }
+
+    fn as_snapshottable_mut(&mut self) -> Option<&mut dyn Snapshottable> {
+        Some(self)
+    }
+}
+
+/// Serializable state for an MmioTransport device.
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct MmioTransportState {
+    pub features_select: u32,
+    pub acked_features_select: u32,
+    pub queue_select: u32,
+    pub device_status: u32,
+    pub config_generation: u32,
+    pub queue_states: Vec<QueueState>,
+}
+
+/// Serializable state for a virtio queue.
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct QueueState {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+}
+
+impl Snapshottable for MmioTransport {
+    fn snapshot_id(&self) -> &str {
+        // Use the device name as the snapshot ID
+        // We can't store a String here easily, so return a static-ish identifier
+        "mmio-transport"
+    }
+
+    fn save_state(&self) -> Result<Vec<u8>, SnapshotError> {
+        let device = self.locked_device();
+        let queue_states: Vec<QueueState> = device
+            .queues()
+            .iter()
+            .map(|q| QueueState {
+                size: q.size,
+                ready: q.ready,
+                desc_table: q.desc_table.raw_value(),
+                avail_ring: q.avail_ring.raw_value(),
+                used_ring: q.used_ring.raw_value(),
+                next_avail: q.next_avail().0,
+                next_used: q.next_used().0,
+            })
+            .collect();
+        drop(device);
+
+        let state = MmioTransportState {
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            queue_states,
+        };
+
+        #[cfg(feature = "snapshot")]
+        {
+            bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
+        }
+        #[cfg(not(feature = "snapshot"))]
+        {
+            let _ = state;
+            Err(SnapshotError::Serialize(
+                "snapshot feature not enabled".to_string(),
+            ))
+        }
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> Result<(), SnapshotError> {
+        #[cfg(feature = "snapshot")]
+        {
+            let state: MmioTransportState =
+                bincode::deserialize(data).map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
+
+            self.features_select = state.features_select;
+            self.acked_features_select = state.acked_features_select;
+            self.queue_select = state.queue_select;
+            self.device_status = state.device_status;
+            self.config_generation = state.config_generation;
+
+            let mut device = self.locked_device();
+            for (i, qs) in state.queue_states.iter().enumerate() {
+                if let Some(queue) = device.queues_mut().get_mut(i) {
+                    queue.size = qs.size;
+                    queue.ready = qs.ready;
+                    queue.desc_table = GuestAddress(qs.desc_table);
+                    queue.avail_ring = GuestAddress(qs.avail_ring);
+                    queue.used_ring = GuestAddress(qs.used_ring);
+                    queue.set_next_avail(qs.next_avail);
+                    queue.set_next_used(qs.next_used);
+                }
+            }
+
+            Ok(())
+        }
+        #[cfg(not(feature = "snapshot"))]
+        {
+            let _ = data;
+            Err(SnapshotError::Deserialize(
+                "snapshot feature not enabled".to_string(),
+            ))
+        }
     }
 }
 

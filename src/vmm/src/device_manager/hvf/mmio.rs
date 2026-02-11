@@ -41,6 +41,8 @@ pub enum Error {
     DeviceNotFound,
     /// Failed to update the mmio device.
     UpdateFailed,
+    /// Failed to save or restore snapshot state.
+    SnapshotState(String),
 }
 
 impl fmt::Display for Error {
@@ -59,6 +61,7 @@ impl fmt::Display for Error {
             Error::RegisterIrqFd => write!(f, "failed to register irqfd"),
             Error::DeviceNotFound => write!(f, "the device couldn't be found"),
             Error::UpdateFailed => write!(f, "failed to update the mmio device"),
+            Error::SnapshotState(ref e) => write!(f, "failed to process snapshot state: {e}"),
         }
     }
 }
@@ -316,6 +319,77 @@ impl MMIODeviceManager {
             }
         }
         None
+    }
+
+    /// Save the state of all snapshottable devices.
+    /// Returns a list of (device_id, serialized_state) pairs.
+    pub fn save_all_device_states(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut states = Vec::new();
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                return Err(Error::SnapshotState(format!(
+                    "Device {device_type}:{device_id} missing from bus"
+                )));
+            };
+
+            let device = device
+                .lock()
+                .map_err(|e| Error::SnapshotState(format!("Failed to lock device: {e}")))?;
+            if let Some(snapshottable) = device.as_snapshottable() {
+                let state = snapshottable.save_state().map_err(|e| {
+                    Error::SnapshotState(format!(
+                        "Failed to save state for {device_type}:{device_id}: {e}"
+                    ))
+                })?;
+                let id = format!("{device_type}:{device_id}");
+                states.push((id, state));
+            } else {
+                return Err(Error::SnapshotState(format!(
+                    "Device {device_type}:{device_id} does not support snapshotting"
+                )));
+            }
+        }
+        Ok(states)
+    }
+
+    /// Restore device states from a snapshot.
+    pub fn restore_all_device_states(&self, states: &[(String, Vec<u8>)]) -> Result<()> {
+        for (id, data) in states {
+            // Find the matching device by iterating all registered devices
+            let mut found = false;
+            for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+                let expected_id = format!("{device_type}:{device_id}");
+                if &expected_id == id {
+                    let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                        return Err(Error::SnapshotState(format!(
+                            "Device {id} missing from bus during restore"
+                        )));
+                    };
+                    let mut device = device
+                        .lock()
+                        .map_err(|e| Error::SnapshotState(format!("Failed to lock device: {e}")))?;
+                    let Some(snapshottable) = device.as_snapshottable_mut() else {
+                        return Err(Error::SnapshotState(format!(
+                            "Device {id} does not support snapshot restore"
+                        )));
+                    };
+                    snapshottable.restore_state(data).map_err(|e| {
+                        Error::SnapshotState(format!(
+                            "Failed to restore state for device {id}: {e}"
+                        ))
+                    })?;
+
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(Error::SnapshotState(format!(
+                    "No matching device found for snapshot state: {id}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
