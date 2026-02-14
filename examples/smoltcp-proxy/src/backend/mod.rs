@@ -6,7 +6,9 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
-pub use tcp::{DeferredConnection, ProxiedTcpFlow, SocketBuffers, TcpConnection, TcpConnectionState};
+pub use tcp::{
+    DeferredConnection, ProxiedTcpFlow, SocketBuffers, TcpConnection, TcpConnectionState,
+};
 pub use udp::{UdpFlow, UdpHostCommand};
 pub use unix::{UnixInboundConnection, UnixInboundState};
 

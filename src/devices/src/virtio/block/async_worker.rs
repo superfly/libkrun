@@ -2,17 +2,17 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use log::{debug, error, info, trace};
+use log::{debug, error, trace, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 use utils::eventfd::EventFd;
 use virtio_bindings::virtio_blk::*;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::Queue;
 use super::{AsyncBlockBackend, AsyncBlockBackendFactory, CacheType, VolatileSliceGuard};
@@ -150,6 +150,13 @@ pub struct AsyncBlockWorker {
     mem: GuestMemoryMmap,
     factory: Box<dyn AsyncBlockBackendFactory>,
     stop_fd: EventFd,
+    resync_fd: EventFd,
+    shared_queue: Arc<Mutex<Queue>>,
+    shared_generation: Arc<AtomicU64>,
+    quiesce_fd: EventFd,
+    resume_fd: EventFd,
+    quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
+    shared_backend_state: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl AsyncBlockWorker {
@@ -161,6 +168,13 @@ impl AsyncBlockWorker {
         mem: GuestMemoryMmap,
         factory: Box<dyn AsyncBlockBackendFactory>,
         stop_fd: EventFd,
+        resync_fd: EventFd,
+        shared_queue: Arc<Mutex<Queue>>,
+        shared_generation: Arc<AtomicU64>,
+        quiesce_fd: EventFd,
+        resume_fd: EventFd,
+        quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
+        shared_backend_state: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Self {
         Self {
             queue,
@@ -169,6 +183,13 @@ impl AsyncBlockWorker {
             mem,
             factory,
             stop_fd,
+            resync_fd,
+            shared_queue,
+            shared_generation,
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack,
+            shared_backend_state,
         }
     }
 
@@ -211,6 +232,13 @@ impl AsyncBlockWorker {
             mem,
             factory,
             stop_fd,
+            resync_fd,
+            shared_queue,
+            shared_generation,
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack,
+            shared_backend_state,
         } = self;
 
         // Create the backend from the factory (inside this runtime)
@@ -320,15 +348,243 @@ impl AsyncBlockWorker {
         // We duplicate the fds because AsyncFd takes ownership but we still need the original EventFd.
         let queue_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(queue_evt.as_raw_fd())) };
         let stop_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(stop_fd.as_raw_fd())) };
+        let resync_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(resync_fd.as_raw_fd())) };
 
         let async_queue_fd =
             AsyncFd::new(queue_fd_dup).expect("failed to create AsyncFd for queue");
         let async_stop_fd = AsyncFd::new(stop_fd_dup).expect("failed to create AsyncFd for stop");
+        let async_resync_fd =
+            AsyncFd::new(resync_fd_dup).expect("failed to create AsyncFd for resync");
+
+        let quiesce_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(quiesce_fd.as_raw_fd())) };
+        let resume_fd_dup = unsafe { OwnedFd::from_raw_fd(libc::dup(resume_fd.as_raw_fd())) };
+        let async_quiesce_fd =
+            AsyncFd::new(quiesce_fd_dup).expect("failed to create AsyncFd for quiesce");
+        let async_resume_fd =
+            AsyncFd::new(resume_fd_dup).expect("failed to create AsyncFd for resume");
 
         log::debug!("async block worker: AsyncFd configured, entering main loop");
+        let mut applied_generation: u64 = 0;
 
         loop {
             tokio::select! {
+                biased;
+
+                // Snapshot quiesce: drain in-flight ops, publish queue state, ACK, park
+                ready = async_quiesce_fd.readable() => {
+                    if let Ok(mut guard) = ready {
+                        guard.clear_ready();
+                        if quiesce_fd.read().is_ok() {
+                            debug!("async block worker: quiesce requested, draining in-flight ops");
+
+                            // 1. Drain write_queue: start remaining batch and await completion
+                            if !write_queue.is_empty() {
+                                if current_write_batch.is_none() {
+                                    current_write_batch = Some(start_write_batch(
+                                        &mut write_queue,
+                                        disk.clone(),
+                                    ));
+                                }
+                            }
+
+                            // 2. Await current_write_batch if in progress, complete its requests
+                            if let Some(handle) = current_write_batch.take() {
+                                match handle.await {
+                                    Ok(batch_result) => {
+                                        writes_since_flush_started = true;
+                                        metrics.writes.fetch_add(batch_result.results.len() as u64, Ordering::Relaxed);
+                                        metrics.bytes_written.fetch_add(batch_result.total_bytes, Ordering::Relaxed);
+                                        metrics.write_latency_us.fetch_add(batch_result.elapsed_us, Ordering::Relaxed);
+                                        for (index, status, len, status_ptr) in batch_result.results {
+                                            unsafe { std::ptr::write_volatile(status_ptr, status); }
+                                            metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                            complete_request(&mut queue, &mem, &interrupt, RequestResult { index, status, len });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("async block worker: quiesce write batch panicked: {e:?}");
+                                    }
+                                }
+                            }
+
+                            // If there were still writes queued (arrived while awaiting batch), drain those too
+                            while !write_queue.is_empty() {
+                                let handle = start_write_batch(&mut write_queue, disk.clone());
+                                match handle.await {
+                                    Ok(batch_result) => {
+                                        for (index, status, len, status_ptr) in batch_result.results {
+                                            unsafe { std::ptr::write_volatile(status_ptr, status); }
+                                            metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                            complete_request(&mut queue, &mem, &interrupt, RequestResult { index, status, len });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("async block worker: quiesce residual write batch panicked: {e:?}");
+                                    }
+                                }
+                            }
+
+                            // 3. Await current_flush if in progress, complete its requests
+                            if let Some(handle) = current_flush.take() {
+                                let flush_status = match handle.await {
+                                    Ok(status) => status,
+                                    Err(e) => {
+                                        error!("async block worker: quiesce flush panicked: {e:?}");
+                                        virtio_bindings::virtio_blk::VIRTIO_BLK_S_IOERR as u8
+                                    }
+                                };
+                                for flush_parsed in flush_requests_in_progress.drain(..) {
+                                    unsafe { std::ptr::write_volatile(flush_parsed.status_ptr, flush_status); }
+                                    metrics.flushes.fetch_add(1, Ordering::Relaxed);
+                                    metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    complete_request(&mut queue, &mem, &interrupt, RequestResult {
+                                        index: flush_parsed.index, status: flush_status, len: 0,
+                                    });
+                                }
+                            }
+
+                            // 4. Drain pending_flushes
+                            if !pending_flushes.is_empty() {
+                                let flush_reqs: Vec<ParsedRequest> = pending_flushes.drain(..).collect();
+                                let disk_clone = disk.clone();
+                                let flush_status = match tokio::task::spawn_local(async move {
+                                    match disk_clone.cache_type() {
+                                        CacheType::Writeback => {
+                                            if let Err(e) = disk_clone.flush().await {
+                                                error!("quiesce flush failed: {e:?}");
+                                                VIRTIO_BLK_S_IOERR as u8
+                                            } else if let Err(e) = disk_clone.sync().await {
+                                                error!("quiesce sync failed: {e:?}");
+                                                VIRTIO_BLK_S_IOERR as u8
+                                            } else {
+                                                VIRTIO_BLK_S_OK as u8
+                                            }
+                                        }
+                                        CacheType::Unsafe => VIRTIO_BLK_S_OK as u8,
+                                    }
+                                }).await {
+                                    Ok(status) => status,
+                                    Err(e) => {
+                                        error!("quiesce flush task panicked: {e:?}");
+                                        VIRTIO_BLK_S_IOERR as u8
+                                    }
+                                };
+                                for flush_parsed in flush_reqs {
+                                    unsafe { std::ptr::write_volatile(flush_parsed.status_ptr, flush_status); }
+                                    metrics.flushes.fetch_add(1, Ordering::Relaxed);
+                                    metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    complete_request(&mut queue, &mem, &interrupt, RequestResult {
+                                        index: flush_parsed.index, status: flush_status, len: 0,
+                                    });
+                                }
+                            }
+
+                            // 5. Drain all in-flight read tasks.
+                            // Read tasks are spawned via spawn_local and hold raw
+                            // pointers into guest memory (VolatileSliceGuard +
+                            // status_ptr). They write_volatile the status byte on
+                            // completion. We MUST await all of them before parking,
+                            // because load_memory overwrites guest RAM during restore
+                            // and any late write_volatile would corrupt restored state.
+                            //
+                            // The key issue: try_recv() never yields to the tokio
+                            // runtime, so spawned tasks never get polled to completion.
+                            // We use recv().await which yields, letting read tasks
+                            // finish their I/O and send completions.
+                            {
+                                let drain_deadline = Instant::now() + Duration::from_secs(2);
+                                loop {
+                                    if metrics.concurrent_reads.load(Ordering::Relaxed) == 0 {
+                                        while let Ok(result) = read_completion_rx.try_recv() {
+                                            complete_request(&mut queue, &mem, &interrupt, result);
+                                        }
+                                        break;
+                                    }
+                                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                                    if remaining.is_zero() {
+                                        warn!(
+                                            "async block worker: timed out draining {} in-flight reads",
+                                            metrics.concurrent_reads.load(Ordering::Relaxed)
+                                        );
+                                        while let Ok(result) = read_completion_rx.try_recv() {
+                                            complete_request(&mut queue, &mem, &interrupt, result);
+                                        }
+                                        break;
+                                    }
+                                    match tokio::time::timeout(remaining, read_completion_rx.recv()).await {
+                                        Ok(Some(result)) => {
+                                            complete_request(&mut queue, &mem, &interrupt, result);
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+
+                            // 6. Publish queue state and backend state to shared
+                            debug!("async block worker: in-flight drained, publishing queue + backend state");
+                            if let Ok(mut shared) = shared_queue.lock() {
+                                *shared = queue.clone();
+                            }
+                            if let Ok(mut shared) = shared_backend_state.lock() {
+                                *shared = disk.save_snapshot_state();
+                            }
+
+                            // 7. Signal the device that we've parked
+                            {
+                                let (lock, cvar) = &*quiesce_ack;
+                                *lock.lock().unwrap() = true;
+                                cvar.notify_one();
+                            }
+
+                            // 8. Park: wait for resume_fd
+                            debug!("async block worker: parked, waiting for resume");
+                            loop {
+                                match async_resume_fd.readable().await {
+                                    Ok(mut rg) => {
+                                        rg.clear_ready();
+                                        if resume_fd.read().is_ok() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("async block worker: resume fd error: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            debug!("async block worker: resumed from quiesce");
+                        }
+                    }
+                }
+
+                ready = async_resync_fd.readable() => {
+                    match ready {
+                        Ok(mut guard) => {
+                            guard.clear_ready();
+                            if resync_fd.read().is_ok() {
+                                apply_shared_queue_state_if_needed(
+                                    &mut queue,
+                                    &mem,
+                                    &shared_queue,
+                                    &shared_generation,
+                                    &mut applied_generation,
+                                );
+                                // Restore backend state if the device provided one
+                                if let Ok(mut shared) = shared_backend_state.lock() {
+                                    if let Some(data) = shared.take() {
+                                        debug!("async block worker: restoring backend state ({} bytes)", data.len());
+                                        disk.restore_snapshot_state(&data);
+                                    }
+                                }
+                                trace!("async block worker: queue state refreshed from snapshot state");
+                            }
+                        }
+                        Err(e) => {
+                            error!("resync fd ready error: {e}");
+                        }
+                    }
+                }
+
                 // Wait for queue event
                 ready = async_queue_fd.readable() => {
                     match ready {
@@ -339,6 +595,13 @@ impl AsyncBlockWorker {
                             // WouldBlock is expected - it means a spurious wakeup or the event was already consumed
                             match queue_evt.read() {
                                 Ok(_) => {
+                                    apply_shared_queue_state_if_needed(
+                                        &mut queue,
+                                        &mem,
+                                        &shared_queue,
+                                        &shared_generation,
+                                        &mut applied_generation,
+                                    );
                                     trace!("async block worker: queue event received");
                                     // Pop and parse all available requests
                                     let requests = pop_and_parse_requests(&mut queue, &mem);
@@ -630,6 +893,40 @@ impl AsyncBlockWorker {
                 }
             }
         }
+    }
+}
+
+fn apply_shared_queue_state_if_needed(
+    queue: &mut Queue,
+    mem: &GuestMemoryMmap,
+    shared_queue: &Arc<Mutex<Queue>>,
+    shared_generation: &Arc<AtomicU64>,
+    applied_generation: &mut u64,
+) {
+    let generation = shared_generation.load(Ordering::Acquire);
+    if generation == *applied_generation {
+        return;
+    }
+
+    if let Ok(shared) = shared_queue.lock() {
+        *queue = shared.clone();
+
+        if queue.ready {
+            if let Some(used_idx_addr) = queue.used_ring.checked_add(2) {
+                if let Ok(used_idx) = mem.read_obj::<u16>(used_idx_addr) {
+                    queue.set_next_used(used_idx);
+                }
+            }
+            if let Some(avail_idx_addr) = queue.avail_ring.checked_add(2) {
+                if let Ok(avail_idx) = mem.read_obj::<u16>(avail_idx_addr) {
+                    if queue.next_avail().0 > avail_idx {
+                        queue.set_next_avail(avail_idx);
+                    }
+                }
+            }
+        }
+
+        *applied_generation = generation;
     }
 }
 
@@ -955,10 +1252,8 @@ fn complete_request(
         error!("failed to add used: {e:?}");
     }
 
-    if queue.needs_notification(mem).unwrap() {
-        if let Err(e) = interrupt.try_signal_used_queue() {
-            error!("error signalling queue: {e:?}");
-        }
+    if let Err(e) = interrupt.try_signal_used_queue() {
+        error!("error signalling queue: {e:?}");
     }
 }
 
@@ -1131,6 +1426,8 @@ mod tests {
         data: RwLock<Vec<u8>>,
         sectors: u64,
         events: Mutex<Vec<OpEvent>>,
+        /// Delay to add to read operations (simulates slow storage)
+        read_delay_ms: AtomicU64,
         /// Delay to add to write operations (simulates slow storage)
         write_delay_ms: AtomicU64,
         /// Delay to add to flush operations
@@ -1150,12 +1447,17 @@ mod tests {
                 data: RwLock::new(vec![0u8; size_bytes]),
                 sectors,
                 events: Mutex::new(Vec::new()),
+                read_delay_ms: AtomicU64::new(0),
                 write_delay_ms: AtomicU64::new(0),
                 flush_delay_ms: AtomicU64::new(0),
                 writes_in_progress: AtomicUsize::new(0),
                 writes_done: Notify::new(),
                 image_id: b"test-tracking-disk".to_vec(),
             }
+        }
+
+        fn set_read_delay(&self, ms: u64) {
+            self.read_delay_ms.store(ms, Ordering::SeqCst);
         }
 
         fn set_write_delay(&self, ms: u64) {
@@ -1210,6 +1512,11 @@ mod tests {
             });
 
             Box::pin(async move {
+                let delay = self.read_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+
                 let data = self.data.read().unwrap();
                 let mut total = 0;
                 let mut current_offset = offset as usize;
@@ -2020,5 +2327,958 @@ mod tests {
         assert_eq!(&data[0..128], &vec![0xFF_u8; 128][..]);
         assert_eq!(&data[128..384], &vec![0x00_u8; 256][..]);
         assert_eq!(&data[384..1024], &vec![0xFF_u8; 640][..]);
+    }
+
+    // ========================================================================
+    // Snapshot Quiesce Tests
+    // ========================================================================
+
+    use super::super::SendBoxFuture;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::InterruptTransport;
+    use std::sync::Condvar;
+    use vm_memory::GuestAddress;
+
+    /// Factory that wraps TrackingBackend for use with AsyncBlockWorker.
+    struct TrackingBackendFactory {
+        size_bytes: usize,
+    }
+
+    impl TrackingBackendFactory {
+        fn new(size_bytes: usize) -> Self {
+            Self { size_bytes }
+        }
+    }
+
+    impl AsyncBlockBackendFactory for TrackingBackendFactory {
+        fn nsectors(&self) -> u64 {
+            self.size_bytes as u64 / 512
+        }
+
+        fn cache_type(&self) -> CacheType {
+            CacheType::Unsafe
+        }
+
+        fn create(
+            self: Box<Self>,
+        ) -> SendBoxFuture<'static, std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>>
+        {
+            Box::pin(async move {
+                Ok(Arc::new(TrackingBackend::new(self.size_bytes))
+                    as Arc<dyn super::super::AsyncBlockBackend + Send + Sync>)
+            })
+        }
+    }
+
+    /// Test that the quiesce protocol works: signal quiesce → worker acks → resume.
+    #[test]
+    fn test_quiesce_ack_resume() {
+        let mem =
+            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
+        let interrupt = InterruptTransport::new(irqchip, "test-blk".into()).unwrap();
+
+        let queue = Queue::new(256);
+        let queue_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let stop_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resync_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let quiesce_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resume_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+
+        let shared_queue = Arc::new(Mutex::new(queue.clone()));
+        let shared_generation = Arc::new(AtomicU64::new(0));
+        let quiesce_ack = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let quiesce_fd_clone = quiesce_fd.try_clone().unwrap();
+        let resume_fd_clone = resume_fd.try_clone().unwrap();
+        let stop_fd_clone = stop_fd.try_clone().unwrap();
+        let quiesce_ack_clone = quiesce_ack.clone();
+        let shared_queue_clone = shared_queue.clone();
+
+        let factory = Box::new(TrackingBackendFactory::new(4096));
+        let shared_backend_state = Arc::new(Mutex::new(None));
+
+        let worker = AsyncBlockWorker::new(
+            queue,
+            queue_evt,
+            interrupt,
+            mem,
+            factory,
+            stop_fd,
+            resync_fd,
+            shared_queue.clone(),
+            shared_generation.clone(),
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack.clone(),
+            shared_backend_state,
+        );
+
+        let _handle = worker.run();
+
+        // Give the worker time to start and create backend
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // --- Quiesce cycle 1: verify ack ---
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        // Wait for ack with timeout
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(5),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack quiesce within timeout"
+            );
+        }
+
+        // Verify shared queue was updated (worker published its state)
+        {
+            let shared = shared_queue_clone.lock().unwrap();
+            // Just verify it's accessible — the worker cloned its local queue into shared
+            let _ = shared.next_avail();
+        }
+
+        // Resume
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        resume_fd_clone.write(1).unwrap();
+
+        // Give worker time to resume
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // --- Quiesce cycle 2: verify it works a second time ---
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(5),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack second quiesce within timeout"
+            );
+        }
+
+        // Resume and stop
+        resume_fd_clone.write(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop_fd_clone.write(1).unwrap();
+    }
+
+    // ========================================================================
+    // End-to-End Snapshot/Restore Test with Real Virtio Queue I/O
+    // ========================================================================
+
+    use crate::virtio::queue::Descriptor;
+    use vm_memory::Bytes;
+
+    // Memory layout constants for virtio queue (queue size = 16)
+    const TEST_QUEUE_SIZE: u16 = 16;
+    const DESC_TABLE_ADDR: u64 = 0x0000; // 16*16=256 bytes, 16-byte aligned
+    const AVAIL_RING_ADDR: u64 = 0x0100; // 4 + 2*16 + 2 = 38 bytes, 2-byte aligned
+    const USED_RING_ADDR: u64 = 0x0200; // 4 + 8*16 + 2 = 134 bytes, 4-byte aligned
+    const DATA_AREA_ADDR: u64 = 0x1000; // request headers, data, status bytes
+    // Each request uses 0x300 bytes: 0x00=header(16), 0x10=data(512), 0x210+1=status(1)
+    const REQ_STRIDE: u64 = 0x300;
+
+    /// Write a single virtio-blk WRITE request into guest memory as a 3-descriptor chain.
+    /// Returns the head descriptor index.
+    fn write_blk_write_request(
+        mem: &GuestMemoryMmap,
+        request_idx: u16,
+        sector: u64,
+        fill_byte: u8,
+    ) -> u16 {
+        let base_desc = request_idx * 3; // each request uses 3 descriptors
+        let data_base = DATA_AREA_ADDR + (request_idx as u64) * REQ_STRIDE;
+        let header_addr = data_base;
+        let data_addr = data_base + 0x10; // after 16-byte header
+        let status_addr = data_base + 0x210; // after 512-byte data
+
+        // Write RequestHeader into guest memory
+        let header = RequestHeader {
+            request_type: VIRTIO_BLK_T_OUT,
+            _reserved: 0,
+            sector,
+        };
+        mem.write_obj(header, GuestAddress(header_addr)).unwrap();
+
+        // Write data (512 bytes filled with fill_byte)
+        let data = vec![fill_byte; 512];
+        mem.write_slice(&data, GuestAddress(data_addr)).unwrap();
+
+        // Write status byte (initially 0xFF to distinguish from success)
+        mem.write_obj(0xFFu8, GuestAddress(status_addr)).unwrap();
+
+        // Write descriptor chain:
+        // desc[base+0]: header, readable, NEXT
+        let desc0 = Descriptor {
+            addr: header_addr,
+            len: 16,
+            flags: 0x1, // VIRTQ_DESC_F_NEXT
+            next: base_desc + 1,
+        };
+        mem.write_obj(
+            desc0,
+            GuestAddress(DESC_TABLE_ADDR + (base_desc as u64) * 16),
+        )
+        .unwrap();
+
+        // desc[base+1]: data, readable, NEXT
+        let desc1 = Descriptor {
+            addr: data_addr,
+            len: 512,
+            flags: 0x1, // VIRTQ_DESC_F_NEXT
+            next: base_desc + 2,
+        };
+        mem.write_obj(
+            desc1,
+            GuestAddress(DESC_TABLE_ADDR + ((base_desc + 1) as u64) * 16),
+        )
+        .unwrap();
+
+        // desc[base+2]: status, writable, no NEXT
+        let desc2 = Descriptor {
+            addr: status_addr,
+            len: 1,
+            flags: 0x2, // VIRTQ_DESC_F_WRITE
+            next: 0,
+        };
+        mem.write_obj(
+            desc2,
+            GuestAddress(DESC_TABLE_ADDR + ((base_desc + 2) as u64) * 16),
+        )
+        .unwrap();
+
+        base_desc
+    }
+
+    /// Add a descriptor chain head to the avail ring and bump the avail idx.
+    fn add_to_avail_ring(mem: &GuestMemoryMmap, avail_slot: u16, head_desc_idx: u16) {
+        // Write the head descriptor index into avail ring[slot]
+        let ring_entry_addr = AVAIL_RING_ADDR + 4 + 2 * (avail_slot as u64);
+        mem.write_obj(head_desc_idx, GuestAddress(ring_entry_addr))
+            .unwrap();
+
+        // Bump avail idx (at avail_ring + 2)
+        let new_idx: u16 = avail_slot + 1;
+        mem.write_obj(new_idx, GuestAddress(AVAIL_RING_ADDR + 2))
+            .unwrap();
+    }
+
+    /// Create a configured Queue pointing at the test memory layout.
+    fn make_test_queue() -> Queue {
+        let mut q = Queue::new(TEST_QUEUE_SIZE);
+        q.size = TEST_QUEUE_SIZE;
+        q.ready = true;
+        q.desc_table = GuestAddress(DESC_TABLE_ADDR);
+        q.avail_ring = GuestAddress(AVAIL_RING_ADDR);
+        q.used_ring = GuestAddress(USED_RING_ADDR);
+        q
+    }
+
+    /// Read the status byte for a given request from guest memory.
+    fn read_status(mem: &GuestMemoryMmap, request_idx: u16) -> u8 {
+        let status_addr = DATA_AREA_ADDR + (request_idx as u64) * REQ_STRIDE + 0x210;
+        mem.read_obj::<u8>(GuestAddress(status_addr)).unwrap()
+    }
+
+    /// Full end-to-end test: submit requests → quiesce → verify queue state →
+    /// simulate restore → submit more requests → verify correctness.
+    #[test]
+    fn test_snapshot_restore_with_real_io() {
+        // 128KB guest memory
+        let mem =
+            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+
+        // Zero out the avail ring flags + idx
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap(); // flags
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap(); // idx
+        // Zero out used ring flags + idx
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap(); // flags
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap(); // idx
+
+        let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
+        let interrupt = InterruptTransport::new(irqchip, "test-blk-snap".into()).unwrap();
+
+        let queue = make_test_queue();
+        let queue_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let stop_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resync_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let quiesce_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resume_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+
+        let shared_queue = Arc::new(Mutex::new(queue.clone()));
+        let shared_generation = Arc::new(AtomicU64::new(0));
+        let quiesce_ack = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let queue_evt_clone = queue_evt.try_clone().unwrap();
+        let quiesce_fd_clone = quiesce_fd.try_clone().unwrap();
+        let resume_fd_clone = resume_fd.try_clone().unwrap();
+        let stop_fd_clone = stop_fd.try_clone().unwrap();
+        let resync_fd_clone = resync_fd.try_clone().unwrap();
+        let quiesce_ack_clone = quiesce_ack.clone();
+        let shared_queue_clone = shared_queue.clone();
+        let shared_generation_clone = shared_generation.clone();
+
+        // 8KB disk (16 sectors)
+        let factory = Box::new(TrackingBackendFactory::new(8192));
+        let shared_backend_state = Arc::new(Mutex::new(None));
+
+        let worker = AsyncBlockWorker::new(
+            queue,
+            queue_evt,
+            interrupt,
+            mem.clone(),
+            factory,
+            stop_fd,
+            resync_fd,
+            shared_queue.clone(),
+            shared_generation.clone(),
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack.clone(),
+            shared_backend_state,
+        );
+
+        let _handle = worker.run();
+
+        // Give the worker time to start
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // ============================================================
+        // Phase 1: Submit 2 write requests (sectors 0 and 1)
+        // ============================================================
+
+        // Request 0: write 0xAA to sector 0
+        let head0 = write_blk_write_request(&mem, 0, 0, 0xAA);
+        add_to_avail_ring(&mem, 0, head0);
+
+        // Request 1: write 0xBB to sector 1
+        let head1 = write_blk_write_request(&mem, 1, 1, 0xBB);
+        add_to_avail_ring(&mem, 1, head1);
+
+        // Signal the queue event to wake the worker
+        queue_evt_clone.write(1).unwrap();
+
+        // Wait for both requests to complete (poll status bytes)
+        for attempt in 0..100 {
+            let s0 = read_status(&mem, 0);
+            let s1 = read_status(&mem, 1);
+            if s0 == VIRTIO_BLK_S_OK as u8 && s1 == VIRTIO_BLK_S_OK as u8 {
+                break;
+            }
+            if attempt == 99 {
+                panic!(
+                    "Requests did not complete in time. status[0]={}, status[1]={}",
+                    s0, s1
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // ============================================================
+        // Phase 2: Quiesce and verify queue state
+        // ============================================================
+
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        // Wait for ack
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(5),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack quiesce within timeout"
+            );
+        }
+
+        // Read the published queue state
+        let snapshot_queue = {
+            let shared = shared_queue_clone.lock().unwrap();
+            shared.clone()
+        };
+
+        // After processing 2 requests:
+        // next_avail should be 2 (popped 2 from avail ring)
+        // next_used should be 2 (added 2 to used ring)
+        assert_eq!(
+            snapshot_queue.next_avail().0, 2,
+            "Expected next_avail=2 after 2 requests, got {}",
+            snapshot_queue.next_avail().0
+        );
+        assert_eq!(
+            snapshot_queue.next_used().0, 2,
+            "Expected next_used=2 after 2 requests, got {}",
+            snapshot_queue.next_used().0
+        );
+
+        // ============================================================
+        // Phase 3: Simulate snapshot/restore
+        // ============================================================
+        // Save the queue state (this is what the snapshot would capture)
+        let saved_next_avail = snapshot_queue.next_avail().0;
+        let saved_next_used = snapshot_queue.next_used().0;
+
+        // Resume the worker (simulates abort_snapshot_quiesce)
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        resume_fd_clone.write(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Now simulate restore: push the saved queue state into the shared queue
+        // and signal resync (this is what post_snapshot_restore does)
+        {
+            let mut shared = shared_queue_clone.lock().unwrap();
+            shared.set_next_avail(saved_next_avail);
+            shared.set_next_used(saved_next_used);
+        }
+        shared_generation_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        resync_fd_clone.write(1).unwrap();
+
+        // Give worker time to apply the resync
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // ============================================================
+        // Phase 4: Submit 2 more write requests (sectors 2 and 3)
+        // ============================================================
+
+        // Request 2: write 0xCC to sector 2
+        let head2 = write_blk_write_request(&mem, 2, 2, 0xCC);
+        add_to_avail_ring(&mem, 2, head2);
+
+        // Request 3: write 0xDD to sector 3
+        let head3 = write_blk_write_request(&mem, 3, 3, 0xDD);
+        add_to_avail_ring(&mem, 3, head3);
+
+        // Signal the queue
+        queue_evt_clone.write(1).unwrap();
+
+        // Wait for requests 2 and 3 to complete
+        for attempt in 0..100 {
+            let s2 = read_status(&mem, 2);
+            let s3 = read_status(&mem, 3);
+            if s2 == VIRTIO_BLK_S_OK as u8 && s3 == VIRTIO_BLK_S_OK as u8 {
+                break;
+            }
+            if attempt == 99 {
+                panic!(
+                    "Post-restore requests did not complete. status[2]={}, status[3]={}",
+                    s2, s3
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // ============================================================
+        // Phase 5: Quiesce again and verify final queue state
+        // ============================================================
+
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(5),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack second quiesce within timeout"
+            );
+        }
+
+        let final_queue = {
+            let shared = shared_queue_clone.lock().unwrap();
+            shared.clone()
+        };
+
+        // After restore at (2,2) and processing 2 more requests:
+        // next_avail should be 4 (2 from restore + 2 new)
+        // next_used should be 4 (2 from restore + 2 new)
+        assert_eq!(
+            final_queue.next_avail().0, 4,
+            "Expected next_avail=4 after restore + 2 more requests, got {}",
+            final_queue.next_avail().0
+        );
+        assert_eq!(
+            final_queue.next_used().0, 4,
+            "Expected next_used=4 after restore + 2 more requests, got {}",
+            final_queue.next_used().0
+        );
+
+        // ============================================================
+        // Cleanup
+        // ============================================================
+        resume_fd_clone.write(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop_fd_clone.write(1).unwrap();
+    }
+
+    // ========================================================================
+    // Regression Test: Quiesce Drains In-Flight Ops Before Memory Overwrite
+    // ========================================================================
+
+    /// Factory that wraps a pre-existing Arc<TrackingBackend> so the test can
+    /// control write delays and inspect backend state externally.
+    struct SharedBackendFactory {
+        backend: Arc<TrackingBackend>,
+    }
+
+    impl AsyncBlockBackendFactory for SharedBackendFactory {
+        fn nsectors(&self) -> u64 {
+            self.backend.nsectors()
+        }
+
+        fn cache_type(&self) -> CacheType {
+            CacheType::Writeback
+        }
+
+        fn create(
+            self: Box<Self>,
+        ) -> SendBoxFuture<'static, std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>>
+        {
+            let backend = self.backend.clone();
+            Box::pin(async move {
+                Ok(backend as Arc<dyn super::super::AsyncBlockBackend + Send + Sync>)
+            })
+        }
+    }
+
+    /// Regression test for the snapshot-restore race condition:
+    ///
+    /// Before the fix, `restore_snapshot` would overwrite guest RAM via
+    /// `load_memory` while async workers were still running. If a worker held
+    /// a VolatileSliceGuard pointing into guest RAM and was mid-I/O, it would
+    /// read stale data from the overwritten memory and/or write stale used-ring
+    /// entries, corrupting the restored VM state.
+    ///
+    /// This test verifies that:
+    /// 1. In-flight ops are fully drained before quiesce acks
+    /// 2. After quiesce, guest memory can be safely overwritten
+    /// 3. The overwritten memory is not corrupted by the worker
+    #[test]
+    fn test_quiesce_drains_inflight_before_memory_overwrite() {
+        // 128KB guest memory
+        let mem =
+            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+
+        // Zero out queue rings
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+
+        let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
+        let interrupt = InterruptTransport::new(irqchip, "test-blk-race".into()).unwrap();
+
+        let queue = make_test_queue();
+        let queue_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let stop_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resync_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let quiesce_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resume_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+
+        let shared_queue = Arc::new(Mutex::new(queue.clone()));
+        let shared_generation = Arc::new(AtomicU64::new(0));
+        let quiesce_ack = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let queue_evt_clone = queue_evt.try_clone().unwrap();
+        let quiesce_fd_clone = quiesce_fd.try_clone().unwrap();
+        let resume_fd_clone = resume_fd.try_clone().unwrap();
+        let stop_fd_clone = stop_fd.try_clone().unwrap();
+        let quiesce_ack_clone = quiesce_ack.clone();
+
+        // Create a shared backend with a 500ms write delay to ensure the
+        // write is still in-flight when we trigger quiesce.
+        let backend = Arc::new(TrackingBackend::new(8192));
+        backend.set_write_delay(500);
+
+        let factory = Box::new(SharedBackendFactory {
+            backend: backend.clone(),
+        });
+        let shared_backend_state = Arc::new(Mutex::new(None));
+
+        let worker = AsyncBlockWorker::new(
+            queue,
+            queue_evt,
+            interrupt,
+            mem.clone(),
+            factory,
+            stop_fd,
+            resync_fd,
+            shared_queue.clone(),
+            shared_generation.clone(),
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack.clone(),
+            shared_backend_state,
+        );
+
+        let _handle = worker.run();
+
+        // Give the worker time to start and create backend
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // === Step 1: Submit a write request that will be slow (500ms delay) ===
+        let head0 = write_blk_write_request(&mem, 0, 0, 0xAA);
+        add_to_avail_ring(&mem, 0, head0);
+        queue_evt_clone.write(1).unwrap();
+
+        // Give the worker just enough time to pick up the request (but NOT
+        // enough for the 500ms write to complete).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // === Step 2: Trigger quiesce while write is in-flight ===
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        // The quiesce should NOT ack until the in-flight write drains.
+        // Wait for the ack — it should arrive after ~400ms more (when the
+        // 500ms write delay completes).
+        let quiesce_start = std::time::Instant::now();
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(10),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack quiesce within timeout"
+            );
+        }
+        let quiesce_duration = quiesce_start.elapsed();
+
+        // Verify the in-flight write completed (it was drained before ack).
+        assert_eq!(
+            read_status(&mem, 0),
+            VIRTIO_BLK_S_OK as u8,
+            "In-flight write should have completed before quiesce ack"
+        );
+
+        // The quiesce ack should have taken at least ~300ms (remaining delay),
+        // proving it waited for the in-flight write to drain.
+        assert!(
+            quiesce_duration >= std::time::Duration::from_millis(200),
+            "Quiesce acked too fast ({:?}), likely didn't drain in-flight ops",
+            quiesce_duration
+        );
+
+        // Verify the backend received the write data correctly.
+        let written_data = backend.read_raw(0, 512);
+        assert!(
+            written_data.iter().all(|&b| b == 0xAA),
+            "Backend should have received the 0xAA write"
+        );
+
+        // === Step 3: Overwrite guest memory (simulating load_memory) ===
+        // Write a sentinel pattern over the data area where the request was.
+        let sentinel = vec![0x55u8; 512];
+        let data_addr = DATA_AREA_ADDR + 0x10; // data portion of request 0
+        mem.write_slice(&sentinel, GuestAddress(data_addr)).unwrap();
+
+        // Also overwrite the used ring area to simulate a full memory restore.
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+
+        // === Step 4: Resume worker and verify memory is not corrupted ===
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        resume_fd_clone.write(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // The sentinel data we wrote should still be intact — the worker
+        // should NOT have written anything back into guest memory after resume
+        // (since there are no new requests pending).
+        let mut readback = vec![0u8; 512];
+        mem.read_slice(&mut readback, GuestAddress(data_addr)).unwrap();
+        assert_eq!(
+            readback, sentinel,
+            "Guest memory was corrupted after restore! Worker wrote stale data."
+        );
+
+        // Cleanup
+        stop_fd_clone.write(1).unwrap();
+    }
+
+    // ========================================================================
+    // Regression Test: Quiesce Drains In-Flight READS Before Ack
+    // ========================================================================
+
+    /// Write a virtio-blk READ request (VIRTIO_BLK_T_IN) descriptor chain.
+    /// Returns the head descriptor index.
+    fn write_blk_read_request(
+        mem: &GuestMemoryMmap,
+        request_idx: u16,
+        sector: u64,
+    ) -> u16 {
+        let base_desc = request_idx * 3;
+        let data_base = DATA_AREA_ADDR + (request_idx as u64) * REQ_STRIDE;
+        let header_addr = data_base;
+        let data_addr = data_base + 0x10;
+        let status_addr = data_base + 0x210;
+
+        // Write RequestHeader (VIRTIO_BLK_T_IN = read)
+        let header = RequestHeader {
+            request_type: VIRTIO_BLK_T_IN,
+            _reserved: 0,
+            sector,
+        };
+        mem.write_obj(header, GuestAddress(header_addr)).unwrap();
+
+        // Zero out data buffer (device will write read data here)
+        let data = vec![0u8; 512];
+        mem.write_slice(&data, GuestAddress(data_addr)).unwrap();
+
+        // Status byte initially 0xFF
+        mem.write_obj(0xFFu8, GuestAddress(status_addr)).unwrap();
+
+        // desc[0]: header, readable, NEXT
+        let desc0 = Descriptor {
+            addr: header_addr,
+            len: 16,
+            flags: 0x1, // VIRTQ_DESC_F_NEXT
+            next: base_desc + 1,
+        };
+        mem.write_obj(desc0, GuestAddress(DESC_TABLE_ADDR + (base_desc as u64) * 16)).unwrap();
+
+        // desc[1]: data buffer, WRITABLE + NEXT (device writes read data here)
+        let desc1 = Descriptor {
+            addr: data_addr,
+            len: 512,
+            flags: 0x3, // VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+            next: base_desc + 2,
+        };
+        mem.write_obj(desc1, GuestAddress(DESC_TABLE_ADDR + ((base_desc + 1) as u64) * 16)).unwrap();
+
+        // desc[2]: status, writable, no NEXT
+        let desc2 = Descriptor {
+            addr: status_addr,
+            len: 1,
+            flags: 0x2, // VIRTQ_DESC_F_WRITE
+            next: 0,
+        };
+        mem.write_obj(desc2, GuestAddress(DESC_TABLE_ADDR + ((base_desc + 2) as u64) * 16)).unwrap();
+
+        base_desc
+    }
+
+    /// Regression test for the spawn_local read task drain bug:
+    ///
+    /// Read tasks are dispatched via tokio::task::spawn_local and hold raw
+    /// pointers (VolatileSliceGuard + status_ptr) into guest memory. Before
+    /// the fix, the quiesce branch only did try_recv() (non-blocking) to
+    /// drain read completions. Since try_recv() never yields to the tokio
+    /// runtime, spawned read tasks never got polled to completion. The worker
+    /// would park on resume_fd.await while in-flight reads still held pointers
+    /// into guest RAM. When load_memory overwrote guest RAM during restore,
+    /// the completing read tasks would write_volatile stale data, corrupting
+    /// the restored state.
+    ///
+    /// This test verifies that:
+    /// 1. In-flight reads are fully drained (awaited) before quiesce acks
+    /// 2. After quiesce + memory overwrite, no stale read writes corrupt RAM
+    #[test]
+    fn test_quiesce_drains_inflight_reads_before_ack() {
+        let mem =
+            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+
+        // Zero out queue rings
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+
+        let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
+        let interrupt = InterruptTransport::new(irqchip, "test-blk-read-drain".into()).unwrap();
+
+        let queue = make_test_queue();
+        let queue_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let stop_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resync_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let quiesce_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let resume_fd = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+
+        let shared_queue = Arc::new(Mutex::new(queue.clone()));
+        let shared_generation = Arc::new(AtomicU64::new(0));
+        let quiesce_ack = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let queue_evt_clone = queue_evt.try_clone().unwrap();
+        let quiesce_fd_clone = quiesce_fd.try_clone().unwrap();
+        let resume_fd_clone = resume_fd.try_clone().unwrap();
+        let stop_fd_clone = stop_fd.try_clone().unwrap();
+        let quiesce_ack_clone = quiesce_ack.clone();
+
+        // Create a backend with a 300ms READ delay so the read is in-flight
+        // when we trigger quiesce. Pre-populate sector 0 with 0xBB.
+        let backend = Arc::new(TrackingBackend::new(8192));
+        backend.set_read_delay(300);
+        {
+            let mut data = backend.data.write().unwrap();
+            data[..512].fill(0xBB);
+        }
+
+        let factory = Box::new(SharedBackendFactory {
+            backend: backend.clone(),
+        });
+        let shared_backend_state = Arc::new(Mutex::new(None));
+
+        let worker = AsyncBlockWorker::new(
+            queue,
+            queue_evt,
+            interrupt,
+            mem.clone(),
+            factory,
+            stop_fd,
+            resync_fd,
+            shared_queue.clone(),
+            shared_generation.clone(),
+            quiesce_fd,
+            resume_fd,
+            quiesce_ack.clone(),
+            shared_backend_state,
+        );
+
+        let _handle = worker.run();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // === Step 1: Submit a read request (will take 500ms due to delay) ===
+        let head0 = write_blk_read_request(&mem, 0, 0);
+        add_to_avail_ring(&mem, 0, head0);
+        queue_evt_clone.write(1).unwrap();
+
+        // Give the worker time to dispatch the read (but not enough for
+        // the 300ms delay to complete).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // === Step 2: Trigger quiesce while read is in-flight ===
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        quiesce_fd_clone.write(1).unwrap();
+
+        // The quiesce should NOT ack until the spawned read task completes.
+        let quiesce_start = std::time::Instant::now();
+        {
+            let (lock, cvar) = &*quiesce_ack_clone;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout_result) = cvar
+                .wait_timeout_while(
+                    guard,
+                    std::time::Duration::from_secs(10),
+                    |acked| !*acked,
+                )
+                .unwrap();
+            assert!(
+                *guard && !timeout_result.timed_out(),
+                "Worker did not ack quiesce within timeout"
+            );
+        }
+        let quiesce_duration = quiesce_start.elapsed();
+
+        // The read should have completed before the quiesce ack.
+        assert_eq!(
+            read_status(&mem, 0),
+            VIRTIO_BLK_S_OK as u8,
+            "In-flight read should have completed before quiesce ack"
+        );
+
+        // Verify the read data was written to guest memory.
+        let data_addr = DATA_AREA_ADDR + 0x10;
+        let mut readback = vec![0u8; 512];
+        mem.read_slice(&mut readback, GuestAddress(data_addr)).unwrap();
+        assert!(
+            readback.iter().all(|&b| b == 0xBB),
+            "Read data should have been written to guest memory before quiesce"
+        );
+
+        // The quiesce should have waited for the read (~200ms remaining delay).
+        // Use a generous lower bound to avoid timing flakes.
+        assert!(
+            quiesce_duration >= std::time::Duration::from_millis(100),
+            "Quiesce acked too fast ({:?}), likely didn't drain in-flight reads",
+            quiesce_duration
+        );
+
+        // === Step 3: Overwrite guest memory (simulating load_memory) ===
+        let sentinel = vec![0x55u8; 512];
+        mem.write_slice(&sentinel, GuestAddress(data_addr)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+
+        // === Step 4: Resume and verify no corruption ===
+        {
+            let (lock, _) = &*quiesce_ack_clone;
+            *lock.lock().unwrap() = false;
+        }
+        resume_fd_clone.write(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Sentinel should be intact — no stale read writes after resume.
+        let mut final_readback = vec![0u8; 512];
+        mem.read_slice(&mut final_readback, GuestAddress(data_addr)).unwrap();
+        assert_eq!(
+            final_readback, sentinel,
+            "Guest memory was corrupted after restore! Stale read wrote data."
+        );
+
+        // Cleanup
+        stop_fd_clone.write(1).unwrap();
     }
 }

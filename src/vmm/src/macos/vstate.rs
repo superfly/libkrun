@@ -47,6 +47,8 @@ pub enum Error {
     VcpuCountNotInitialized,
     /// Cannot run the VCPUs.
     VcpuRun,
+    /// Failed to save/restore vCPU state.
+    VcpuState(String),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -68,6 +70,7 @@ impl Display for Error {
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
             VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
             VcpuRun => write!(f, "Cannot run the VCPUs"),
+            VcpuState(e) => write!(f, "Failed to save or restore vCPU state: {e}"),
             NotEnoughMemorySlots => write!(
                 f,
                 "The number of configured slots is bigger than the maximum reported by KVM"
@@ -511,6 +514,8 @@ impl Vcpu {
                         if !self.wait_for_resume(&mut hvf_vcpu) {
                             break;
                         }
+                        // Drain stale wfe messages from a previous life after restore.
+                        while wfe_receiver.try_recv().is_ok() {}
                     }
                     _ => (),
                 },
@@ -519,6 +524,8 @@ impl Vcpu {
                     if !self.wait_for_resume(&mut hvf_vcpu) {
                         break;
                     }
+                    // Drain stale wfe messages from a previous life after restore.
+                    while wfe_receiver.try_recv().is_ok() {}
                 }
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
@@ -564,6 +571,14 @@ impl Vcpu {
                             if !self.wait_for_resume(hvf_vcpu) {
                                 return;
                             }
+                            // Drain stale wfe messages from a previous life after restore.
+                            while wfe_receiver.try_recv().is_ok() {}
+                            // After pause/resume (or state restore + resume), return
+                            // to the main loop so the vCPU re-enters hv_vcpu_run.
+                            // Without this, should_wait() sets status to Waiting and
+                            // the vCPU blocks here forever — no timer ticks, no
+                            // forward progress (manifests as RCU stalls on the guest).
+                            return;
                         }
                         Ok(_) => (),
                         Err(_) => return,
@@ -584,6 +599,10 @@ impl Vcpu {
                             if !self.wait_for_resume(hvf_vcpu) {
                                 return;
                             }
+                            // Drain stale wfe messages from a previous life after restore.
+                            while wfe_receiver.try_recv().is_ok() {}
+                            // Same as above: break out of WFI wait after resume.
+                            return;
                         }
                         Ok(_) => (),
                         Err(_) => return,
@@ -610,7 +629,9 @@ impl Vcpu {
                             .expect("failed to send state saved status");
                     }
                     Err(e) => {
-                        error!("Failed to save vCPU state: {e:?}");
+                        self.response_sender
+                            .send(VcpuResponse::StateError(format!("save_state: {e:?}")))
+                            .expect("failed to send state error status");
                     }
                 },
                 Ok(VcpuEvent::RestoreState(state)) => match hvf_vcpu.restore_state(&state) {
@@ -620,7 +641,9 @@ impl Vcpu {
                             .expect("failed to send state restored status");
                     }
                     Err(e) => {
-                        error!("Failed to restore vCPU state: {e:?}");
+                        self.response_sender
+                            .send(VcpuResponse::StateError(format!("restore_state: {e:?}")))
+                            .expect("failed to send state error status");
                     }
                 },
                 Ok(VcpuEvent::EnableDirtyTracking(config)) => {
@@ -693,6 +716,8 @@ pub enum VcpuResponse {
     StateSaved(Box<hvf::Aarch64VcpuState>),
     /// vCPU state has been restored.
     StateRestored,
+    /// vCPU state operation failed.
+    StateError(String),
     /// Vcpu is stopped.
     Exited(u8),
 }
@@ -717,6 +742,7 @@ impl std::fmt::Debug for VcpuResponse {
             VcpuResponse::Resumed => write!(f, "Resumed"),
             VcpuResponse::StateSaved(_) => write!(f, "StateSaved(...)"),
             VcpuResponse::StateRestored => write!(f, "StateRestored"),
+            VcpuResponse::StateError(msg) => write!(f, "StateError({msg})"),
             VcpuResponse::Exited(code) => write!(f, "Exited({code})"),
         }
     }
@@ -779,6 +805,7 @@ impl VcpuHandle {
             .recv_timeout(Duration::from_millis(5000))
         {
             Ok(VcpuResponse::StateSaved(state)) => Ok(*state),
+            Ok(VcpuResponse::StateError(msg)) => Err(Error::VcpuState(msg)),
             other => {
                 error!("Unexpected response to SaveState: {other:?}");
                 Err(Error::VcpuRun)
@@ -796,6 +823,7 @@ impl VcpuHandle {
             .recv_timeout(Duration::from_millis(5000))
         {
             Ok(VcpuResponse::StateRestored) => Ok(()),
+            Ok(VcpuResponse::StateError(msg)) => Err(Error::VcpuState(msg)),
             other => {
                 error!("Unexpected response to RestoreState: {other:?}");
                 Err(Error::VcpuRun)

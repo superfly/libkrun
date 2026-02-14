@@ -218,6 +218,12 @@ pub struct Vmm {
     pio_device_manager: PortIODeviceManager,
     #[cfg(target_os = "macos")]
     dirty_bitmaps: Vec<dirty_bitmap::DirtyBitmap>,
+
+    // Interrupt controller state needed for snapshots.
+    #[cfg(target_os = "macos")]
+    vcpu_list: Arc<devices::legacy::VcpuList>,
+    #[cfg(target_os = "macos")]
+    intc: IrqChip,
 }
 
 impl Vmm {
@@ -232,21 +238,31 @@ impl Vmm {
 
     /// Starts the microVM vcpus.
     pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
-        let vcpu_count = vcpus.len();
+        self.start_vcpus_paused(&mut vcpus)?;
 
+        // The vcpus start off in the `Paused` state, let them run.
+        self.resume_vcpus()?;
+
+        Ok(())
+    }
+
+    /// Starts the microVM vcpus without resuming them.
+    ///
+    /// After this call vCPU threads exist but are sitting in their initial
+    /// event loop waiting for Resume or RestoreState. Use this for cold
+    /// restore from snapshot.
+    pub fn start_vcpus_paused(&mut self, vcpus: &mut Vec<Vcpu>) -> Result<()> {
         Vcpu::register_kick_signal_handler();
 
-        self.vcpus_handles.reserve(vcpu_count);
+        self.vcpus_handles.reserve(vcpus.len());
 
-        for mut vcpu in vcpus.drain(..) {
+        for vcpu in vcpus.drain(..) {
+            let mut vcpu = vcpu;
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
         }
-
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
 
         Ok(())
     }
@@ -289,6 +305,44 @@ impl Vmm {
         for (handle, state) in self.vcpus_handles.iter().zip(states.into_iter()) {
             handle.restore_state(state).map_err(Error::Vcpu)?;
         }
+        Ok(())
+    }
+
+    /// Save interrupt controller state (pending IRQs + GIC registers) for snapshot.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    fn save_interrupt_controller_state(
+        &self,
+    ) -> std::result::Result<Option<Vec<u8>>, snapshot::SnapshotError> {
+        let pending_irqs = self.vcpu_list.save_interrupt_state();
+        let gic_registers = self.intc.lock().unwrap().save_snapshot_state();
+
+        let ic_snapshot = snapshot::InterruptControllerSnapshot {
+            pending_irqs,
+            gic_registers,
+        };
+
+        let data = bincode::serialize(&ic_snapshot)
+            .map_err(|e| snapshot::SnapshotError::Serialize(e.to_string()))?;
+        Ok(Some(data))
+    }
+
+    /// Restore interrupt controller state (pending IRQs + GIC registers) from snapshot.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    fn restore_interrupt_controller_state(
+        &self,
+        data: &[u8],
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let ic_snapshot: snapshot::InterruptControllerSnapshot =
+            bincode::deserialize(data)
+                .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))?;
+
+        self.vcpu_list
+            .restore_interrupt_state(&ic_snapshot.pending_irqs);
+
+        if let Some(gic_data) = &ic_snapshot.gic_registers {
+            self.intc.lock().unwrap().restore_snapshot_state(gic_data);
+        }
+
         Ok(())
     }
 
@@ -399,10 +453,8 @@ impl Vmm {
         &mut self,
         path: &std::path::Path,
     ) -> std::result::Result<(), snapshot::SnapshotError> {
-        let vcpu_states = self.save_vcpu_states().map_err(|e| {
-            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
-        })?;
-
+        // Save device state before vCPU state (Firecracker convention: device
+        // save may trigger interrupts that should be captured in vCPU state).
         let device_states = self
             .mmio_device_manager
             .save_all_device_states()
@@ -410,11 +462,18 @@ impl Vmm {
                 snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
             })?;
 
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        let gic_state = self.save_interrupt_controller_state()?;
+
         snapshot::create_full_snapshot(
             path,
             &self.guest_memory,
             vcpu_states,
             device_states,
+            gic_state,
             false, // TODO: get nested_enabled from VM config
         )
     }
@@ -432,7 +491,25 @@ impl Vmm {
             self.vcpus_handles.len(),
         )?;
 
+        // Quiesce all async device workers before overwriting guest memory.
+        // Workers may hold VolatileSliceGuard pointers into guest RAM; if we
+        // overwrite memory while they're mid-operation, they'll corrupt the
+        // restored state (e.g. writing stale used-ring entries → NETDEV WATCHDOG).
+        self.mmio_device_manager
+            .quiesce_all_device_workers(snapshot::SNAPSHOT_QUIESCE_TIMEOUT)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to quiesce device workers before restore: {e}"
+                ))
+            })?;
+
         snapshot::load_memory(&self.guest_memory, &path.join("memory"))?;
+
+        // Phase 1: Restore all state without spawning any threads.
+        // Device state is deserialized but activate() is deferred.
+        if let Some(gic_data) = &vmstate.gic_state {
+            self.restore_interrupt_controller_state(gic_data)?;
+        }
         self.mmio_device_manager
             .restore_all_device_states(&vmstate.device_states)
             .map_err(|e| {
@@ -440,6 +517,19 @@ impl Vmm {
                     "Failed to restore device states: {e}"
                 ))
             })?;
+
+        // Phase 2: Now that all state is loaded, activate devices (spawning
+        // threads) and kick workers. Threads can safely fire IRQs because
+        // interrupt controller state is already in place.
+        self.mmio_device_manager
+            .complete_all_device_restores()
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to complete device restores: {e}"
+                ))
+            })?;
+        self.mmio_device_manager.resume_all_device_workers();
+
         self.restore_vcpu_states(vmstate.vcpu_states).map_err(|e| {
             snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
         })?;
@@ -522,16 +612,19 @@ impl Vmm {
     ) -> std::result::Result<(), snapshot::SnapshotError> {
         use vm_memory::{GuestAddress, GuestMemory, GuestMemoryRegion};
 
-        let vcpu_states = self.save_vcpu_states().map_err(|e| {
-            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
-        })?;
-
+        // Save device state before vCPU state (Firecracker convention).
         let device_states = self
             .mmio_device_manager
             .save_all_device_states()
             .map_err(|e| {
                 snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
             })?;
+
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        let gic_state = self.save_interrupt_controller_state()?;
 
         let mut dirty_pages = Vec::new();
         for bitmap in &self.dirty_bitmaps {
@@ -577,6 +670,7 @@ impl Vmm {
             vcpu_states,
             device_states,
             dirty_pages,
+            gic_state,
         };
 
         snapshot::save_incremental_snapshot(&incremental, path)
@@ -595,7 +689,23 @@ impl Vmm {
             self.vcpus_handles.len(),
         )?;
 
+        // Quiesce all async device workers before overwriting guest memory.
+        // Same race as restore_snapshot: workers may hold raw pointers into
+        // guest RAM during in-flight I/O.
+        self.mmio_device_manager
+            .quiesce_all_device_workers(snapshot::SNAPSHOT_QUIESCE_TIMEOUT)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to quiesce device workers before restore: {e}"
+                ))
+            })?;
+
         snapshot::apply_dirty_pages(&self.guest_memory, &incremental.dirty_pages)?;
+
+        // Phase 1: Restore all state without spawning any threads.
+        if let Some(gic_data) = &incremental.gic_state {
+            self.restore_interrupt_controller_state(gic_data)?;
+        }
         self.mmio_device_manager
             .restore_all_device_states(&incremental.device_states)
             .map_err(|e| {
@@ -603,6 +713,17 @@ impl Vmm {
                     "Failed to restore device states: {e}"
                 ))
             })?;
+
+        // Phase 2: Activate devices (if needed) and kick workers.
+        self.mmio_device_manager
+            .complete_all_device_restores()
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to complete device restores: {e}"
+                ))
+            })?;
+        self.mmio_device_manager.resume_all_device_workers();
+
         self.restore_vcpu_states(incremental.vcpu_states)
             .map_err(|e| {
                 snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))

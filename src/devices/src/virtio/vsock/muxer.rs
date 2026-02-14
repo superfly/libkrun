@@ -139,10 +139,15 @@ impl VsockMuxer {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        rxq_kick: utils::eventfd::EventFd,
     ) {
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
+
+        // Wire up the rxq notification so the EventManager drains pushed
+        // packets even when they come from the muxer thread.
+        self.rxq.lock().unwrap().set_kick_fd(rxq_kick);
 
         #[cfg(target_os = "macos")]
         {

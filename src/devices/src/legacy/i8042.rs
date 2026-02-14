@@ -325,12 +325,9 @@ mod tests {
         assert_eq!(data, [1, 2]);
 
         // Check if reset works.
-        // Write 1 to the reset event fd, so that read doesn't block in case the event fd
-        // counter doesn't change (for 0 it blocks).
-        assert!(reset_evt.write(1).is_ok());
         let mut data = [CMD_RESET_CPU];
         i8042.write(0, OFS_STATUS, &data);
-        assert_eq!(reset_evt.read().unwrap(), 2);
+        assert_eq!(reset_evt.read().unwrap(), 1);
 
         // Check if reading with offset 1 doesn't have side effects.
         i8042.read(0, 1, &mut data);
@@ -411,29 +408,24 @@ mod tests {
         fn expect_key(i8042: &mut I8042Device, key: u16) {
             let mut data = [1];
 
-            // The interrupt line should be on.
-            i8042.trigger_kbd_interrupt().unwrap();
-            assert!(i8042.kbd_interrupt_evt.read().unwrap() > 1);
+            // The interrupt from trigger_key should be pending.
+            assert_eq!(i8042.kbd_interrupt_evt.read().unwrap(), 1);
 
             // The "data available" flag should be on.
             i8042.read(0, OFS_STATUS, &mut data);
 
-            let mut key_byte: u8;
             if key & 0xFF00 != 0 {
                 // For extended keys, we should be able to read the MSB first.
-                key_byte = ((key & 0xFF00) >> 8) as u8;
+                let key_byte = ((key & 0xFF00) >> 8) as u8;
                 i8042.read(0, OFS_DATA, &mut data);
                 assert_eq!(data[0], key_byte);
 
-                // And then do the same for the LSB.
-
-                // The interrupt line should be on.
-                i8042.trigger_kbd_interrupt().unwrap();
-                assert!(i8042.kbd_interrupt_evt.read().unwrap() > 1);
-                // The "data available" flag should be on.
+                // Reading the MSB triggers another interrupt (more data available).
+                assert_eq!(i8042.kbd_interrupt_evt.read().unwrap(), 1);
+                // The "data available" flag should still be on.
                 i8042.read(0, OFS_STATUS, &mut data);
             }
-            key_byte = (key & 0xFF) as u8;
+            let key_byte = (key & 0xFF) as u8;
             i8042.read(0, OFS_DATA, &mut data);
             assert_eq!(data[0], key_byte);
         }

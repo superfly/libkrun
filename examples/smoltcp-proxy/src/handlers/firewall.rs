@@ -482,8 +482,14 @@ mod tests {
         // Helper to create IpAddr::V6 from segments
         fn v6(segments: [u16; 8]) -> IpAddr {
             IpAddr::V6(Ipv6Addr::new(
-                segments[0], segments[1], segments[2], segments[3],
-                segments[4], segments[5], segments[6], segments[7],
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                segments[4],
+                segments[5],
+                segments[6],
+                segments[7],
             ))
         }
 
@@ -537,7 +543,9 @@ mod tests {
         fn test_cidr_v6_slash_64() {
             let cidr = Cidr::parse("2001:db8::/32").unwrap();
             assert!(cidr.contains(v6([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1])));
-            assert!(cidr.contains(v6([0x2001, 0x0db8, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff])));
+            assert!(cidr.contains(v6([
+                0x2001, 0x0db8, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff
+            ])));
             assert!(!cidr.contains(v6([0x2001, 0x0db9, 0, 0, 0, 0, 0, 1])));
             // IPv4 doesn't match IPv6 CIDR
             assert!(!cidr.contains(v4(10, 0, 0, 1)));
@@ -554,7 +562,9 @@ mod tests {
         fn test_cidr_v6_link_local() {
             let cidr = Cidr::parse("fe80::/10").unwrap();
             assert!(cidr.contains(v6([0xfe80, 0, 0, 0, 0, 0, 0, 1])));
-            assert!(cidr.contains(v6([0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff])));
+            assert!(cidr.contains(v6([
+                0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff
+            ])));
             assert!(!cidr.contains(v6([0xfec0, 0, 0, 0, 0, 0, 0, 1])));
         }
 
@@ -1298,12 +1308,18 @@ mod tests {
             // HTTP to public: allowed
             let pkt = build_tcp_syn_packet(src, public, 12345, 80);
             let ctx = PacketContext::parse(&pkt, VM_MAC, GW_MAC, &tx).unwrap();
-            assert!(matches!(handler.handle(&ctx).unwrap(), PacketVerdict::Continue));
+            assert!(matches!(
+                handler.handle(&ctx).unwrap(),
+                PacketVerdict::Continue
+            ));
 
             // HTTPS to public: allowed
             let pkt = build_tcp_syn_packet(src, public, 12345, 443);
             let ctx = PacketContext::parse(&pkt, VM_MAC, GW_MAC, &tx).unwrap();
-            assert!(matches!(handler.handle(&ctx).unwrap(), PacketVerdict::Continue));
+            assert!(matches!(
+                handler.handle(&ctx).unwrap(),
+                PacketVerdict::Continue
+            ));
 
             // HTTP to private: blocked (destination denied)
             let pkt = build_tcp_syn_packet(src, private, 12345, 80);
@@ -1318,7 +1334,10 @@ mod tests {
             // DNS to public: allowed
             let pkt = build_udp_packet(src, public, 12345, 53);
             let ctx = PacketContext::parse(&pkt, VM_MAC, GW_MAC, &tx).unwrap();
-            assert!(matches!(handler.handle(&ctx).unwrap(), PacketVerdict::Continue));
+            assert!(matches!(
+                handler.handle(&ctx).unwrap(),
+                PacketVerdict::Continue
+            ));
 
             // DNS to private: blocked
             let pkt = build_udp_packet(src, private, 12345, 53);
@@ -1328,7 +1347,10 @@ mod tests {
             // Ping to public: allowed
             let pkt = build_icmp_echo_request(src, public);
             let ctx = PacketContext::parse(&pkt, VM_MAC, GW_MAC, &tx).unwrap();
-            assert!(matches!(handler.handle(&ctx).unwrap(), PacketVerdict::Continue));
+            assert!(matches!(
+                handler.handle(&ctx).unwrap(),
+                PacketVerdict::Continue
+            ));
 
             // Ping to private: blocked
             let pkt = build_icmp_echo_request(src, private);

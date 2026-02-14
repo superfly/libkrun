@@ -17,6 +17,9 @@ use hvf::Aarch64VcpuState;
 pub const SNAPSHOT_MAGIC: u32 = 0x4B52_534E; // "KRSN"
 pub const SNAPSHOT_VERSION: u32 = 1;
 
+/// Timeout for quiescing async device workers during snapshot operations.
+pub const SNAPSHOT_QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(io::Error),
@@ -123,6 +126,8 @@ pub struct VmSnapshot {
     pub vcpu_states: Vec<Aarch64VcpuState>,
     /// Device states as (device_id, serialized_bytes) pairs.
     pub device_states: Vec<(String, Vec<u8>)>,
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub gic_state: Option<Vec<u8>>,
 }
 
 /// Dump guest memory to a file.
@@ -215,6 +220,7 @@ pub fn create_full_snapshot(
     guest_memory: &GuestMemoryMmap,
     vcpu_states: Vec<Aarch64VcpuState>,
     device_states: Vec<(String, Vec<u8>)>,
+    gic_state: Option<Vec<u8>>,
     nested_enabled: bool,
 ) -> Result<(), SnapshotError> {
     std::fs::create_dir_all(path)?;
@@ -229,6 +235,7 @@ pub fn create_full_snapshot(
         },
         vcpu_states,
         device_states,
+        gic_state,
     };
 
     save_vmstate(&snapshot, &path.join("vmstate"))?;
@@ -256,6 +263,16 @@ pub struct IncrementalSnapshot {
     pub vcpu_states: Vec<Aarch64VcpuState>,
     pub device_states: Vec<(String, Vec<u8>)>,
     pub dirty_pages: Vec<DirtyPage>,
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub gic_state: Option<Vec<u8>>,
+}
+
+/// Combined interrupt controller snapshot: pending IRQs + GIC register state.
+#[cfg(feature = "snapshot")]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct InterruptControllerSnapshot {
+    pub pending_irqs: Vec<Vec<u32>>,
+    pub gic_registers: Option<Vec<u8>>,
 }
 
 /// Save an incremental snapshot.

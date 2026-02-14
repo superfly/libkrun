@@ -106,6 +106,22 @@ impl VcpuList {
             .set_irq_common(irq);
     }
 
+    /// Save pending IRQ queues for all vCPUs (for snapshot).
+    pub fn save_interrupt_state(&self) -> Vec<Vec<u32>> {
+        self.vcpus
+            .iter()
+            .map(|vcpu| vcpu.lock().unwrap().pending_irqs.iter().copied().collect())
+            .collect()
+    }
+
+    /// Restore pending IRQ queues for all vCPUs (from snapshot).
+    pub fn restore_interrupt_state(&self, irqs: &[Vec<u32>]) {
+        assert_eq!(irqs.len(), self.cpu_count as usize);
+        for (vcpu, pending) in self.vcpus.iter().zip(irqs.iter()) {
+            vcpu.lock().unwrap().pending_irqs = pending.iter().copied().collect();
+        }
+    }
+
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);

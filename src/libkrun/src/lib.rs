@@ -3030,6 +3030,27 @@ impl Context {
                 .map_err(StartError::EventManagerRun)?;
         }
     }
+
+    /// Cold restore: load a snapshot and run the VM from restored state.
+    ///
+    /// Restores the full base snapshot, then applies any incremental
+    /// snapshots in order. The VM starts executing from the final
+    /// restored state. Blocks until the VM exits.
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_and_run(
+        mut self,
+        base_path: &std::path::Path,
+        incremental_paths: &[&std::path::Path],
+    ) -> Result<(), StartError> {
+        self.built_vm
+            .restore_from_snapshot(base_path, incremental_paths)?;
+
+        loop {
+            self.event_manager
+                .run()
+                .map_err(StartError::EventManagerRun)?;
+        }
+    }
 }
 
 /// Handle for controlling a running VM from another thread.

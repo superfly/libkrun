@@ -136,8 +136,8 @@ impl Subscriber for Console {
                 raise_irq |= self.process_control_rx();
             } else if source == control_rxq {
                 // Guest provided new buffers to control RX queue - try to deliver pending messages
-                raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
-                    && self.process_control_rx()
+                raise_irq |=
+                    self.read_queue_event(CONTROL_RXQ_INDEX, event) && self.process_control_rx()
             }
             /* Guest signaled input/output on port */
             else if let Some(queue_index) = self

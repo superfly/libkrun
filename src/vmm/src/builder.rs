@@ -579,6 +579,11 @@ pub struct BuiltVm {
     vcpus: Option<Vec<Vcpu>>,
     /// Device information populated during build - access this before calling `run()`.
     pub device_info: VmDeviceInfo,
+    /// Boot senders for secondary vCPUs. Used to unblock them during cold
+    /// restore (they wait on boot_receiver for a PSCI CPU_ON that never comes
+    /// when we skip the kernel boot).
+    #[cfg(target_os = "macos")]
+    boot_senders: Vec<Sender<u64>>,
 }
 
 impl BuiltVm {
@@ -600,6 +605,76 @@ impl BuiltVm {
             .expect("Poisoned vmm lock")
             .start_vcpus(vcpus)
             .map_err(StartMicrovmError::Internal)?;
+        Ok(self.vmm.clone())
+    }
+
+    /// Cold restore: start vCPU threads paused, load snapshot, then resume.
+    ///
+    /// Unlike `run()` which boots from the kernel entry point, this skips
+    /// kernel boot entirely and restores the VM from a previously-taken
+    /// snapshot. Optionally applies a chain of incremental snapshots on
+    /// top of the base before resuming.
+    ///
+    /// The flow is:
+    ///
+    /// 1. Start vCPU threads (paused in initial event loop)
+    /// 2. Unblock secondary vCPUs (they wait for PSCI CPU_ON which never comes)
+    /// 3. Restore full snapshot (memory, devices, interrupts, vCPU state)
+    /// 4. Apply each incremental snapshot in order (dirty pages, updated
+    ///    device/interrupt/vCPU state — each RestoreState overwrites the last)
+    /// 5. Resume all vCPUs — they continue from the final restored state
+    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    pub fn restore_from_snapshot(
+        &mut self,
+        base_path: &std::path::Path,
+        incremental_paths: &[&std::path::Path],
+    ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+        let mut vcpus = self
+            .vcpus
+            .take()
+            .ok_or(StartMicrovmError::MicroVMAlreadyRunning)?;
+
+        let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
+
+        // Step 1: Start vCPU threads — they park in the initial event loop
+        // waiting for Resume or RestoreState.
+        vmm.start_vcpus_paused(&mut vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+
+        // Step 2: Unblock secondary vCPUs. They block on boot_receiver.recv()
+        // waiting for PSCI CPU_ON from the kernel. Since we're skipping boot,
+        // send a dummy entry address to unblock them. RestoreState will
+        // overwrite their registers anyway.
+        for sender in self.boot_senders.drain(..) {
+            let _ = sender.send(0);
+        }
+
+        let snapshot_err = |e: super::snapshot::SnapshotError| {
+            StartMicrovmError::Internal(super::Error::EventFd(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        };
+
+        // Step 3: Load the full base snapshot (memory, devices, interrupts, vCPU state).
+        // vCPU threads receive RestoreState but stay in the initial event loop.
+        vmm.restore_snapshot(base_path).map_err(snapshot_err)?;
+
+        // Step 4: Apply incremental snapshots in order. Each one patches dirty
+        // pages and sends a fresh RestoreState that overwrites the previous.
+        // Device workers are quiesced/resumed around each incremental to avoid
+        // races with guest memory writes.
+        for inc_path in incremental_paths {
+            vmm.restore_incremental_snapshot(inc_path)
+                .map_err(snapshot_err)?;
+        }
+
+        // Step 5: Resume all vCPUs — they leave the initial event loop and
+        // enter the main execution loop with the final restored state.
+        vmm.resume_vcpus()
+            .map_err(StartMicrovmError::Internal)?;
+
+        drop(vmm);
         Ok(self.vmm.clone())
     }
 }
@@ -851,6 +926,8 @@ pub fn build_microvm(
     };
 
     let vcpus;
+    #[cfg(target_os = "macos")]
+    let mut boot_senders: Vec<Sender<u64>> = Vec::new();
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -950,7 +1027,8 @@ pub fn build_microvm(
             Arc::new(Mutex::new(gic))
         };
 
-        vcpus = create_vcpus_aarch64(
+        let created;
+        (created, boot_senders) = create_vcpus_aarch64(
             &vm,
             &vcpu_config,
             &arch_memory_info,
@@ -960,6 +1038,7 @@ pub fn build_microvm(
             vm_resources.nested_enabled,
         )
         .map_err(StartMicrovmError::Internal)?;
+        vcpus = created;
 
         attach_legacy_devices(
             &vm,
@@ -1012,6 +1091,10 @@ pub fn build_microvm(
         pio_device_manager,
         #[cfg(target_os = "macos")]
         dirty_bitmaps: Vec::new(),
+        #[cfg(target_os = "macos")]
+        vcpu_list: vcpu_list.clone(),
+        #[cfg(target_os = "macos")]
+        intc: intc.clone(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1191,6 +1274,8 @@ pub fn build_microvm(
         vmm,
         vcpus: Some(vcpus),
         device_info,
+        #[cfg(target_os = "macos")]
+        boot_senders,
     })
 }
 
@@ -1833,6 +1918,12 @@ fn create_vcpus_aarch64(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+/// Returns (vcpus, boot_senders_for_cold_restore).
+///
+/// `boot_senders_for_cold_restore` contains one sender per secondary vCPU.
+/// During normal boot, vCPU 0 sends entry addresses via PSCI CPU_ON.
+/// During cold restore, we send dummy values to unblock secondary vCPUs
+/// before injecting the snapshot state.
 fn create_vcpus_aarch64(
     _vm: &Vm,
     vcpu_config: &VcpuConfig,
@@ -1841,9 +1932,10 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
-) -> super::Result<Vec<Vcpu>> {
+) -> super::Result<(Vec<Vcpu>, Vec<Sender<u64>>)> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut cold_restore_senders: Vec<Sender<u64>> = Vec::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {
@@ -1866,6 +1958,7 @@ fn create_vcpus_aarch64(
         vcpu.configure_aarch64(mem_info).map_err(Error::Vcpu)?;
 
         if let Some(boot_sender) = boot_sender {
+            cold_restore_senders.push(boot_sender.clone());
             boot_senders.insert(vcpu.get_mpidr(), boot_sender);
         }
 
@@ -1874,7 +1967,7 @@ fn create_vcpus_aarch64(
 
     vcpus[0].set_boot_senders(boot_senders);
 
-    Ok(vcpus)
+    Ok((vcpus, cold_restore_senders))
 }
 
 #[cfg(all(target_arch = "riscv64", target_os = "linux"))]

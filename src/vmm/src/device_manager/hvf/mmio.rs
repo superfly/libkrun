@@ -325,6 +325,7 @@ impl MMIODeviceManager {
     /// Returns a list of (device_id, serialized_state) pairs.
     pub fn save_all_device_states(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut states = Vec::new();
+
         for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
             let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
                 return Err(Error::SnapshotState(format!(
@@ -332,24 +333,95 @@ impl MMIODeviceManager {
                 )));
             };
 
-            let device = device
-                .lock()
-                .map_err(|e| Error::SnapshotState(format!("Failed to lock device: {e}")))?;
+            let device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id}: {e}"
+                    )));
+                }
+            };
             if let Some(snapshottable) = device.as_snapshottable() {
-                let state = snapshottable.save_state().map_err(|e| {
-                    Error::SnapshotState(format!(
-                        "Failed to save state for {device_type}:{device_id}: {e}"
-                    ))
-                })?;
+                let state = match snapshottable.save_state() {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return Err(Error::SnapshotState(format!(
+                            "Failed to save state for {device_type}:{device_id}: {e}"
+                        )));
+                    }
+                };
                 let id = format!("{device_type}:{device_id}");
                 states.push((id, state));
             } else {
-                return Err(Error::SnapshotState(format!(
-                    "Device {device_type}:{device_id} does not support snapshotting"
-                )));
+                debug!(
+                    "Skipping non-snapshottable device during snapshot save: {device_type}:{device_id}"
+                );
             }
         }
         Ok(states)
+    }
+
+    /// Quiesce all device workers before snapshot restore overwrites guest memory.
+    /// This ensures no async workers hold stale pointers into guest RAM.
+    pub fn quiesce_all_device_workers(&self, timeout: std::time::Duration) -> Result<()> {
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                continue;
+            };
+            let device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id} for quiesce: {e}"
+                    )));
+                }
+            };
+            if let Err(e) = device.quiesce_workers(timeout) {
+                return Err(Error::SnapshotState(format!(
+                    "Failed to quiesce workers for {device_type}:{device_id}: {e}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume all device workers after snapshot restore completes.
+    pub fn resume_all_device_workers(&self) {
+        for (_, dev_info) in &self.id_to_dev_info {
+            if let Some((_, device)) = self.bus.get_device(dev_info.addr) {
+                if let Ok(device) = device.lock() {
+                    device.resume_workers();
+                }
+            }
+        }
+    }
+
+    /// Activate devices and kick workers after all snapshot state is loaded.
+    ///
+    /// Must be called after restore_all_device_states() and after interrupt
+    /// controller state has been restored. This is the point where device
+    /// threads are spawned.
+    #[cfg(feature = "snapshot")]
+    pub fn complete_all_device_restores(&self) -> Result<()> {
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                continue;
+            };
+            let mut device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id} for complete_restore: {e}"
+                    )));
+                }
+            };
+            if let Err(e) = device.complete_restore() {
+                return Err(Error::SnapshotState(format!(
+                    "Failed to complete restore for {device_type}:{device_id}: {e}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Restore device states from a snapshot.
@@ -365,19 +437,24 @@ impl MMIODeviceManager {
                             "Device {id} missing from bus during restore"
                         )));
                     };
-                    let mut device = device
-                        .lock()
-                        .map_err(|e| Error::SnapshotState(format!("Failed to lock device: {e}")))?;
+                    let mut device = match device.lock() {
+                        Ok(device) => device,
+                        Err(e) => {
+                            return Err(Error::SnapshotState(format!(
+                                "Failed to lock device {id} during restore: {e}"
+                            )));
+                        }
+                    };
                     let Some(snapshottable) = device.as_snapshottable_mut() else {
                         return Err(Error::SnapshotState(format!(
                             "Device {id} does not support snapshot restore"
                         )));
                     };
-                    snapshottable.restore_state(data).map_err(|e| {
-                        Error::SnapshotState(format!(
+                    if let Err(e) = snapshottable.restore_state(data) {
+                        return Err(Error::SnapshotState(format!(
                             "Failed to restore state for device {id}: {e}"
-                        ))
-                    })?;
+                        )));
+                    }
 
                     found = true;
                     break;
@@ -416,14 +493,12 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::builder;
     use super::*;
     use arch;
     use devices::legacy::DummyIrqChip;
     use devices::virtio::{ActivateResult, InterruptTransport, Queue, VirtioDevice};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
-    use utils::errno;
     use utils::eventfd::EventFd;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -432,19 +507,17 @@ mod tests {
     impl MMIODeviceManager {
         fn register_virtio_device(
             &mut self,
-            vm: &VmFd,
             guest_mem: GuestMemoryMmap,
             device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
-            cmdline: &mut kernel_cmdline::Cmdline,
+            _cmdline: &mut kernel_cmdline::Cmdline,
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
             let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device);
+                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
+                    .unwrap();
             let (mmio_base, _irq) =
-                self.register_mmio_device(vm, mmio_device, type_id, device_id.to_string())?;
-            #[cfg(target_arch = "x86_64")]
-            self.add_device_to_cmdline(cmdline, mmio_base, _irq)?;
+                self.register_mmio_device(mmio_device, type_id, device_id.to_string())?;
             Ok(mmio_base)
         }
     }
@@ -536,19 +609,14 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let mut vm = builder::setup_kvm_vm(&guest_mem).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
-        #[cfg(target_arch = "x86_64")]
-        assert!(builder::setup_interrupt_controller(&mut vm).is_ok());
-        #[cfg(target_arch = "aarch64")]
-        assert!(builder::setup_interrupt_controller(&mut vm, 1).is_ok());
 
         assert!(device_manager
-            .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, 0, "dummy")
+            .register_virtio_device(guest_mem, dummy, &mut cmdline, 0, "dummy")
             .is_ok());
     }
 
@@ -558,20 +626,14 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let mut vm = builder::setup_kvm_vm(&guest_mem).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
-        #[cfg(target_arch = "x86_64")]
-        assert!(builder::setup_interrupt_controller(&mut vm).is_ok());
-        #[cfg(target_arch = "aarch64")]
-        assert!(builder::setup_interrupt_controller(&mut vm, 1).is_ok());
 
         for _i in arch::IRQ_BASE..=arch::IRQ_MAX {
             device_manager
                 .register_virtio_device(
-                    vm.fd(),
                     guest_mem.clone(),
                     Arc::new(Mutex::new(DummyDevice::new())),
                     &mut cmdline,
@@ -585,7 +647,6 @@ mod tests {
                 "{}",
                 device_manager
                     .register_virtio_device(
-                        vm.fd(),
                         guest_mem,
                         Arc::new(Mutex::new(DummyDevice::new())),
                         &mut cmdline,
@@ -646,12 +707,12 @@ mod tests {
             "no more IRQs are available"
         );
         assert_eq!(
-            format!("{}", Error::RegisterIoEvent(errno::Error::new(0))),
-            format!("failed to register IO event: {}", errno::Error::new(0))
+            format!("{}", Error::RegisterIoEvent),
+            "failed to register IO event"
         );
         assert_eq!(
-            format!("{}", Error::RegisterIrqFd(errno::Error::new(0))),
-            format!("failed to register irqfd: {}", errno::Error::new(0))
+            format!("{}", Error::RegisterIrqFd),
+            "failed to register irqfd"
         );
     }
 
@@ -661,7 +722,6 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let vm = builder::setup_kvm_vm(&guest_mem).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
@@ -669,14 +729,9 @@ mod tests {
 
         let type_id = 0;
         let id = String::from("foo");
-        if let Ok(addr) = device_manager.register_virtio_device(
-            vm.fd(),
-            guest_mem,
-            dummy,
-            &mut cmdline,
-            type_id,
-            &id,
-        ) {
+        if let Ok(addr) =
+            device_manager.register_virtio_device(guest_mem, dummy, &mut cmdline, type_id, &id)
+        {
             assert!(device_manager
                 .get_device(DeviceType::Virtio(type_id), &id)
                 .is_some());

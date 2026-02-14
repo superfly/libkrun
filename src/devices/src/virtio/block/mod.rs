@@ -1,9 +1,9 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod async_worker;
 pub mod device;
 mod worker;
-pub mod async_worker;
 
 use std::io;
 use std::sync::Arc;
@@ -137,6 +137,14 @@ pub trait BlockBackend: Send {
     /// Called when the VMM is shutting down.
     /// Use this for cleanup like flushing data to persistent storage.
     fn on_exit(&self) {}
+
+    /// Serialize backend state for snapshot. Default: no state saved.
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restore backend state from a previous snapshot. Default: no-op.
+    fn restore_snapshot_state(&self, _data: &[u8]) {}
 }
 
 impl<B> BlockBackend for std::sync::Arc<B>
@@ -181,6 +189,14 @@ where
 
     fn on_exit(&self) {
         (**self).on_exit()
+    }
+
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        (**self).save_snapshot_state()
+    }
+
+    fn restore_snapshot_state(&self, data: &[u8]) {
+        (**self).restore_snapshot_state(data)
     }
 }
 
@@ -235,11 +251,19 @@ pub trait AsyncBlockBackend: Send + Sync + 'static {
 
     /// Reads data from the backend at the given offset into the provided buffers.
     /// Returns the number of bytes read.
-    fn read_vectored_at(&self, bufs: Vec<VolatileSliceGuard>, offset: u64) -> BoxFuture<'_, io::Result<usize>>;
+    fn read_vectored_at(
+        &self,
+        bufs: Vec<VolatileSliceGuard>,
+        offset: u64,
+    ) -> BoxFuture<'_, io::Result<usize>>;
 
     /// Writes data to the backend at the given offset from the provided buffers.
     /// Returns the number of bytes written.
-    fn write_vectored_at(&self, bufs: Vec<VolatileSliceGuard>, offset: u64) -> BoxFuture<'_, io::Result<usize>>;
+    fn write_vectored_at(
+        &self,
+        bufs: Vec<VolatileSliceGuard>,
+        offset: u64,
+    ) -> BoxFuture<'_, io::Result<usize>>;
 
     /// Writes multiple regions in a single batch operation.
     /// Each tuple contains (offset, buffers) for one write.
@@ -247,7 +271,10 @@ pub trait AsyncBlockBackend: Send + Sync + 'static {
     ///
     /// The default implementation calls write_vectored_at for each write sequentially.
     /// Backends can override this to implement more efficient batching (e.g., single WAL append).
-    fn write_batch(&self, writes: Vec<(u64, Vec<VolatileSliceGuard>)>) -> BoxFuture<'_, io::Result<Vec<usize>>> {
+    fn write_batch(
+        &self,
+        writes: Vec<(u64, Vec<VolatileSliceGuard>)>,
+    ) -> BoxFuture<'_, io::Result<Vec<usize>>> {
         Box::pin(async move {
             let mut results = Vec::with_capacity(writes.len());
             for (offset, bufs) in writes {
@@ -281,6 +308,14 @@ pub trait AsyncBlockBackend: Send + Sync + 'static {
     /// Called when the VMM is shutting down.
     /// Use this for cleanup like flushing data to persistent storage.
     fn on_exit(&self) {}
+
+    /// Serialize backend state for snapshot. Default: no state saved.
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restore backend state from a previous snapshot. Default: no-op.
+    fn restore_snapshot_state(&self, _data: &[u8]) {}
 }
 
 /// A guard that holds a pointer and length for a volatile memory region.
@@ -384,15 +419,26 @@ where
         (**self).image_id()
     }
 
-    fn read_vectored_at(&self, bufs: Vec<VolatileSliceGuard>, offset: u64) -> BoxFuture<'_, io::Result<usize>> {
+    fn read_vectored_at(
+        &self,
+        bufs: Vec<VolatileSliceGuard>,
+        offset: u64,
+    ) -> BoxFuture<'_, io::Result<usize>> {
         (**self).read_vectored_at(bufs, offset)
     }
 
-    fn write_vectored_at(&self, bufs: Vec<VolatileSliceGuard>, offset: u64) -> BoxFuture<'_, io::Result<usize>> {
+    fn write_vectored_at(
+        &self,
+        bufs: Vec<VolatileSliceGuard>,
+        offset: u64,
+    ) -> BoxFuture<'_, io::Result<usize>> {
         (**self).write_vectored_at(bufs, offset)
     }
 
-    fn write_batch(&self, writes: Vec<(u64, Vec<VolatileSliceGuard>)>) -> BoxFuture<'_, io::Result<Vec<usize>>> {
+    fn write_batch(
+        &self,
+        writes: Vec<(u64, Vec<VolatileSliceGuard>)>,
+    ) -> BoxFuture<'_, io::Result<Vec<usize>>> {
         (**self).write_batch(writes)
     }
 

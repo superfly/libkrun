@@ -35,6 +35,10 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
 
 pub struct Vsock {
     cid: u64,
+    host_port_map: Option<HashMap<u16, u16>>,
+    unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    enable_tsi: bool,
+    enable_tsi_unix: bool,
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Arc<Mutex<VirtQueue>>,
     pub(crate) queue_tx: Arc<Mutex<VirtQueue>>,
@@ -66,6 +70,10 @@ impl Vsock {
 
         Ok(Vsock {
             cid,
+            host_port_map: host_port_map.clone(),
+            unix_ipc_port_map: unix_ipc_port_map.clone(),
+            enable_tsi,
+            enable_tsi_unix,
             muxer: VsockMuxer::new(
                 cid,
                 host_port_map,
@@ -156,6 +164,8 @@ impl Vsock {
             }
         }
 
+        self.queues[RXQ_INDEX] = queue_rx.clone();
+
         have_used
     }
 
@@ -204,6 +214,8 @@ impl Vsock {
                 error!("failed to add used elements to the queue: {e:?}");
             }
         }
+
+        self.queues[TXQ_INDEX] = queue_tx.clone();
 
         have_used
     }
@@ -284,8 +296,12 @@ impl VirtioDevice for Vsock {
 
         self.queue_tx = Arc::new(Mutex::new(self.queues[TXQ_INDEX].clone()));
         self.queue_rx = Arc::new(Mutex::new(self.queues[RXQ_INDEX].clone()));
+
+        let rxq_kick = self.queue_events[RXQ_INDEX]
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
         self.muxer
-            .activate(mem.clone(), self.queue_rx.clone(), interrupt.clone());
+            .activate(mem.clone(), self.queue_rx.clone(), interrupt.clone(), rxq_kick);
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
@@ -294,5 +310,40 @@ impl VirtioDevice for Vsock {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        self.device_state = DeviceState::Inactive;
+        self.queue_rx = Arc::new(Mutex::new(self.queues[RXQ_INDEX].clone()));
+        self.queue_tx = Arc::new(Mutex::new(self.queues[TXQ_INDEX].clone()));
+        self.muxer = VsockMuxer::new(
+            self.cid,
+            self.host_port_map.clone(),
+            self.unix_ipc_port_map.clone(),
+            self.enable_tsi,
+            self.enable_tsi_unix,
+        );
+        true
+    }
+
+    fn sync_queues_for_snapshot(&mut self) {
+        self.queues[RXQ_INDEX] = self.queue_rx.lock().unwrap().clone();
+        self.queues[TXQ_INDEX] = self.queue_tx.lock().unwrap().clone();
+    }
+
+    fn post_snapshot_restore(&mut self) {
+        *self.queue_rx.lock().unwrap() = self.queues[RXQ_INDEX].clone();
+        *self.queue_tx.lock().unwrap() = self.queues[TXQ_INDEX].clone();
+    }
+
+    fn post_restore_kick(&mut self) {
+        if !self.device_state.is_activated() {
+            return;
+        }
+        for (i, evt) in self.queue_events.iter().enumerate() {
+            if let Err(e) = evt.write(1) {
+                error!("vsock: post_restore_kick queue {i} failed: {e}");
+            }
+        }
     }
 }

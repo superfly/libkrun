@@ -18,6 +18,7 @@ use bindings::*;
 use std::arch::asm;
 
 use std::convert::TryInto;
+use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -179,6 +180,10 @@ pub enum Error {
     VcpuSetVtimerMask,
     VcpuSetVtimerOffset,
     VcpuGetVtimerOffset,
+    GicStateCreate,
+    GicStateSize,
+    GicStateRead,
+    GicStateRestore,
     VmCreate,
 }
 
@@ -213,9 +218,45 @@ impl Display for Error {
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
             VcpuSetVtimerOffset => write!(f, "Error setting HVF vCPU vtimer offset"),
             VcpuGetVtimerOffset => write!(f, "Error getting HVF vCPU vtimer offset"),
+            GicStateCreate => write!(f, "Error creating HVF GIC state object"),
+            GicStateSize => write!(f, "Error obtaining HVF GIC state size"),
+            GicStateRead => write!(f, "Error reading HVF GIC state data"),
+            GicStateRestore => write!(f, "Error restoring HVF GIC state data"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
+}
+
+pub fn save_gic_state() -> Result<Vec<u8>, Error> {
+    let state = unsafe { hv_gic_state_create() };
+    if state.is_null() {
+        return Err(Error::GicStateCreate);
+    }
+
+    let mut size: usize = 0;
+    let size_ret = unsafe { hv_gic_state_get_size(state, &mut size as *mut usize) };
+    if size_ret != HV_SUCCESS {
+        unsafe { os_release(state as *mut c_void) };
+        return Err(Error::GicStateSize);
+    }
+
+    let mut data = vec![0u8; size];
+    let data_ret = unsafe { hv_gic_state_get_data(state, data.as_mut_ptr() as *mut c_void) };
+    unsafe { os_release(state as *mut c_void) };
+
+    if data_ret != HV_SUCCESS {
+        return Err(Error::GicStateRead);
+    }
+
+    Ok(data)
+}
+
+pub fn restore_gic_state(data: &[u8]) -> Result<(), Error> {
+    let ret = unsafe { hv_gic_set_state(data.as_ptr() as *const c_void, data.len()) };
+    if ret != HV_SUCCESS {
+        return Err(Error::GicStateRestore);
+    }
+    Ok(())
 }
 
 pub enum InterruptType {
@@ -839,13 +880,25 @@ impl HvfVcpu<'_> {
                 },
         );
         for &reg in SAVEABLE_SYS_REGS {
-            let val = self.read_sys_reg(reg)?;
-            sys_regs.push((reg, val));
+            match self.read_sys_reg(reg) {
+                Ok(val) => sys_regs.push((reg, val)),
+                Err(Error::VcpuReadSystemRegister) => {
+                    debug!("Skipping unreadable system register during snapshot save: 0x{reg:04x}");
+                }
+                Err(err) => return Err(err),
+            }
         }
         if self.nested_enabled {
             for &reg in SAVEABLE_SYS_REGS_EL2 {
-                let val = self.read_sys_reg(reg)?;
-                sys_regs.push((reg, val));
+                match self.read_sys_reg(reg) {
+                    Ok(val) => sys_regs.push((reg, val)),
+                    Err(Error::VcpuReadSystemRegister) => {
+                        debug!(
+                            "Skipping unreadable EL2 system register during snapshot save: 0x{reg:04x}"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -876,7 +929,15 @@ impl HvfVcpu<'_> {
 
         // Restore system registers
         for &(reg, val) in &state.sys_regs {
-            self.write_sys_reg(reg, val)?;
+            match self.write_sys_reg(reg, val) {
+                Ok(()) => {}
+                Err(Error::VcpuSetSystemRegister(_, _)) => {
+                    debug!(
+                        "Skipping unwritable system register during snapshot restore: 0x{reg:04x}"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         // Restore vtimer offset

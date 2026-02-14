@@ -12,6 +12,28 @@ pub enum SnapshotError {
     Serialize(String),
     /// Deserialization failed.
     Deserialize(String),
+    /// Device quiesce did not complete within the configured deadline.
+    QuiesceTimeout {
+        device_id: String,
+        timeout_ms: u64,
+        detail: Option<String>,
+    },
+    /// Device restore resync did not complete within the configured deadline.
+    ResyncTimeout {
+        device_id: String,
+        timeout_ms: u64,
+        detail: Option<String>,
+    },
+    /// Device quiesce failed before snapshot save.
+    QuiesceFailure {
+        device_id: String,
+        detail: Option<String>,
+    },
+    /// Device restore resync failed.
+    ResyncFailure {
+        device_id: String,
+        detail: Option<String>,
+    },
 }
 
 impl fmt::Display for SnapshotError {
@@ -19,6 +41,63 @@ impl fmt::Display for SnapshotError {
         match self {
             SnapshotError::Serialize(e) => write!(f, "Device snapshot serialize error: {e}"),
             SnapshotError::Deserialize(e) => write!(f, "Device snapshot deserialize error: {e}"),
+            SnapshotError::QuiesceTimeout {
+                device_id,
+                timeout_ms,
+                detail,
+            } => {
+                if let Some(detail) = detail {
+                    write!(
+                        f,
+                        "Device snapshot quiesce timeout for '{device_id}' after {timeout_ms}ms: {detail}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Device snapshot quiesce timeout for '{device_id}' after {timeout_ms}ms"
+                    )
+                }
+            }
+            SnapshotError::ResyncTimeout {
+                device_id,
+                timeout_ms,
+                detail,
+            } => {
+                if let Some(detail) = detail {
+                    write!(
+                        f,
+                        "Device snapshot restore resync timeout for '{device_id}' after {timeout_ms}ms: {detail}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Device snapshot restore resync timeout for '{device_id}' after {timeout_ms}ms"
+                    )
+                }
+            }
+            SnapshotError::QuiesceFailure { device_id, detail } => {
+                if let Some(detail) = detail {
+                    write!(
+                        f,
+                        "Device snapshot quiesce failure for '{device_id}': {detail}"
+                    )
+                } else {
+                    write!(f, "Device snapshot quiesce failure for '{device_id}'")
+                }
+            }
+            SnapshotError::ResyncFailure { device_id, detail } => {
+                if let Some(detail) = detail {
+                    write!(
+                        f,
+                        "Device snapshot restore resync failure for '{device_id}': {detail}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Device snapshot restore resync failure for '{device_id}'"
+                    )
+                }
+            }
         }
     }
 }

@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, ConsoleError, DeviceState, Queue as VirtQueue, VirtioDevice,
@@ -271,6 +271,23 @@ impl Console {
 
         raise_irq
     }
+
+    pub(crate) fn restore_ports_after_snapshot(&mut self) {
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(mem, interrupt) => (mem.clone(), interrupt.clone()),
+            DeviceState::Inactive => return,
+        };
+
+        for port_id in 0..self.ports.len() {
+            self.ports[port_id].start(
+                mem.clone(),
+                self.queues[port_id_to_queue_idx(QueueDirection::Rx, port_id)].clone(),
+                self.queues[port_id_to_queue_idx(QueueDirection::Tx, port_id)].clone(),
+                interrupt.clone(),
+                self.control.clone(),
+            );
+        }
+    }
 }
 
 impl VirtioDevice for Console {
@@ -352,6 +369,39 @@ impl VirtioDevice for Console {
             port.shutdown();
         }
         true
+    }
+
+    fn sync_queues_for_snapshot(&mut self) {
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
+            return;
+        };
+
+        for queue in &mut self.queues {
+            if !queue.ready {
+                continue;
+            }
+
+            let Some(avail_idx_addr) = queue.avail_ring.checked_add(2) else {
+                continue;
+            };
+            let Some(used_idx_addr) = queue.used_ring.checked_add(2) else {
+                continue;
+            };
+
+            let Ok(avail_idx) = mem.read_obj::<u16>(avail_idx_addr) else {
+                continue;
+            };
+            let Ok(used_idx) = mem.read_obj::<u16>(used_idx_addr) else {
+                continue;
+            };
+
+            queue.set_next_avail(avail_idx);
+            queue.set_next_used(used_idx);
+        }
+    }
+
+    fn post_snapshot_restore(&mut self) {
+        self.restore_ports_after_snapshot();
     }
 }
 

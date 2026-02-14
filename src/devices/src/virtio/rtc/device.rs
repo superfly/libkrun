@@ -353,7 +353,11 @@ impl Rtc {
                 uapi::VIRTIO_RTC_REQ_CLOCK_CAP => {
                     // Read clock_id from request body
                     let req_body: ReqClockCap = mem
-                        .read_obj(req_desc.addr.unchecked_add(std::mem::size_of::<ReqHead>() as u64))
+                        .read_obj(
+                            req_desc
+                                .addr
+                                .unchecked_add(std::mem::size_of::<ReqHead>() as u64),
+                        )
                         .unwrap_or_default();
 
                     let clock_id = req_body.clock_id.to_native();
@@ -391,7 +395,11 @@ impl Rtc {
                 uapi::VIRTIO_RTC_REQ_READ => {
                     // Read clock_id from request body
                     let req_body: ReqRead = mem
-                        .read_obj(req_desc.addr.unchecked_add(std::mem::size_of::<ReqHead>() as u64))
+                        .read_obj(
+                            req_desc
+                                .addr
+                                .unchecked_add(std::mem::size_of::<ReqHead>() as u64),
+                        )
                         .unwrap_or_default();
 
                     let clock_id = req_body.clock_id.to_native();
@@ -645,7 +653,10 @@ mod tests {
 
         // Time should be before 2100-01-01 (4102444800 seconds)
         let max_time_ns: u64 = 4102444800 * 1_000_000_000;
-        assert!(time_ns < max_time_ns, "Time {time_ns} should be before 2100");
+        assert!(
+            time_ns < max_time_ns,
+            "Time {time_ns} should be before 2100"
+        );
     }
 
     /// Verify device initialization
@@ -784,7 +795,10 @@ mod tests {
 
         // Counter should be monotonically increasing (or at least not wildly different)
         // Allow for wrap-around by checking they're both non-zero
-        assert!(cnt1 > 0 || cnt2 > 0, "Counter should return non-zero values");
+        assert!(
+            cnt1 > 0 || cnt2 > 0,
+            "Counter should return non-zero values"
+        );
 
         // Second read should be >= first (unless wrap, which is unlikely in a test)
         // We use wrapping comparison to handle potential overflow

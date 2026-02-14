@@ -10,6 +10,7 @@ use nix::sys::socket::{
     Shutdown, SockFlag, SockType, UnixAddr,
 };
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -629,6 +630,19 @@ pub struct UnixAcceptorProxy {
 
 impl UnixAcceptorProxy {
     pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                debug!("removed stale unix vsock listener path: {:?}", path);
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(
+                    "failed to remove unix vsock listener path {:?}: {err}",
+                    path
+                );
+            }
+        }
+
         let fd = socket(
             AddressFamily::Unix,
             SockType::Stream,

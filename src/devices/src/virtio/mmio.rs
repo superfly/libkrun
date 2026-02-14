@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use super::device_status;
 use super::*;
@@ -27,6 +28,8 @@ const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 
 //current version specified by the mmio standard (legacy devices used 1 here)
 const MMIO_VERSION: u32 = 2;
+const SNAPSHOT_QUIESCE_TIMEOUT: Duration = Duration::from_millis(250);
+const SNAPSHOT_RESYNC_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum CreateMmioTransportError {
@@ -70,6 +73,13 @@ pub struct MmioTransport {
     queue_evts: HashMap<u32, EventFd>,
     shm_region_select: u32,
     interrupt: InterruptTransport,
+    /// Set by restore_state when the device needs activate() called.
+    /// Cleared by complete_restore(). This defers thread spawning until
+    /// after all snapshot state (memory, interrupts, devices) is loaded,
+    /// preventing races where newly-spawned threads fire IRQs that get
+    /// overwritten by later restore steps.
+    #[cfg(feature = "snapshot")]
+    needs_post_restore_activate: bool,
 }
 
 struct InterruptTransportInner {
@@ -123,11 +133,19 @@ impl InterruptTransport {
     }
 
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
-        self.status().fetch_or(status as usize, Ordering::SeqCst);
-        self.intc()
-            .lock()
-            .unwrap()
-            .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        let prev = self.status().fetch_or(status as usize, Ordering::SeqCst);
+        // Only fire a GIC interrupt if at least one new status bit was set.
+        // Re-firing when the bit is already set creates a spurious interrupt:
+        // the guest may have acked the ISR between our set and the GIC delivery,
+        // causing the second interrupt to see ISR=0 and skip VQ processing.
+        // The ISR ack handler (offset 0x64) re-asserts if new bits arrived
+        // between the guest's read and ack, so we don't lose interrupts.
+        if (prev as u32 & status) != status {
+            self.intc()
+                .lock()
+                .unwrap()
+                .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        }
         Ok(())
     }
 
@@ -183,6 +201,8 @@ impl MmioTransport {
             mem,
             queue_evts: HashMap::new(),
             shm_region_select: 0,
+            #[cfg(feature = "snapshot")]
+            needs_post_restore_activate: false,
         })
     }
 
@@ -203,6 +223,36 @@ impl MmioTransport {
     // Gets the encapsulated VirtioDevice.
     pub fn device(&self) -> Arc<Mutex<dyn VirtioDevice>> {
         self.device.clone()
+    }
+
+    pub fn begin_snapshot_quiesce(&self, timeout: Duration) -> Result<(), SnapshotError> {
+        let mut device = self.locked_device();
+        let device_id = device.device_name().to_string();
+
+        device
+            .begin_snapshot_quiesce(timeout)
+            .map_err(|err| map_quiesce_error(device_id, timeout, err))
+    }
+
+    pub fn abort_snapshot_quiesce(&self) {
+        self.locked_device().abort_snapshot_quiesce();
+    }
+
+    pub fn begin_restore_resync(&self, timeout: Duration) -> Result<(), SnapshotError> {
+        let mut device = self.locked_device();
+        let device_id = device.device_name().to_string();
+
+        device
+            .begin_restore_resync(timeout)
+            .map_err(|err| map_resync_error(device_id, timeout, err))
+    }
+
+    pub fn end_restore_resync(&self) {
+        self.locked_device().end_restore_resync();
+    }
+
+    pub fn post_restore_kick(&self) {
+        self.locked_device().post_restore_kick();
     }
 
     pub fn register_queue_evt(&mut self, queue_evt: EventFd, id: u32) {
@@ -324,6 +374,40 @@ impl MmioTransport {
     }
 }
 
+fn map_quiesce_error(device_id: String, timeout: Duration, err: SnapshotError) -> SnapshotError {
+    match err {
+        SnapshotError::QuiesceTimeout { detail, .. } => SnapshotError::QuiesceTimeout {
+            device_id,
+            timeout_ms: timeout.as_millis() as u64,
+            detail,
+        },
+        SnapshotError::QuiesceFailure { detail, .. } => {
+            SnapshotError::QuiesceFailure { device_id, detail }
+        }
+        other => SnapshotError::QuiesceFailure {
+            device_id,
+            detail: Some(other.to_string()),
+        },
+    }
+}
+
+fn map_resync_error(device_id: String, timeout: Duration, err: SnapshotError) -> SnapshotError {
+    match err {
+        SnapshotError::ResyncTimeout { detail, .. } => SnapshotError::ResyncTimeout {
+            device_id,
+            timeout_ms: timeout.as_millis() as u64,
+            detail,
+        },
+        SnapshotError::ResyncFailure { detail, .. } => {
+            SnapshotError::ResyncFailure { device_id, detail }
+        }
+        other => SnapshotError::ResyncFailure {
+            device_id,
+            detail: Some(other.to_string()),
+        },
+    }
+}
+
 impl BusDevice for MmioTransport {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
         match offset {
@@ -428,6 +512,22 @@ impl BusDevice for MmioTransport {
                             self.interrupt
                                 .status()
                                 .fetch_and(!(v as usize), Ordering::SeqCst);
+                            // Level-triggered re-assertion: if new status bits arrived
+                            // between the guest's ISR read and this ack, the ISR is still
+                            // non-zero. Re-fire the GIC interrupt so the guest processes them.
+                            let remaining =
+                                self.interrupt.status().load(Ordering::SeqCst) as u32;
+                            if remaining != 0 {
+                                if let Err(e) = self
+                                    .interrupt
+                                    .intc()
+                                    .lock()
+                                    .unwrap()
+                                    .set_irq(self.interrupt.irq_line(), Some(self.interrupt.event()))
+                                {
+                                    log::error!("failed to re-assert interrupt after ack: {e:?}");
+                                }
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),
@@ -478,6 +578,22 @@ impl BusDevice for MmioTransport {
     fn as_snapshottable_mut(&mut self) -> Option<&mut dyn Snapshottable> {
         Some(self)
     }
+
+    fn quiesce_workers(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), SnapshotError> {
+        self.begin_snapshot_quiesce(timeout)
+    }
+
+    fn resume_workers(&self) {
+        self.abort_snapshot_quiesce();
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn complete_restore(&mut self) -> std::result::Result<(), SnapshotError> {
+        self.complete_restore()
+    }
 }
 
 /// Serializable state for an MmioTransport device.
@@ -489,7 +605,18 @@ pub struct MmioTransportState {
     pub queue_select: u32,
     pub device_status: u32,
     pub config_generation: u32,
+    pub interrupt_status: u32,
     pub queue_states: Vec<QueueState>,
+    /// The inner device's negotiated features. Without this, after restore
+    /// the device has acked_features=0, so event_idx is false while the guest
+    /// still uses EVENT_IDX — breaking kick suppression and causing hangs.
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub acked_features: u64,
+    /// Opaque backend state blob. Backends that implement
+    /// `save_snapshot_state` / `restore_snapshot_state` use this to preserve
+    /// connection state (e.g., TCP sockets, NAT mappings) across snapshots.
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub backend_state: Option<Vec<u8>>,
 }
 
 /// Serializable state for a virtio queue.
@@ -513,78 +640,168 @@ impl Snapshottable for MmioTransport {
     }
 
     fn save_state(&self) -> Result<Vec<u8>, SnapshotError> {
-        let device = self.locked_device();
-        let queue_states: Vec<QueueState> = device
-            .queues()
-            .iter()
-            .map(|q| QueueState {
-                size: q.size,
-                ready: q.ready,
-                desc_table: q.desc_table.raw_value(),
-                avail_ring: q.avail_ring.raw_value(),
-                used_ring: q.used_ring.raw_value(),
-                next_avail: q.next_avail().0,
-                next_used: q.next_used().0,
-            })
-            .collect();
-        drop(device);
+        self.begin_snapshot_quiesce(SNAPSHOT_QUIESCE_TIMEOUT)?;
 
-        let state = MmioTransportState {
-            features_select: self.features_select,
-            acked_features_select: self.acked_features_select,
-            queue_select: self.queue_select,
-            device_status: self.device_status,
-            config_generation: self.config_generation,
-            queue_states,
-        };
+        let save_result = (|| {
+            let mut device = self.locked_device();
+            device.sync_queues_for_snapshot();
+            let queue_states: Vec<QueueState> = device
+                .queues()
+                .iter()
+                .map(|q| QueueState {
+                    size: q.size,
+                    ready: q.ready,
+                    desc_table: q.desc_table.raw_value(),
+                    avail_ring: q.avail_ring.raw_value(),
+                    used_ring: q.used_ring.raw_value(),
+                    next_avail: q.next_avail().0,
+                    next_used: q.next_used().0,
+                })
+                .collect();
 
-        #[cfg(feature = "snapshot")]
-        {
-            bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
-        }
-        #[cfg(not(feature = "snapshot"))]
-        {
-            let _ = state;
-            Err(SnapshotError::Serialize(
-                "snapshot feature not enabled".to_string(),
-            ))
-        }
+            let backend_state = device.save_backend_state();
+
+            let state = MmioTransportState {
+                features_select: self.features_select,
+                acked_features_select: self.acked_features_select,
+                queue_select: self.queue_select,
+                device_status: self.device_status,
+                config_generation: self.config_generation,
+                interrupt_status: self.interrupt.0.status.load(Ordering::SeqCst) as u32,
+                queue_states,
+                acked_features: device.acked_features(),
+                backend_state,
+            };
+
+            #[cfg(feature = "snapshot")]
+            {
+                bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
+            }
+            #[cfg(not(feature = "snapshot"))]
+            {
+                let _ = state;
+                Err(SnapshotError::Serialize(
+                    "snapshot feature not enabled".to_string(),
+                ))
+            }
+        })();
+
+        self.abort_snapshot_quiesce();
+        save_result
     }
 
     fn restore_state(&mut self, data: &[u8]) -> Result<(), SnapshotError> {
-        #[cfg(feature = "snapshot")]
-        {
-            let state: MmioTransportState =
-                bincode::deserialize(data).map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
+        self.begin_restore_resync(SNAPSHOT_RESYNC_TIMEOUT)?;
 
-            self.features_select = state.features_select;
-            self.acked_features_select = state.acked_features_select;
-            self.queue_select = state.queue_select;
-            self.device_status = state.device_status;
-            self.config_generation = state.config_generation;
+        let restore_result = (|| {
+            #[cfg(feature = "snapshot")]
+            {
+                let state: MmioTransportState = bincode::deserialize(data)
+                    .map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
 
-            let mut device = self.locked_device();
-            for (i, qs) in state.queue_states.iter().enumerate() {
-                if let Some(queue) = device.queues_mut().get_mut(i) {
-                    queue.size = qs.size;
-                    queue.ready = qs.ready;
-                    queue.desc_table = GuestAddress(qs.desc_table);
-                    queue.avail_ring = GuestAddress(qs.avail_ring);
-                    queue.used_ring = GuestAddress(qs.used_ring);
-                    queue.set_next_avail(qs.next_avail);
-                    queue.set_next_used(qs.next_used);
+                self.features_select = state.features_select;
+                self.acked_features_select = state.acked_features_select;
+                self.queue_select = state.queue_select;
+                self.device_status = state.device_status;
+                self.config_generation = state.config_generation;
+                self.interrupt
+                    .0
+                    .status
+                    .store(state.interrupt_status as usize, Ordering::SeqCst);
+                let should_reactivate = (state.device_status & device_status::DRIVER_OK) != 0;
+
+                let mut device = self.locked_device();
+
+                // Restore acked_features BEFORE activate() so the device sees
+                // the correct feature set (especially EVENT_IDX).
+                device.set_acked_features(state.acked_features);
+
+                for (i, qs) in state.queue_states.iter().enumerate() {
+                    if let Some(queue) = device.queues_mut().get_mut(i) {
+                        queue.size = qs.size;
+                        queue.ready = qs.ready;
+                        queue.desc_table = GuestAddress(qs.desc_table);
+                        queue.avail_ring = GuestAddress(qs.avail_ring);
+                        queue.used_ring = GuestAddress(qs.used_ring);
+                        queue.set_next_avail(qs.next_avail);
+                        queue.set_next_used(qs.next_used);
+                    }
                 }
-            }
 
-            Ok(())
+                let device_name = device.device_name().to_string();
+                let force_reactivate = matches!(device_name.as_str(), "console");
+                if force_reactivate {
+                    let _ = device.reset();
+                }
+
+                // Compute whether activation is needed while we hold the lock,
+                // but defer the actual activate() call to complete_restore().
+                let needs_activate =
+                    should_reactivate && (!device.is_activated() || force_reactivate);
+
+                if let Some(ref backend_data) = state.backend_state {
+                    device.restore_backend_state(backend_data);
+                }
+
+                device.post_snapshot_restore();
+
+                // Drop device lock before writing to self.
+                drop(device);
+
+                // Defer activation to complete_restore(). This ensures all
+                // snapshot state (memory, interrupts, all device states) is
+                // fully loaded before any device threads are spawned. Without
+                // this, threads spawned by activate() can fire IRQs that race
+                // with later restore steps.
+                self.needs_post_restore_activate = needs_activate;
+
+                Ok(())
+            }
+            #[cfg(not(feature = "snapshot"))]
+            {
+                let _ = data;
+                Err(SnapshotError::Deserialize(
+                    "snapshot feature not enabled".to_string(),
+                ))
+            }
+        })();
+
+        self.end_restore_resync();
+        restore_result
+    }
+}
+
+#[cfg(feature = "snapshot")]
+impl MmioTransport {
+    /// Activate the device and kick workers after all snapshot state is loaded.
+    ///
+    /// Must be called after restore_state() and after interrupt controller
+    /// state has been restored. This is the point where device threads are
+    /// spawned and can safely fire interrupts.
+    pub fn complete_restore(&mut self) -> Result<(), SnapshotError> {
+        if self.needs_post_restore_activate {
+            self.needs_post_restore_activate = false;
+            let mut device = self.locked_device();
+            let device_name = device.device_name().to_string();
+            device
+                .activate(self.mem.clone(), self.interrupt.clone())
+                .map_err(|e| {
+                    SnapshotError::Deserialize(format!(
+                        "failed to reactivate virtio device '{device_name}' during snapshot restore: {e:?}",
+                    ))
+                })?;
         }
-        #[cfg(not(feature = "snapshot"))]
-        {
-            let _ = data;
-            Err(SnapshotError::Deserialize(
-                "snapshot feature not enabled".to_string(),
-            ))
-        }
+
+        // Clear ISR status before kicking workers. The restored ISR value is
+        // stale — the GIC has no corresponding pending interrupt after restore.
+        // Without this, try_signal's dedup logic sees the bit already set and
+        // skips the GIC interrupt, leaving the guest unaware of pending work.
+        self.interrupt
+            .status()
+            .store(0, Ordering::SeqCst);
+
+        self.post_restore_kick();
+        Ok(())
     }
 }
 

@@ -897,7 +897,6 @@ fn forget_one(
             }
         }
     }
-
 }
 
 /// Convert FUSE lock start/end to flock l_len.

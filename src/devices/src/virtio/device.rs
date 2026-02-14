@@ -6,7 +6,9 @@
 // found in the THIRD-PARTY file.
 
 use super::{ActivateResult, InterruptTransport, Queue};
+use crate::snapshot::SnapshotError;
 use crate::virtio::AsAny;
+use std::time::Duration;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
@@ -127,6 +129,52 @@ pub trait VirtioDevice: AsAny + Send {
     fn reset(&mut self) -> bool {
         false
     }
+
+    /// Begin quiescing the device for snapshot save.
+    ///
+    /// Implementations should complete within `timeout` and leave the device in a snapshot-safe
+    /// state. The default implementation is a no-op for backward compatibility.
+    fn begin_snapshot_quiesce(&mut self, _timeout: Duration) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    /// Abort an in-progress snapshot quiesce and return to normal operation.
+    fn abort_snapshot_quiesce(&mut self) {}
+
+    /// Synchronize any runtime queue state into `queues()` before snapshot serialization.
+    fn sync_queues_for_snapshot(&mut self) {}
+
+    /// Begin restore-time resync after state has been loaded.
+    ///
+    /// Implementations should complete within `timeout` and prepare workers/queues to continue
+    /// normal operation. The default implementation is a no-op for backward compatibility.
+    fn begin_restore_resync(&mut self, _timeout: Duration) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    /// End restore-time resync and transition the device to its steady runtime state.
+    fn end_restore_resync(&mut self) {}
+
+    /// Trigger any best-effort post-restore kick needed to restart asynchronous processing.
+    fn post_restore_kick(&mut self) {}
+
+    /// Perform any device-specific recovery steps after snapshot restore.
+    fn post_snapshot_restore(&mut self) {}
+
+    /// Return the backend's snapshot state, if any.
+    ///
+    /// Called after quiesce during snapshot save. The returned bytes are
+    /// included in the device's serialized state and passed back to
+    /// `restore_backend_state` on restore.
+    fn save_backend_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Provide backend snapshot state for restore.
+    ///
+    /// Called before `post_snapshot_restore`, storing the data so the worker
+    /// can pick it up during resync and call `backend.restore_snapshot_state()`.
+    fn restore_backend_state(&mut self, _data: &[u8]) {}
 
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {

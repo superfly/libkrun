@@ -17,6 +17,7 @@ use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
 use crate::legacy::{IrqChip, ReadableFd};
+use crate::snapshot::{SnapshotError, Snapshottable};
 use crate::Error as DeviceError;
 
 /* Registers */
@@ -92,6 +93,26 @@ pub struct Serial {
     input: Option<Box<dyn ReadableFd + Send>>,
     intc: Option<IrqChip>,
     irq_line: Option<u32>,
+}
+
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+struct SerialState {
+    flags: u32,
+    lcr: u32,
+    rsr: u32,
+    cr: u32,
+    dmacr: u32,
+    debug: u32,
+    int_enabled: u32,
+    int_level: u32,
+    read_fifo: Vec<u8>,
+    ilpr: u32,
+    ibrd: u32,
+    fbrd: u32,
+    ifl: u32,
+    read_count: u32,
+    read_trigger: u32,
 }
 
 impl Serial {
@@ -385,6 +406,65 @@ impl BusDevice for Serial {
                 data.len()
             );
         }
+    }
+
+    fn as_snapshottable(&self) -> Option<&dyn Snapshottable> {
+        Some(self)
+    }
+
+    fn as_snapshottable_mut(&mut self) -> Option<&mut dyn Snapshottable> {
+        Some(self)
+    }
+}
+
+impl Snapshottable for Serial {
+    fn snapshot_id(&self) -> &str {
+        "pl011"
+    }
+
+    fn save_state(&self) -> std::result::Result<Vec<u8>, SnapshotError> {
+        let state = SerialState {
+            flags: self.flags,
+            lcr: self.lcr,
+            rsr: self.rsr,
+            cr: self.cr,
+            dmacr: self.dmacr,
+            debug: self.debug,
+            int_enabled: self.int_enabled,
+            int_level: self.int_level,
+            read_fifo: self.read_fifo.iter().copied().collect(),
+            ilpr: self.ilpr,
+            ibrd: self.ibrd,
+            fbrd: self.fbrd,
+            ifl: self.ifl,
+            read_count: self.read_count,
+            read_trigger: self.read_trigger,
+        };
+
+        bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
+    }
+
+    fn restore_state(&mut self, data: &[u8]) -> std::result::Result<(), SnapshotError> {
+        let state: SerialState =
+            bincode::deserialize(data).map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
+
+        self.flags = state.flags;
+        self.lcr = state.lcr;
+        self.rsr = state.rsr;
+        self.cr = state.cr;
+        self.dmacr = state.dmacr;
+        self.debug = state.debug;
+        self.int_enabled = state.int_enabled;
+        self.int_level = state.int_level;
+        self.read_fifo = state.read_fifo.into_iter().collect();
+        self.ilpr = state.ilpr;
+        self.ibrd = state.ibrd;
+        self.fbrd = state.fbrd;
+        self.ifl = state.ifl;
+        self.read_count = state.read_count;
+        self.read_trigger = state.read_trigger;
+
+        Ok(())
     }
 }
 

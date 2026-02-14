@@ -14,6 +14,12 @@ use super::device::{Vsock, EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
 use crate::virtio::VirtioDevice;
 
 impl Vsock {
+    fn drain_inactive_queue_event(&self, queue_index: usize) {
+        if let Err(e) = self.queue_events[queue_index].read() {
+            debug!("Failed to drain inactive vsock queue event: {e:?}");
+        }
+    }
+
     pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
         debug!("RX queue event");
 
@@ -76,44 +82,7 @@ impl Vsock {
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume vsock activate event: {e:?}");
         }
-
-        // The subscriber must exist as we previously registered activate_evt via
-        // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
-
-        event_manager
-            .register(
-                self.queue_events[RXQ_INDEX].as_raw_fd(),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[RXQ_INDEX].as_raw_fd() as u64,
-                ),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register vsock rxq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_events[TXQ_INDEX].as_raw_fd(),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[TXQ_INDEX].as_raw_fd() as u64,
-                ),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register vsock txq with event manager: {e:?}");
-            });
-
-        event_manager
-            .unregister(self.activate_evt.as_raw_fd())
-            .unwrap_or_else(|e| {
-                error!("Failed to unregister vsock activate evt: {e:?}");
-            })
+        let _ = event_manager;
     }
 }
 
@@ -126,6 +95,11 @@ impl Subscriber for Vsock {
         //let backend = self.backend.as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
 
+        if source == activate_evt {
+            self.handle_activate_event(event_manager);
+            return;
+        }
+
         if self.is_activated() {
             let mut raise_irq = false;
             match source {
@@ -137,9 +111,6 @@ impl Subscriber for Vsock {
                     raise_irq = self.notify_backend(event);
                 }
                 */
-                _ if source == activate_evt => {
-                    self.handle_activate_event(event_manager);
-                }
                 _ => warn!("Unexpected vsock event received: {source:?}"),
             }
             if raise_irq {
@@ -147,14 +118,32 @@ impl Subscriber for Vsock {
                 self.device_state.signal_used_queue();
             }
         } else {
+            if source == rxq {
+                self.drain_inactive_queue_event(RXQ_INDEX);
+            } else if source == txq {
+                self.drain_inactive_queue_event(TXQ_INDEX);
+            } else if source == evq {
+                self.drain_inactive_queue_event(EVQ_INDEX);
+            }
             warn!("The device is not yet activated. Spurious event received: {source:?}");
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.activate_evt.as_raw_fd() as u64,
-        )]
+        vec![
+            EpollEvent::new(EventSet::IN, self.activate_evt.as_raw_fd() as u64),
+            EpollEvent::new(
+                EventSet::IN,
+                self.queue_events[RXQ_INDEX].as_raw_fd() as u64,
+            ),
+            EpollEvent::new(
+                EventSet::IN,
+                self.queue_events[TXQ_INDEX].as_raw_fd() as u64,
+            ),
+            EpollEvent::new(
+                EventSet::IN,
+                self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+            ),
+        ]
     }
 }

@@ -186,7 +186,11 @@ impl<'a> PacketContext<'a> {
     }
 
     /// Parse transport layer protocol (shared between IPv4 and IPv6).
-    fn parse_transport(raw: &'a [u8], transport_start: usize, protocol: u8) -> Option<TransportProtocol<'a>> {
+    fn parse_transport(
+        raw: &'a [u8],
+        transport_start: usize,
+        protocol: u8,
+    ) -> Option<TransportProtocol<'a>> {
         let transport = match protocol {
             // TCP (protocol 6)
             6 => {
@@ -373,7 +377,13 @@ impl<'a> PacketContext<'a> {
     }
 
     /// Build an IPv4 response packet (helper for other builders).
-    fn build_ipv4_response(&self, protocol: u8, payload: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Bytes {
+    fn build_ipv4_response(
+        &self,
+        protocol: u8,
+        payload: &[u8],
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+    ) -> Bytes {
         let ip_total_len = 20 + payload.len();
         let mut ip = Vec::with_capacity(ip_total_len);
 

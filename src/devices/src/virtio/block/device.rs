@@ -16,8 +16,10 @@ use std::os::linux::fs::MetadataExt;
 use std::os::macos::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::{
@@ -29,7 +31,7 @@ use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
-use vm_memory::{ByteValued, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap, VolatileSlice};
 
 use super::worker::BlockWorker;
 use super::{
@@ -37,6 +39,7 @@ use super::{
     BlockBackend, Error, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
+use crate::snapshot::SnapshotError;
 use crate::virtio::block::{AsyncBlockBackendFactory, AsyncBlockWorker};
 use crate::virtio::{
     block::{ImageType, SyncMode},
@@ -332,6 +335,18 @@ pub struct Block {
     disk: Option<BlockDeviceBackend>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    worker_resyncfd: EventFd,
+    worker_queue_state: Arc<Mutex<Queue>>,
+    worker_queue_generation: Arc<AtomicU64>,
+
+    /// Signal the async worker to quiesce (drain + publish queues then park).
+    worker_quiesce_fd: EventFd,
+    /// Signal the async worker to resume after quiesce.
+    worker_resume_fd: EventFd,
+    /// Condvar the worker sets when it has drained, published queues and parked.
+    worker_quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
+    /// Shared backend snapshot state for async workers.
+    worker_backend_state: Arc<Mutex<Option<Vec<u8>>>>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -447,7 +462,9 @@ impl Block {
 
         let queue_evts = [EventFd::new(EFD_NONBLOCK)?];
 
-        let queues = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
+        let queues: Vec<Queue> = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
+        let worker_queue_state = Arc::new(Mutex::new(queues[0].clone()));
+        let worker_queue_generation = Arc::new(AtomicU64::new(0));
 
         let config = VirtioBlkConfig {
             capacity: disk.nsectors(),
@@ -475,6 +492,13 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_resyncfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_queue_state,
+            worker_queue_generation,
+            worker_quiesce_fd: EventFd::new(EFD_NONBLOCK)?,
+            worker_resume_fd: EventFd::new(EFD_NONBLOCK)?,
+            worker_quiesce_ack: Arc::new((Mutex::new(false), Condvar::new())),
+            worker_backend_state: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -587,7 +611,18 @@ impl VirtioDevice for Block {
                     mem.clone(),
                     factory,
                     self.worker_stopfd.try_clone().unwrap(),
+                    self.worker_resyncfd.try_clone().unwrap(),
+                    self.worker_queue_state.clone(),
+                    self.worker_queue_generation.clone(),
+                    self.worker_quiesce_fd.try_clone().unwrap(),
+                    self.worker_resume_fd.try_clone().unwrap(),
+                    self.worker_quiesce_ack.clone(),
+                    self.worker_backend_state.clone(),
                 );
+                if let Ok(mut shared) = self.worker_queue_state.lock() {
+                    *shared = self.queues[0].clone();
+                }
+                self.worker_queue_generation.fetch_add(1, Ordering::SeqCst);
                 self.worker_thread = Some(worker.run());
             }
         }
@@ -605,6 +640,90 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn begin_snapshot_quiesce(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<(), SnapshotError> {
+        if !self.device_state.is_activated() {
+            return Ok(());
+        }
+        // Only quiesce async workers (disk is None when async factory was consumed)
+        if self.disk.is_some() {
+            return Ok(());
+        }
+
+        // Reset ack flag, then signal the worker to quiesce
+        {
+            let (lock, _) = &*self.worker_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        let _ = self.worker_quiesce_fd.write(1);
+
+        // Wait for the worker to drain, publish queues and park
+        let (lock, cvar) = &*self.worker_quiesce_ack;
+        let guard = lock.lock().unwrap();
+        let (guard, wait_result) = cvar
+            .wait_timeout_while(guard, timeout, |acked| !*acked)
+            .unwrap();
+        if !*guard || wait_result.timed_out() {
+            return Err(SnapshotError::QuiesceTimeout {
+                device_id: String::new(),
+                timeout_ms: timeout.as_millis() as u64,
+                detail: Some("async block worker did not ack quiesce".into()),
+            });
+        }
+        Ok(())
+    }
+
+    fn abort_snapshot_quiesce(&mut self) {
+        if !self.device_state.is_activated() || self.disk.is_some() {
+            return;
+        }
+        // Reset ack flag and resume the worker
+        {
+            let (lock, _) = &*self.worker_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        let _ = self.worker_resume_fd.write(1);
+    }
+
+    fn sync_queues_for_snapshot(&mut self) {
+        let DeviceState::Activated(_, _) = self.device_state else {
+            return;
+        };
+
+        if let Ok(shared) = self.worker_queue_state.lock() {
+            self.queues[0] = shared.clone();
+        }
+    }
+
+    fn save_backend_state(&self) -> Option<Vec<u8>> {
+        self.worker_backend_state.lock().ok()?.clone()
+    }
+
+    fn restore_backend_state(&mut self, data: &[u8]) {
+        if let Ok(mut shared) = self.worker_backend_state.lock() {
+            *shared = Some(data.to_vec());
+        }
+    }
+
+    fn post_snapshot_restore(&mut self) {
+        if let Ok(mut shared) = self.worker_queue_state.lock() {
+            *shared = self.queues[0].clone();
+        }
+        self.worker_queue_generation.fetch_add(1, Ordering::SeqCst);
+        let _ = self.worker_resyncfd.write(1);
+    }
+
+    fn post_restore_kick(&mut self) {
+        if !self.device_state.is_activated() {
+            return;
+        }
+        if let Err(e) = self.queue_evts[0].write(1) {
+            error!("block: post_restore_kick failed: {e}");
+        }
     }
 }
 

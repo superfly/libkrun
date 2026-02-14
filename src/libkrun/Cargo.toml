@@ -31,7 +31,7 @@ once_cell = "1.4.1"
 krun_display = { path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { path = "../krun_input", optional = true, features = ["bindgen_clang_runtime"] }
 
-devices = { path = "../devices" }
+devices = { path = "../devices", features = ["snapshot"] }
 polly = { path = "../polly" }
 utils = { path = "../utils" }
 vmm = { path = "../vmm" }

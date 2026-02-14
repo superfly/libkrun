@@ -21,6 +21,7 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
+use utils::eventfd::EventFd;
 
 /// The muxer RX queue.
 pub struct MuxerRxQ {
@@ -28,6 +29,11 @@ pub struct MuxerRxQ {
     q: VecDeque<MuxerRx>,
     /// The RX queue sync status.
     synced: bool,
+    /// Optional eventfd to kick the EventManager when data is pushed.
+    /// This ensures the EventManager calls process_stream_rx() to drain
+    /// the rxq, even when data was pushed by the muxer thread (which
+    /// can't call process_stream_rx directly).
+    kick_fd: Option<EventFd>,
 }
 
 impl MuxerRxQ {
@@ -38,7 +44,14 @@ impl MuxerRxQ {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
             synced: true,
+            kick_fd: None,
         }
+    }
+
+    /// Set the eventfd used to notify the EventManager when data is pushed.
+    /// This should be a clone of the RXQ eventfd that the EventManager monitors.
+    pub fn set_kick_fd(&mut self, fd: EventFd) {
+        self.kick_fd = Some(fd);
     }
 
     /// Push a new RX item to the queue.
@@ -58,6 +71,10 @@ impl MuxerRxQ {
         // Pushing to a non-full, synchronized queue will always succeed.
         if self.is_synced() && !self.is_full() {
             self.q.push_back(rx);
+            // Kick the EventManager so it drains the rxq via process_stream_rx.
+            if let Some(ref fd) = self.kick_fd {
+                let _ = fd.write(1);
+            }
             return true;
         }
 

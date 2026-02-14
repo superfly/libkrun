@@ -388,6 +388,15 @@ impl GicV3 {
     }
 }
 
+#[cfg(feature = "snapshot")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GicV3SnapshotState {
+    gicd_ctlr: u32,
+    edge_trigger: Vec<u32>,
+    gicr_waker: u32,
+    gicd_irouter: Vec<u64>,
+}
+
 impl IrqChipT for GicV3 {
     fn get_mmio_addr(&self) -> u64 {
         self.redists_addr
@@ -413,6 +422,31 @@ impl IrqChipT for GicV3 {
                 io::ErrorKind::InvalidData,
                 "IRQ not line configured",
             )))
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        let state = GicV3SnapshotState {
+            gicd_ctlr: self.gicd_ctlr,
+            edge_trigger: self.edge_trigger.to_vec(),
+            gicr_waker: self.gicr_waker,
+            gicd_irouter: self.gicd_irouter.to_vec(),
+        };
+        bincode::serialize(&state).ok()
+    }
+
+    #[cfg(feature = "snapshot")]
+    fn restore_snapshot_state(&mut self, data: &[u8]) {
+        if let Ok(state) = bincode::deserialize::<GicV3SnapshotState>(data) {
+            self.gicd_ctlr = state.gicd_ctlr;
+            if state.edge_trigger.len() == self.edge_trigger.len() {
+                self.edge_trigger.copy_from_slice(&state.edge_trigger);
+            }
+            self.gicr_waker = state.gicr_waker;
+            if state.gicd_irouter.len() == self.gicd_irouter.len() {
+                self.gicd_irouter.copy_from_slice(&state.gicd_irouter);
+            }
         }
     }
 }
