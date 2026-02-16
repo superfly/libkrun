@@ -21,12 +21,11 @@ use std::sync::{Arc, Mutex};
 use super::super::linux_errno::linux_errno_raw;
 use super::super::Queue as VirtQueue;
 use super::muxer::{push_packet, MuxerRx};
+use vm_memory::GuestMemoryMmap;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
 use utils::epoll::EventSet;
-
-use vm_memory::GuestMemoryMmap;
 
 pub struct UnixProxy {
     id: u64,
@@ -156,6 +155,10 @@ impl UnixProxy {
         }
     }
 
+    fn push_pkt(&self, rx: MuxerRx) {
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
         match fcntl(&self.fd, FcntlArg::F_GETFL) {
@@ -183,7 +186,7 @@ impl UnixProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn push_reset(&self) {
@@ -197,7 +200,7 @@ impl UnixProxy {
             peer_port: self.peer_port,
         };
 
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -379,7 +382,7 @@ impl Proxy for UnixProxy {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
 
         None
     }
@@ -434,7 +437,7 @@ impl Proxy for UnixProxy {
                 fwd_cnt: self.tx_cnt.0,
             };
 
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            self.push_pkt(rx);
             update.signal_queue = true;
         }
 
@@ -489,7 +492,7 @@ impl Proxy for UnixProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

@@ -166,11 +166,11 @@ impl Gpio {
 
     pub fn trigger_restart_key(&mut self, press: bool) {
         if press {
-            debug!("Generate a restart key press event");
+            debug!("GPIO: generate a restart key press event");
             self.istate = 0x8;
             self.data = 0x8;
         } else {
-            debug!("Generate a restart key release event");
+            debug!("GPIO: generate a restart key release event");
             self.istate = 0x8;
             self.data = 0x0;
         }
@@ -318,6 +318,7 @@ impl Subscriber for Gpio {
 
         match source {
             _ if source == self.shutdown_efd.as_raw_fd() => {
+                debug!("GPIO: shutdown_efd fired, sending restart key press");
                 _ = self.shutdown_efd.read();
                 // Send a key press event.
                 self.trigger_restart_key(true);

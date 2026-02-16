@@ -403,6 +403,29 @@ impl VirtioDevice for Console {
     fn post_snapshot_restore(&mut self) {
         self.restore_ports_after_snapshot();
     }
+
+    fn post_restore_kick(&mut self) {
+        // During restore_state(), post_snapshot_restore() is called while the
+        // device is still Inactive (activation is deferred to complete_restore),
+        // so restore_ports_after_snapshot() bails out without starting any port
+        // threads. By the time post_restore_kick() runs (from complete_restore),
+        // the device has been activated, so we can start ports now.
+        self.restore_ports_after_snapshot();
+
+        // Kick all ready queues so the event handler can deliver any pending
+        // notifications to the newly-started port threads.
+        if !self.device_state.is_activated() {
+            return;
+        }
+        for (i, evt) in self.queue_events.iter().enumerate() {
+            if !self.queues[i].ready {
+                continue;
+            }
+            if let Err(e) = evt.write(1) {
+                error!("console: post_restore_kick queue {i} failed: {e}");
+            }
+        }
+    }
 }
 
 impl VmmExitObserver for Console {

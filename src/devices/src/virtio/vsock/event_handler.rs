@@ -21,43 +21,47 @@ impl Vsock {
     }
 
     pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
-        debug!("RX queue event");
+        debug!("vsock: handle_rxq_event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
-            warn!("rxq unexpected event {event_set:?}");
+            warn!("vsock: rxq unexpected event {event_set:?}");
             return false;
         }
 
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[RXQ_INDEX].read() {
-            error!("Failed to get vsock rx queue event: {e:?}");
+            error!("vsock: failed to read rxq event: {e:?}");
         } else {
             raise_irq |= self.process_stream_rx();
+        }
+        if raise_irq {
+            debug!("vsock: rxq raising IRQ");
         }
         raise_irq
     }
 
     pub(crate) fn handle_txq_event(&mut self, event: &EpollEvent) -> bool {
-        debug!("TX queue event");
+        debug!("vsock: handle_txq_event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
-            warn!("txq unexpected event {event_set:?}");
+            warn!("vsock: txq unexpected event {event_set:?}");
             return false;
         }
 
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[TXQ_INDEX].read() {
-            error!("Failed to get vsock tx queue event: {e:?}");
+            error!("vsock: failed to read txq event: {e:?}");
         } else {
             raise_irq |= self.process_stream_tx();
-            // The backend may have queued up responses to the packets we sent during
-            // TX queue processing. If that happened, we need to fetch those responses
-            // and place them into RX buffers.
             if self.muxer.has_pending_rx() {
+                debug!("vsock: txq has pending rx, draining");
                 raise_irq |= self.process_stream_rx();
             }
+        }
+        if raise_irq {
+            debug!("vsock: txq raising IRQ");
         }
         raise_irq
     }

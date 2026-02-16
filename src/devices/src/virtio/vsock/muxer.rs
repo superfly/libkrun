@@ -23,9 +23,10 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Condvar;
+use utils::eventfd::EventFd;
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
-
 /// A muxer RX queue item.
 #[derive(Debug)]
 pub enum MuxerRx {
@@ -81,15 +82,19 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
+    debug!(
+        "vsock: push_packet: rx={:?} queue(next_avail={}, next_used={})",
+        rx, queue.next_avail(), queue.next_used()
+    );
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
             if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
-                error!("failed to add used elements to the queue: {e:?}");
+                error!("vsock: push_packet add_used failed: {e:?}");
             }
         }
     } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
+        warn!("vsock: push_packet: no avail bufs, deferring to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
     }
@@ -134,12 +139,19 @@ impl VsockMuxer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn activate(
         &mut self,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-        rxq_kick: utils::eventfd::EventFd,
+        rxq_kick: EventFd,
+        muxer_quiesce_fd: EventFd,
+        muxer_resume_fd: EventFd,
+        muxer_quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
+        timesync_quiesce_fd: EventFd,
+        timesync_resume_fd: EventFd,
+        timesync_quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
     ) {
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
@@ -151,8 +163,15 @@ impl VsockMuxer {
 
         #[cfg(target_os = "macos")]
         {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                timesync_quiesce_fd,
+                timesync_resume_fd,
+                timesync_quiesce_ack,
+            );
             timesync.run();
         }
 
@@ -168,6 +187,9 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            muxer_quiesce_fd,
+            muxer_resume_fd,
+            muxer_quiesce_ack,
         );
         thread.run();
 
@@ -181,12 +203,12 @@ impl VsockMuxer {
     }
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
-        debug!("recv_stream_pkt");
         if self.rxq.lock().unwrap().is_empty() {
             return Err(VsockError::NoData);
         }
 
         if let Some(rx) = self.rxq.lock().unwrap().pop() {
+            debug!("vsock: muxer recv_pkt: dequeued {:?}", rx);
             rx_to_pkt(self.cid, rx, pkt);
         }
 
@@ -197,29 +219,34 @@ impl VsockMuxer {
         let mem = match self.mem.as_ref() {
             Some(m) => m,
             None => {
-                error!("proxy creation without mem");
+                error!("vsock: muxer push_packet without mem");
                 return;
             }
         };
         let queue_mutex = match self.queue.as_ref() {
             Some(q) => q,
             None => {
-                error!("stream proxy creation without stream queue");
+                error!("vsock: muxer push_packet without queue");
                 return;
             }
         };
 
         let mut queue = queue_mutex.lock().unwrap();
+        debug!(
+            "vsock: muxer push_packet: rx={:?} queue(next_avail={}, next_used={})",
+            rx, queue.next_avail(), queue.next_used()
+        );
         if let Some(head) = queue.pop(mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                 rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                if let Err(e) =
+                    queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
                 {
-                    error!("failed to add used elements to the queue: {e:?}");
+                    error!("vsock: muxer push_packet add_used failed: {e:?}");
                 }
             }
         } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
+            warn!("vsock: muxer push_packet: no avail bufs, deferring to rxq");
             drop(queue);
             self.rxq.lock().unwrap().push(rx);
         }
@@ -492,9 +519,9 @@ impl VsockMuxer {
 
     pub(crate) fn send_dgram_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
         debug!(
-            "send_dgram_pkt: src_port={} dst_port={}",
-            pkt.src_port(),
-            pkt.dst_port()
+            "vsock: muxer send_dgram_pkt: op={} src={}:{} dst={}:{} len={}",
+            pkt.op(), pkt.src_cid(), pkt.src_port(),
+            pkt.dst_cid(), pkt.dst_port(), pkt.len()
         );
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
@@ -675,10 +702,9 @@ impl VsockMuxer {
 
     pub(crate) fn send_stream_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
         debug!(
-            "send_pkt: src_port={} dst_port={}, op={}",
-            pkt.src_port(),
-            pkt.dst_port(),
-            pkt.op()
+            "vsock: muxer send_stream_pkt: op={} src={}:{} dst={}:{} len={}",
+            pkt.op(), pkt.src_cid(), pkt.src_port(),
+            pkt.dst_cid(), pkt.dst_port(), pkt.len()
         );
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {

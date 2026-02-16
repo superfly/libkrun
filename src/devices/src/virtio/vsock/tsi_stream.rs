@@ -26,6 +26,7 @@ use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{push_packet, MuxerRx};
+use vm_memory::GuestMemoryMmap;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
@@ -34,8 +35,6 @@ use super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
 use utils::epoll::EventSet;
-
-use vm_memory::GuestMemoryMmap;
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -384,7 +383,7 @@ impl TsiStreamProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn push_reset(&self) {
@@ -398,7 +397,7 @@ impl TsiStreamProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn switch_to_connected(&mut self) {
@@ -451,6 +450,10 @@ impl TsiStreamProxy {
         }
 
         None
+    }
+
+    fn push_pkt(&self, rx: MuxerRx) {
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 }
 
@@ -519,7 +522,7 @@ impl Proxy for TsiStreamProxy {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
 
         // Now that the vsock transport is fully established, start listening
         // for events in the TCP socket again.
@@ -572,7 +575,7 @@ impl Proxy for TsiStreamProxy {
             peer_port: pkt.src_port(),
             data,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
@@ -620,7 +623,7 @@ impl Proxy for TsiStreamProxy {
                 peer_port: pkt.src_port(),
                 fwd_cnt: self.tx_cnt.0,
             };
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+            self.push_pkt(rx);
             update.signal_queue = true;
         }
 
@@ -652,7 +655,7 @@ impl Proxy for TsiStreamProxy {
             peer_port: pkt.src_port(),
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
 
         if result == 0 {
             self.peer_port = req.vm_port;
@@ -711,7 +714,7 @@ impl Proxy for TsiStreamProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
@@ -757,7 +760,7 @@ impl Proxy for TsiStreamProxy {
             peer_port: self.control_port,
             result,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) {

@@ -1196,8 +1196,12 @@ impl HvfVcpu<'_> {
                 let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
-            EC_AA64_HVC => self.handle_psci_request(),
+            EC_AA64_HVC => {
+                debug!("vcpu[{}]: EC_AA64_HVC PSCI", self.vcpuid);
+                self.handle_psci_request()
+            }
             EC_AA64_SMC => {
+                debug!("vcpu[{}]: EC_AA64_SMC PSCI", self.vcpuid);
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }

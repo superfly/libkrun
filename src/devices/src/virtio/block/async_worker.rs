@@ -222,7 +222,7 @@ impl AsyncBlockWorker {
 
     /// Main async work loop.
     async fn work_async(self) {
-        log::debug!("async block worker: work_async starting");
+        warn!("async block worker: work_async starting");
 
         // Destructure self so we can consume the factory while keeping other fields
         let AsyncBlockWorker {
@@ -242,7 +242,7 @@ impl AsyncBlockWorker {
         } = self;
 
         // Create the backend from the factory (inside this runtime)
-        log::debug!("async block worker: creating backend from factory");
+        warn!("async block worker: creating backend from factory");
         let disk = match factory.create().await {
             Ok(disk) => disk,
             Err(e) => {
@@ -250,7 +250,7 @@ impl AsyncBlockWorker {
                 return;
             }
         };
-        log::debug!("async block worker: backend created successfully");
+        warn!("async block worker: backend created, nsectors={}", disk.nsectors());
 
         // Create metrics
         let metrics = Arc::new(AsyncWorkerMetrics::default());
@@ -363,8 +363,14 @@ impl AsyncBlockWorker {
         let async_resume_fd =
             AsyncFd::new(resume_fd_dup).expect("failed to create AsyncFd for resume");
 
-        log::debug!("async block worker: AsyncFd configured, entering main loop");
+        let worker_nsectors = disk.nsectors();
+        warn!("async block worker [ns={}]: AsyncFd configured, entering main loop", worker_nsectors);
         let mut applied_generation: u64 = 0;
+        let mut total_queue_events: u64 = 0;
+
+        // Periodic poll to detect missed notifications (guest adds to avail ring without kicking)
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        poll_interval.tick().await; // skip first immediate tick
 
         loop {
             tokio::select! {
@@ -569,14 +575,15 @@ impl AsyncBlockWorker {
                                     &shared_generation,
                                     &mut applied_generation,
                                 );
+                                warn!("async block worker [ns={}]: resync applied, queue avail={} used={}",
+                                    worker_nsectors, queue.next_avail().0, queue.next_used().0);
                                 // Restore backend state if the device provided one
                                 if let Ok(mut shared) = shared_backend_state.lock() {
                                     if let Some(data) = shared.take() {
-                                        debug!("async block worker: restoring backend state ({} bytes)", data.len());
+                                        warn!("async block worker [ns={}]: restoring backend state ({} bytes)", worker_nsectors, data.len());
                                         disk.restore_snapshot_state(&data);
                                     }
                                 }
-                                trace!("async block worker: queue state refreshed from snapshot state");
                             }
                         }
                         Err(e) => {
@@ -602,9 +609,12 @@ impl AsyncBlockWorker {
                                         &shared_generation,
                                         &mut applied_generation,
                                     );
-                                    trace!("async block worker: queue event received");
+                                    total_queue_events += 1;
                                     // Pop and parse all available requests
                                     let requests = pop_and_parse_requests(&mut queue, &mem);
+                                    warn!("async block worker [ns={}]: queue event #{}, parsed {} requests, queue avail={} used={}",
+                                        worker_nsectors, total_queue_events, requests.len(),
+                                        queue.next_avail().0, queue.next_used().0);
 
                                     for parsed in requests {
                                         metrics.in_flight.fetch_add(1, Ordering::Relaxed);
@@ -694,6 +704,41 @@ impl AsyncBlockWorker {
                         }
                         Err(e) => {
                             error!("queue fd ready error: {e}");
+                        }
+                    }
+                }
+
+                // Periodic poll: detect missed notifications
+                _ = poll_interval.tick() => {
+                    // Read avail_idx directly from guest memory
+                    if let Some(avail_idx_addr) = queue.avail_ring.checked_add(2) {
+                        if let Ok(avail_idx) = mem.read_obj::<u16>(avail_idx_addr) {
+                            let next_avail = queue.next_avail().0;
+                            if avail_idx != next_avail {
+                                warn!("async block worker [ns={}]: MISSED NOTIFICATION! avail_idx_in_mem={} next_avail={} next_used={} total_events={}",
+                                    worker_nsectors, avail_idx, next_avail, queue.next_used().0, total_queue_events);
+                                // Try to process the missed requests
+                                let requests = pop_and_parse_requests(&mut queue, &mem);
+                                if !requests.is_empty() {
+                                    warn!("async block worker [ns={}]: recovered {} missed requests!", worker_nsectors, requests.len());
+                                    for parsed in requests {
+                                        metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+                                        match &parsed.request {
+                                            Request::Read { .. } | Request::GetId { .. } |
+                                            Request::Discard { .. } | Request::WriteZeroes { .. } => {
+                                                spawn_read_task(parsed, disk.clone(), read_completion_tx.clone(), metrics.clone());
+                                            }
+                                            Request::Write { .. } | Request::Flush => {
+                                                // For simplicity, treat as read path
+                                                spawn_read_task(parsed, disk.clone(), read_completion_tx.clone(), metrics.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!("async block worker [ns={}]: poll ok, avail_idx={} next_avail={} next_used={} events={}",
+                                    worker_nsectors, avail_idx, next_avail, queue.next_used().0, total_queue_events);
+                            }
                         }
                     }
                 }
@@ -1253,8 +1298,10 @@ fn complete_request(
     }
 
     if let Err(e) = interrupt.try_signal_used_queue() {
-        error!("error signalling queue: {e:?}");
+        error!("complete_request: error signalling queue: {e:?}");
     }
+    warn!("complete_request: index={} status={} len={} queue_used={}",
+        result.index, result.status, result.len, queue.next_used().0);
 }
 
 /// Process a single request asynchronously, returning request type for metrics.

@@ -133,19 +133,19 @@ impl InterruptTransport {
     }
 
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
-        let prev = self.status().fetch_or(status as usize, Ordering::SeqCst);
-        // Only fire a GIC interrupt if at least one new status bit was set.
-        // Re-firing when the bit is already set creates a spurious interrupt:
-        // the guest may have acked the ISR between our set and the GIC delivery,
-        // causing the second interrupt to see ISR=0 and skip VQ processing.
-        // The ISR ack handler (offset 0x64) re-asserts if new bits arrived
-        // between the guest's read and ack, so we don't lose interrupts.
-        if (prev as u32 & status) != status {
-            self.intc()
-                .lock()
-                .unwrap()
-                .set_irq(self.0.irq_line, Some(&self.0.event))?;
-        }
+        self.status().fetch_or(status as usize, Ordering::SeqCst);
+        // Always fire the GIC interrupt. Skipping when the ISR bit is
+        // already set causes a race: if Thread A sets the bit and fires,
+        // and Thread B adds work to the used ring + sets the bit (no-op)
+        // while the guest is mid-handler (between reading used_idx and
+        // acking), Thread B's work is silently missed — the ack clears
+        // the bit and the re-assertion sees remaining=0.
+        // A spurious interrupt (guest sees ISR=0) is harmless — the guest
+        // just returns from the handler without processing.
+        self.intc()
+            .lock()
+            .unwrap()
+            .set_irq(self.0.irq_line, Some(&self.0.event))?;
         Ok(())
     }
 
@@ -241,6 +241,7 @@ impl MmioTransport {
     pub fn begin_restore_resync(&self, timeout: Duration) -> Result<(), SnapshotError> {
         let mut device = self.locked_device();
         let device_id = device.device_name().to_string();
+        debug!("mmio: begin_restore_resync '{}'", device_id);
 
         device
             .begin_restore_resync(timeout)
@@ -248,6 +249,8 @@ impl MmioTransport {
     }
 
     pub fn end_restore_resync(&self) {
+        let device_id = self.locked_device().device_name().to_string();
+        debug!("mmio: end_restore_resync '{}'", device_id);
         self.locked_device().end_restore_resync();
     }
 
@@ -739,6 +742,18 @@ impl Snapshottable for MmioTransport {
                 let needs_activate =
                     should_reactivate && (!device.is_activated() || force_reactivate);
 
+                debug!(
+                    "mmio: restore_state '{}': should_reactivate={} is_activated={} force_reactivate={} needs_activate={}",
+                    device_name, should_reactivate, device.is_activated(), force_reactivate, needs_activate
+                );
+
+                for (i, qs) in state.queue_states.iter().enumerate() {
+                    debug!(
+                        "mmio: restore_state '{}': queue[{}] size={} ready={} next_avail={} next_used={}",
+                        device_name, i, qs.size, qs.ready, qs.next_avail, qs.next_used
+                    );
+                }
+
                 if let Some(ref backend_data) = state.backend_state {
                     device.restore_backend_state(backend_data);
                 }
@@ -779,10 +794,15 @@ impl MmioTransport {
     /// state has been restored. This is the point where device threads are
     /// spawned and can safely fire interrupts.
     pub fn complete_restore(&mut self) -> Result<(), SnapshotError> {
+        let device_name = self.locked_device().device_name().to_string();
+        debug!(
+            "mmio: complete_restore '{}': needs_post_restore_activate={}",
+            device_name, self.needs_post_restore_activate
+        );
         if self.needs_post_restore_activate {
             self.needs_post_restore_activate = false;
             let mut device = self.locked_device();
-            let device_name = device.device_name().to_string();
+            debug!("mmio: complete_restore '{}': calling activate()", device_name);
             device
                 .activate(self.mem.clone(), self.interrupt.clone())
                 .map_err(|e| {
@@ -792,15 +812,9 @@ impl MmioTransport {
                 })?;
         }
 
-        // Clear ISR status before kicking workers. The restored ISR value is
-        // stale — the GIC has no corresponding pending interrupt after restore.
-        // Without this, try_signal's dedup logic sees the bit already set and
-        // skips the GIC interrupt, leaving the guest unaware of pending work.
-        self.interrupt
-            .status()
-            .store(0, Ordering::SeqCst);
-
         self.post_restore_kick();
+        self.interrupt.signal_used_queue();
+
         Ok(())
     }
 }

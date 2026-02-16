@@ -155,8 +155,30 @@ pub trait VirtioDevice: AsAny + Send {
     /// End restore-time resync and transition the device to its steady runtime state.
     fn end_restore_resync(&mut self) {}
 
-    /// Trigger any best-effort post-restore kick needed to restart asynchronous processing.
-    fn post_restore_kick(&mut self) {}
+    /// Kick all ready queues after snapshot restore so workers process any
+    /// pending work. Skips queues the guest never configured (ready=false)
+    /// to avoid accessing invalid GuestAddress(0) ring pointers.
+    fn post_restore_kick(&mut self) {
+        if !self.is_activated() {
+            return;
+        }
+        for (i, (queue, evt)) in self
+            .queues()
+            .iter()
+            .zip(self.queue_events().iter())
+            .enumerate()
+        {
+            if !queue.ready {
+                continue;
+            }
+            if let Err(e) = evt.write(1) {
+                error!(
+                    "{}: post_restore_kick queue {i} failed: {e}",
+                    self.device_name()
+                );
+            }
+        }
+    }
 
     /// Perform any device-specific recovery steps after snapshot restore.
     fn post_snapshot_restore(&mut self) {}

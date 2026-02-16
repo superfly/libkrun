@@ -37,7 +37,7 @@ pub enum ProxyStatus {
     WaitingOnAccept,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub enum ProxyRemoval {
     #[default]
     Keep,

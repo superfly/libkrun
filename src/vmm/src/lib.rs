@@ -744,7 +744,7 @@ impl Vmm {
 
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
     pub fn stop(&mut self, exit_code: i32) {
-        info!("Vmm is stopping.");
+        info!("Vmm is stopping with exit_code={exit_code}");
 
         for observer in &self.exit_observers {
             observer
@@ -790,6 +790,7 @@ impl Subscriber for Vmm {
         let event_set = event.event_set();
 
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
+            debug!("Vmm: exit_evt fired, shutting down");
             let _ = self.exit_evt.read();
             // Query each vcpu for the exit_code.
             // If the exit_code can't be found on any vcpu, it means that the exit signal

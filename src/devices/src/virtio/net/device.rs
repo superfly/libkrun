@@ -402,14 +402,4 @@ impl VirtioDevice for Net {
         let _ = self.worker_resync_fd.write(1);
     }
 
-    fn post_restore_kick(&mut self) {
-        if !self.device_state.is_activated() {
-            return;
-        }
-        for (i, evt) in self.queue_evts.iter().enumerate() {
-            if let Err(e) = evt.write(1) {
-                error!("net: post_restore_kick queue {i} failed: {e}");
-            }
-        }
-    }
 }

@@ -18,13 +18,12 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
+use vm_memory::GuestMemoryMmap;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use utils::epoll::EventSet;
-
-use vm_memory::GuestMemoryMmap;
 
 pub struct TsiDgramProxy {
     pub id: u64,
@@ -127,6 +126,10 @@ impl TsiDgramProxy {
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
+    fn push_pkt(&self, rx: MuxerRx) {
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
     /*
     fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
@@ -139,7 +142,7 @@ impl TsiDgramProxy {
             peer_port: self.peer_port,
             fwd_cnt: self.tx_cnt.0,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
     */
 
@@ -266,7 +269,7 @@ impl Proxy for TsiDgramProxy {
             peer_port: pkt.src_port(),
             result: res,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
 
         let mut update = ProxyUpdate::default();
         if res == 0 && !self.listening {
@@ -304,7 +307,7 @@ impl Proxy for TsiDgramProxy {
             peer_port: pkt.src_port(),
             data,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.push_pkt(rx);
     }
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {

@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
@@ -19,6 +20,7 @@ use super::super::{
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::{defs, defs::uapi};
+use crate::snapshot::SnapshotError;
 use crate::virtio::InterruptTransport;
 
 pub(crate) const RXQ_INDEX: usize = 0;
@@ -48,6 +50,13 @@ pub struct Vsock {
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+
+    muxer_quiesce_fd: EventFd,
+    muxer_resume_fd: EventFd,
+    muxer_quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
+    timesync_quiesce_fd: EventFd,
+    timesync_resume_fd: EventFd,
+    timesync_quiesce_ack: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Vsock {
@@ -90,6 +99,16 @@ impl Vsock {
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            muxer_quiesce_fd: EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(VsockError::EventFd)?,
+            muxer_resume_fd: EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(VsockError::EventFd)?,
+            muxer_quiesce_ack: Arc::new((Mutex::new(false), Condvar::new())),
+            timesync_quiesce_fd: EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(VsockError::EventFd)?,
+            timesync_resume_fd: EventFd::new(utils::eventfd::EFD_NONBLOCK)
+                .map_err(VsockError::EventFd)?,
+            timesync_quiesce_ack: Arc::new((Mutex::new(false), Condvar::new())),
         })
     }
 
@@ -127,82 +146,94 @@ impl Vsock {
     /// have pending. Return `true` if descriptors have been added to the used ring, and `false`
     /// otherwise.
     pub fn process_stream_rx(&mut self) -> bool {
-        debug!("process_stream_rx()");
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem,
-            // This should never happen, it's been already validated in the event handler.
             DeviceState::Inactive => unreachable!(),
         };
 
         let mut have_used = false;
 
-        debug!("process_rx before while");
         let mut queue_rx = self.queue_rx.lock().unwrap();
+        debug!(
+            "vsock: process_stream_rx: next_avail={} next_used={} pending_rx={}",
+            queue_rx.next_avail(), queue_rx.next_used(), self.muxer.has_pending_rx()
+        );
         while let Some(head) = queue_rx.pop(mem) {
-            debug!("process_rx inside while");
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => {
                     if self.muxer.recv_pkt(&mut pkt).is_ok() {
+                        debug!(
+                            "vsock: RX pkt: op={} src={}:{} dst={}:{} len={} type={}",
+                            pkt.op(), pkt.src_cid(), pkt.src_port(),
+                            pkt.dst_cid(), pkt.dst_port(), pkt.len(), pkt.type_()
+                        );
                         pkt.hdr().len() as u32 + pkt.len()
                     } else {
-                        // We are using a consuming iterator over the virtio buffers, so, if we can't
-                        // fill in this buffer, we'll need to undo the last iterator step.
                         queue_rx.undo_pop();
                         break;
                     }
                 }
                 Err(e) => {
-                    warn!("RX queue error: {e:?}");
+                    warn!("vsock: RX queue head error: {e:?}");
                     0
                 }
             };
 
-            debug!("process_rx: something to queue");
             have_used = true;
             if let Err(e) = queue_rx.add_used(mem, head.index, used_len) {
-                error!("failed to add used elements to the queue: {e:?}");
+                error!("vsock: RX add_used failed: {e:?}");
             }
         }
 
         self.queues[RXQ_INDEX] = queue_rx.clone();
 
+        if have_used {
+            debug!("vsock: process_stream_rx: delivered packets, next_avail={} next_used={}",
+                self.queues[RXQ_INDEX].next_avail(), self.queues[RXQ_INDEX].next_used());
+        }
         have_used
     }
 
     /// Walk the driver-provided TX queue buffers, package them up as vsock packets, and process
     /// them. Return `true` if descriptors have been added to the used ring, and `false` otherwise.
     pub fn process_stream_tx(&mut self) -> bool {
-        debug!("process_stream_tx()");
         let mem = match self.device_state {
             DeviceState::Activated(ref mem, _) => mem,
-            // This should never happen, it's been already validated in the event handler.
             DeviceState::Inactive => unreachable!(),
         };
 
         let mut have_used = false;
 
         let mut queue_tx = self.queue_tx.lock().unwrap();
+        debug!(
+            "vsock: process_stream_tx: next_avail={} next_used={}",
+            queue_tx.next_avail(), queue_tx.next_used()
+        );
         while let Some(head) = queue_tx.pop(mem) {
             let pkt = match VsockPacket::from_tx_virtq_head(&head) {
                 Ok(pkt) => pkt,
                 Err(e) => {
-                    error!("error reading TX packet: {e:?}");
+                    error!("vsock: TX packet read error: {e:?}");
                     have_used = true;
                     if let Err(e) = queue_tx.add_used(mem, head.index, 0) {
-                        error!("failed to add used elements to the queue: {e:?}");
+                        error!("vsock: TX add_used failed: {e:?}");
                     }
                     continue;
                 }
             };
 
+            debug!(
+                "vsock: TX pkt: op={} src={}:{} dst={}:{} len={} type={}",
+                pkt.op(), pkt.src_cid(), pkt.src_port(),
+                pkt.dst_cid(), pkt.dst_port(), pkt.len(), pkt.type_()
+            );
+
             if pkt.type_() == uapi::VSOCK_TYPE_DGRAM {
-                debug!("process_stream_tx() is DGRAM");
                 if self.muxer.send_dgram_pkt(&pkt).is_err() {
                     queue_tx.undo_pop();
                     break;
                 }
             } else {
-                debug!("process_stream_tx() is STREAM");
                 if self.muxer.send_stream_pkt(&pkt).is_err() {
                     queue_tx.undo_pop();
                     break;
@@ -211,7 +242,7 @@ impl Vsock {
 
             have_used = true;
             if let Err(e) = queue_tx.add_used(mem, head.index, 0) {
-                error!("failed to add used elements to the queue: {e:?}");
+                error!("vsock: TX add_used failed: {e:?}");
             }
         }
 
@@ -280,6 +311,7 @@ impl VirtioDevice for Vsock {
     }
 
     fn activate(&mut self, mem: GuestMemoryMmap, interrupt: InterruptTransport) -> ActivateResult {
+        warn!("vsock: activate called, already_activated={}", self.device_state.is_activated());
         if self.queues.len() != defs::NUM_QUEUES {
             error!(
                 "Cannot perform activate. Expected {} queue(s), got {}",
@@ -300,8 +332,34 @@ impl VirtioDevice for Vsock {
         let rxq_kick = self.queue_events[RXQ_INDEX]
             .try_clone()
             .map_err(|_| ActivateError::BadActivate)?;
-        self.muxer
-            .activate(mem.clone(), self.queue_rx.clone(), interrupt.clone(), rxq_kick);
+        let muxer_quiesce_fd = self
+            .muxer_quiesce_fd
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let muxer_resume_fd = self
+            .muxer_resume_fd
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let timesync_quiesce_fd = self
+            .timesync_quiesce_fd
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        let timesync_resume_fd = self
+            .timesync_resume_fd
+            .try_clone()
+            .map_err(|_| ActivateError::BadActivate)?;
+        self.muxer.activate(
+            mem.clone(),
+            self.queue_rx.clone(),
+            interrupt.clone(),
+            rxq_kick,
+            muxer_quiesce_fd,
+            muxer_resume_fd,
+            self.muxer_quiesce_ack.clone(),
+            timesync_quiesce_fd,
+            timesync_resume_fd,
+            self.timesync_quiesce_ack.clone(),
+        );
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
@@ -326,24 +384,112 @@ impl VirtioDevice for Vsock {
         true
     }
 
+    fn begin_snapshot_quiesce(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<(), SnapshotError> {
+        warn!("vsock: begin_snapshot_quiesce, activated={}", self.device_state.is_activated());
+        if !self.device_state.is_activated() {
+            return Ok(());
+        }
+
+        // Quiesce the muxer thread.
+        {
+            let (lock, _) = &*self.muxer_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        let _ = self.muxer_quiesce_fd.write(1);
+
+        let (lock, cvar) = &*self.muxer_quiesce_ack;
+        let guard = lock.lock().unwrap();
+        let (guard, wait_result) = cvar
+            .wait_timeout_while(guard, timeout, |acked| !*acked)
+            .unwrap();
+        if !*guard || wait_result.timed_out() {
+            return Err(SnapshotError::QuiesceTimeout {
+                device_id: String::new(),
+                timeout_ms: timeout.as_millis() as u64,
+                detail: Some("vsock muxer thread did not ack quiesce".into()),
+            });
+        }
+        drop(guard);
+
+        // Quiesce the timesync thread.
+        {
+            let (lock, _) = &*self.timesync_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        let _ = self.timesync_quiesce_fd.write(1);
+
+        let (lock, cvar) = &*self.timesync_quiesce_ack;
+        let guard = lock.lock().unwrap();
+        let (guard, wait_result) = cvar
+            .wait_timeout_while(guard, timeout, |acked| !*acked)
+            .unwrap();
+        if !*guard || wait_result.timed_out() {
+            // Resume the muxer thread since it already quiesced.
+            let _ = self.muxer_resume_fd.write(1);
+            return Err(SnapshotError::QuiesceTimeout {
+                device_id: String::new(),
+                timeout_ms: timeout.as_millis() as u64,
+                detail: Some("vsock timesync thread did not ack quiesce".into()),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn abort_snapshot_quiesce(&mut self) {
+        warn!("vsock: abort_snapshot_quiesce (resume workers), activated={}", self.device_state.is_activated());
+        if !self.device_state.is_activated() {
+            return;
+        }
+        // Reset ack flags and resume both threads.
+        {
+            let (lock, _) = &*self.muxer_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        {
+            let (lock, _) = &*self.timesync_quiesce_ack;
+            *lock.lock().unwrap() = false;
+        }
+        let _ = self.muxer_resume_fd.write(1);
+        let _ = self.timesync_resume_fd.write(1);
+    }
+
     fn sync_queues_for_snapshot(&mut self) {
         self.queues[RXQ_INDEX] = self.queue_rx.lock().unwrap().clone();
         self.queues[TXQ_INDEX] = self.queue_tx.lock().unwrap().clone();
+        warn!(
+            "vsock: sync_queues_for_snapshot: rx(next_avail={}, next_used={}) tx(next_avail={}, next_used={})",
+            self.queues[RXQ_INDEX].next_avail(), self.queues[RXQ_INDEX].next_used(),
+            self.queues[TXQ_INDEX].next_avail(), self.queues[TXQ_INDEX].next_used(),
+        );
     }
 
     fn post_snapshot_restore(&mut self) {
+        warn!("vsock: post_snapshot_restore called, activated={}", self.device_state.is_activated());
+
+        let rx_q = &self.queues[RXQ_INDEX];
+        let tx_q = &self.queues[TXQ_INDEX];
+        warn!(
+            "vsock: restore queues from snapshot: rx(ready={}, size={}, next_avail={}, next_used={}) tx(ready={}, size={}, next_avail={}, next_used={})",
+            rx_q.ready, rx_q.size, rx_q.next_avail(), rx_q.next_used(),
+            tx_q.ready, tx_q.size, tx_q.next_avail(), tx_q.next_used(),
+        );
+
+        {
+            let shared_rx = self.queue_rx.lock().unwrap();
+            let shared_tx = self.queue_tx.lock().unwrap();
+            warn!(
+                "vsock: shared queues before restore: rx(next_avail={}, next_used={}) tx(next_avail={}, next_used={})",
+                shared_rx.next_avail(), shared_rx.next_used(),
+                shared_tx.next_avail(), shared_tx.next_used(),
+            );
+        }
+
         *self.queue_rx.lock().unwrap() = self.queues[RXQ_INDEX].clone();
         *self.queue_tx.lock().unwrap() = self.queues[TXQ_INDEX].clone();
     }
 
-    fn post_restore_kick(&mut self) {
-        if !self.device_state.is_activated() {
-            return;
-        }
-        for (i, evt) in self.queue_events.iter().enumerate() {
-            if let Err(e) = evt.write(1) {
-                error!("vsock: post_restore_kick queue {i} failed: {e}");
-            }
-        }
-    }
 }

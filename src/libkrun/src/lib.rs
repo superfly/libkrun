@@ -2930,6 +2930,12 @@ impl Builder {
 
         let (sender, _receiver) = unbounded();
 
+        let shutdown_efd_clone = ctx_cfg
+            .shutdown_efd
+            .as_ref()
+            .and_then(|efd| efd.try_clone().ok())
+            .map(Arc::new);
+
         let built_vm = vmm::builder::build_microvm(
             &mut ctx_cfg.vmr,
             &mut event_manager,
@@ -2953,6 +2959,7 @@ impl Builder {
         Ok(Context {
             built_vm,
             event_manager,
+            shutdown_efd: shutdown_efd_clone,
         })
     }
 }
@@ -2973,6 +2980,8 @@ pub enum BuilderError {
 pub struct Context {
     built_vm: vmm::builder::BuiltVm,
     event_manager: EventManager,
+    /// Cloned shutdown eventfd for host-initiated GPIO shutdown.
+    shutdown_efd: Option<Arc<EventFd>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3015,6 +3024,7 @@ impl Context {
     pub fn vm_handle(&self) -> VmHandle {
         VmHandle {
             vmm: self.built_vm.vmm().clone(),
+            shutdown_efd: self.shutdown_efd.clone(),
         }
     }
 
@@ -3059,6 +3069,7 @@ impl Context {
 #[derive(Clone)]
 pub struct VmHandle {
     vmm: Arc<Mutex<vmm::Vmm>>,
+    shutdown_efd: Option<Arc<EventFd>>,
 }
 
 impl VmHandle {
@@ -3088,6 +3099,25 @@ impl VmHandle {
             .expect("Poisoned vmm lock")
             .resume_vcpus()
             .map_err(|e| StartError::Microvm(vmm::builder::StartMicrovmError::Internal(e)))
+    }
+
+    /// Trigger host-initiated guest shutdown via the MMIO GPIO shutdown eventfd.
+    pub fn trigger_shutdown_event(&self) -> Result<(), StartError> {
+        match self.shutdown_efd.as_ref() {
+            Some(efd) => efd.write(1).map_err(|e| {
+                StartError::Microvm(vmm::builder::StartMicrovmError::Internal(
+                    vmm::Error::EventFd(e),
+                ))
+            }),
+            None => Err(StartError::Microvm(
+                vmm::builder::StartMicrovmError::Internal(vmm::Error::EventFd(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "shutdown eventfd unavailable for this VM",
+                    ),
+                )),
+            )),
+        }
     }
 
     /// Create a full snapshot of the VM. Pauses vCPUs, takes snapshot, resumes vCPUs.

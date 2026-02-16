@@ -591,6 +591,11 @@ impl VirtioDevice for Block {
                 // Put the backend back so on_exit can access it
                 self.disk = Some(BlockDeviceBackend::Sync(backend.clone()));
 
+                if let Ok(mut shared) = self.worker_queue_state.lock() {
+                    *shared = self.queues[0].clone();
+                }
+                self.worker_queue_generation.fetch_add(1, Ordering::SeqCst);
+
                 let worker = BlockWorker::new(
                     self.queues[0].clone(),
                     self.queue_evts[0].try_clone().unwrap(),
@@ -598,6 +603,12 @@ impl VirtioDevice for Block {
                     mem.clone(),
                     backend,
                     self.worker_stopfd.try_clone().unwrap(),
+                    self.worker_queue_state.clone(),
+                    self.worker_queue_generation.clone(),
+                    self.worker_resyncfd.try_clone().unwrap(),
+                    self.worker_quiesce_fd.try_clone().unwrap(),
+                    self.worker_resume_fd.try_clone().unwrap(),
+                    self.worker_quiesce_ack.clone(),
                 );
                 self.worker_thread = Some(worker.run());
             }
@@ -649,10 +660,6 @@ impl VirtioDevice for Block {
         if !self.device_state.is_activated() {
             return Ok(());
         }
-        // Only quiesce async workers (disk is None when async factory was consumed)
-        if self.disk.is_some() {
-            return Ok(());
-        }
 
         // Reset ack flag, then signal the worker to quiesce
         {
@@ -671,14 +678,14 @@ impl VirtioDevice for Block {
             return Err(SnapshotError::QuiesceTimeout {
                 device_id: String::new(),
                 timeout_ms: timeout.as_millis() as u64,
-                detail: Some("async block worker did not ack quiesce".into()),
+                detail: Some("block worker did not ack quiesce".into()),
             });
         }
         Ok(())
     }
 
     fn abort_snapshot_quiesce(&mut self) {
-        if !self.device_state.is_activated() || self.disk.is_some() {
+        if !self.device_state.is_activated() {
             return;
         }
         // Reset ack flag and resume the worker
@@ -717,14 +724,6 @@ impl VirtioDevice for Block {
         let _ = self.worker_resyncfd.write(1);
     }
 
-    fn post_restore_kick(&mut self) {
-        if !self.device_state.is_activated() {
-            return;
-        }
-        if let Err(e) = self.queue_evts[0].write(1) {
-            error!("block: post_restore_kick failed: {e}");
-        }
-    }
 }
 
 impl VmmExitObserver for Block {
