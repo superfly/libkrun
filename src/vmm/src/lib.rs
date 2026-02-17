@@ -302,7 +302,11 @@ impl Vmm {
         if states.len() != self.vcpus_handles.len() {
             return Err(Error::VcpuPause);
         }
-        for (handle, state) in self.vcpus_handles.iter().zip(states.into_iter()) {
+        // Read host counter once so all vCPUs get the same reference point
+        // (avoids inter-vCPU skew from restore loop timing).
+        let host_now = hvf::host_counter_now();
+        for (handle, mut state) in self.vcpus_handles.iter().zip(states.into_iter()) {
+            state.host_counter_at_restore = Some(host_now);
             handle.restore_state(state).map_err(Error::Vcpu)?;
         }
         Ok(())

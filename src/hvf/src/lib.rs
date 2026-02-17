@@ -365,6 +365,12 @@ pub fn check_nested_virt() -> Result<bool, Error> {
     Ok(el2_supported)
 }
 
+/// Read the host physical counter (mach_absolute_time on Apple Silicon).
+/// Used by the VM-level restore path to get a single timestamp for all vCPUs.
+pub fn host_counter_now() -> u64 {
+    unsafe { mach_absolute_time() }
+}
+
 pub struct HvfVm {}
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -579,6 +585,12 @@ pub struct Aarch64VcpuState {
     pub sys_regs: Vec<(u16, u64)>,
     /// Virtual timer offset
     pub vtimer_offset: u64,
+    /// Host physical counter at save time (for adjusting vtimer_offset on restore)
+    pub host_counter_at_save: u64,
+    /// Host counter value to use during restore (set by VM-level restore path
+    /// so all vCPUs use the same value, avoiding inter-vCPU skew).
+    #[cfg_attr(feature = "snapshot", serde(skip))]
+    pub host_counter_at_restore: Option<u64>,
     /// Whether the virtual timer interrupt was masked
     pub vtimer_masked: bool,
     /// Whether a PC advance was pending at the time of save
@@ -902,14 +914,17 @@ impl HvfVcpu<'_> {
             }
         }
 
-        // Save vtimer offset
+        // Save vtimer offset and host counter for deterministic restore
         let vtimer_offset = vcpu_get_vtimer_offset(self.vcpuid)?;
+        let host_counter_at_save = host_counter_now();
 
         Ok(Aarch64VcpuState {
             gp_regs,
             simd_fp_regs,
             sys_regs,
             vtimer_offset,
+            host_counter_at_save,
+            host_counter_at_restore: None,
             vtimer_masked: self.vtimer_masked,
             pending_advance_pc: self.pending_advance_pc,
         })
@@ -940,8 +955,20 @@ impl HvfVcpu<'_> {
             }
         }
 
-        // Restore vtimer offset
-        vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset)?;
+        // Restore vtimer offset, adjusting for elapsed host time so that
+        // guest CNTVCT_EL0 resumes from its snapshot value rather than
+        // jumping forward by the wall-clock gap between save and restore.
+        // guest_cnt = host_cnt - vtimer_offset
+        // new_offset = saved_offset + (host_now - host_at_save)
+        //
+        // host_counter_at_restore is stamped by the VM-level restore path so
+        // all vCPUs use the same value (no inter-vCPU skew from restore loop timing).
+        let host_now = state
+            .host_counter_at_restore
+            .unwrap_or_else(host_counter_now);
+        let delta = host_now.wrapping_sub(state.host_counter_at_save);
+        let adjusted_offset = state.vtimer_offset.wrapping_add(delta);
+        vcpu_set_vtimer_offset(self.vcpuid, adjusted_offset)?;
 
         // Restore vtimer mask state
         if state.vtimer_masked {
