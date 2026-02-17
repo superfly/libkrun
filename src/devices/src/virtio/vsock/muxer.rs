@@ -84,7 +84,9 @@ pub fn push_packet(
     let mut queue = queue_mutex.lock().unwrap();
     debug!(
         "vsock: push_packet: rx={:?} queue(next_avail={}, next_used={})",
-        rx, queue.next_avail(), queue.next_used()
+        rx,
+        queue.next_avail(),
+        queue.next_used()
     );
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
@@ -234,13 +236,14 @@ impl VsockMuxer {
         let mut queue = queue_mutex.lock().unwrap();
         debug!(
             "vsock: muxer push_packet: rx={:?} queue(next_avail={}, next_used={})",
-            rx, queue.next_avail(), queue.next_used()
+            rx,
+            queue.next_avail(),
+            queue.next_used()
         );
         if let Some(head) = queue.pop(mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
                 rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) =
-                    queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
                 {
                     error!("vsock: muxer push_packet add_used failed: {e:?}");
                 }
@@ -272,11 +275,11 @@ impl VsockMuxer {
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
-                warn!("immediately removing proxy: {id}");
+                debug!("immediately removing proxy: {id}");
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                warn!("deferring proxy removal: {id}");
+                debug!("deferring proxy removal: {id}");
                 if let Some(reaper_sender) = &self.reaper_sender {
                     if reaper_sender.send(id).is_err() {
                         self.proxy_map.write().unwrap().remove(&id);
@@ -520,8 +523,12 @@ impl VsockMuxer {
     pub(crate) fn send_dgram_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
         debug!(
             "vsock: muxer send_dgram_pkt: op={} src={}:{} dst={}:{} len={}",
-            pkt.op(), pkt.src_cid(), pkt.src_port(),
-            pkt.dst_cid(), pkt.dst_port(), pkt.len()
+            pkt.op(),
+            pkt.src_cid(),
+            pkt.src_port(),
+            pkt.dst_cid(),
+            pkt.dst_port(),
+            pkt.len()
         );
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
@@ -703,8 +710,12 @@ impl VsockMuxer {
     pub(crate) fn send_stream_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
         debug!(
             "vsock: muxer send_stream_pkt: op={} src={}:{} dst={}:{} len={}",
-            pkt.op(), pkt.src_cid(), pkt.src_port(),
-            pkt.dst_cid(), pkt.dst_port(), pkt.len()
+            pkt.op(),
+            pkt.src_cid(),
+            pkt.src_port(),
+            pkt.dst_cid(),
+            pkt.dst_port(),
+            pkt.len()
         );
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {

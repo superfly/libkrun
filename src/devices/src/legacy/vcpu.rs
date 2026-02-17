@@ -27,7 +27,7 @@ struct PerCPUInterruptControllerState {
 
 impl PerCPUInterruptControllerState {
     fn set_irq_common(&mut self, irq: u32) {
-        debug!(
+        trace!(
             "[GICv3] SET_IRQ_COMMON vcpuid={}, irq_line={}",
             self.vcpuid, irq
         );
@@ -234,7 +234,7 @@ impl Vcpus for VcpuList {
                 let aff3aff2aff1 = val & ((0xff << 48) | (0xff << 32) | (0xff << 16));
                 let rs = (val & (0xf << 44)) >> 44;
 
-                debug!("vCPU {vcpuid} GenerateSoftwareInterrupt={intid} (0x{val:x})");
+                trace!("vCPU {vcpuid} GenerateSoftwareInterrupt={intid} (0x{val:x})");
 
                 // A flat core hierarchy should be good enough, but if we ever start using
                 // Aff[123] MPIDR fields (currently MPID is configured via DT), GICv3 support

@@ -124,7 +124,7 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
         let mut total_queue_events: u64 = 0;
         let mut total_requests: u64 = 0;
 
-        log::warn!(
+        log::debug!(
             "sync block worker [ns={}]: starting, queue ready={} avail={} used={}",
             worker_nsectors,
             self.queue.ready,
@@ -168,7 +168,7 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                         match event_set {
                             EventSet::IN if source == virtq_ev_fd => {
                                 total_queue_events += 1;
-                                log::warn!(
+                                log::debug!(
                                     "sync block worker [ns={}]: queue event #{} avail={} used={}",
                                     worker_nsectors,
                                     total_queue_events,
@@ -178,7 +178,7 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                                 let before = total_requests;
                                 self.process_queue_event_counted(&mut total_requests);
                                 let processed = total_requests - before;
-                                log::warn!(
+                                log::debug!(
                                     "sync block worker [ns={}]: queue event #{} done, processed {} requests (total={})",
                                     worker_nsectors,
                                     total_queue_events,
@@ -188,14 +188,14 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                             }
                             EventSet::IN if source == resync_ev_fd => {
                                 let _ = self.resync_fd.read();
-                                log::warn!(
+                                log::debug!(
                                     "sync block worker [ns={}]: resync event, before: avail={} used={}",
                                     worker_nsectors,
                                     self.queue.next_avail().0,
                                     self.queue.next_used().0,
                                 );
                                 self.apply_shared_queue_state();
-                                log::warn!(
+                                log::debug!(
                                     "sync block worker [ns={}]: resync done, after: avail={} used={}",
                                     worker_nsectors,
                                     self.queue.next_avail().0,
@@ -203,13 +203,19 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                                 );
                             }
                             EventSet::IN if source == quiesce_ev_fd => {
-                                log::warn!("sync block worker [ns={}]: quiesce event", worker_nsectors);
+                                log::debug!(
+                                    "sync block worker [ns={}]: quiesce event",
+                                    worker_nsectors
+                                );
                                 let _ = self.quiesce_fd.read();
                                 self.handle_quiesce();
-                                log::warn!("sync block worker [ns={}]: resumed after quiesce", worker_nsectors);
+                                log::debug!(
+                                    "sync block worker [ns={}]: resumed after quiesce",
+                                    worker_nsectors
+                                );
                             }
                             EventSet::IN if source == stop_ev_fd => {
-                                log::warn!("sync block worker [ns={}]: stopping", worker_nsectors);
+                                log::debug!("sync block worker [ns={}]: stopping", worker_nsectors);
                                 let _ = self.stop_fd.read();
                                 return;
                             }
@@ -223,7 +229,10 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                     }
                 }
                 Err(e) => {
-                    log::warn!("sync block worker [ns={}]: epoll error: {e}", worker_nsectors);
+                    log::warn!(
+                        "sync block worker [ns={}]: epoll error: {e}",
+                        worker_nsectors
+                    );
                 }
             }
         }
@@ -346,7 +355,10 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
                     Err(e) => {
                         log::warn!(
                             "sync block worker [ns={}]: request #{} {} sector={} ERROR: {e:?}",
-                            worker_nsectors, total_requests, req_type_str, req_sector,
+                            worker_nsectors,
+                            total_requests,
+                            req_type_str,
+                            req_sector,
                         );
                         (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
                     }
@@ -405,10 +417,16 @@ impl<B: BlockBackend + 'static> BlockWorker<B> {
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
                 CacheType::Writeback => {
-                    log::warn!("sync block worker [ns={}]: FLUSH start", self.disk.nsectors());
+                    log::debug!(
+                        "sync block worker [ns={}]: FLUSH start",
+                        self.disk.nsectors()
+                    );
                     self.disk.flush().map_err(RequestError::FlushingToDisk)?;
                     self.disk.sync().map_err(RequestError::FlushingToDisk)?;
-                    log::warn!("sync block worker [ns={}]: FLUSH done", self.disk.nsectors());
+                    log::debug!(
+                        "sync block worker [ns={}]: FLUSH done",
+                        self.disk.nsectors()
+                    );
                     Ok(0)
                 }
                 CacheType::Unsafe => Ok(0),

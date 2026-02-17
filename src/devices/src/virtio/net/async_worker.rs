@@ -461,11 +461,7 @@ fn apply_shared_queue_state_if_needed(
 
 /// Consume TX descriptors without forwarding to the backend.
 /// Used during backend creation to prevent NETDEV WATCHDOG timeouts.
-fn discard_tx_queue(
-    queues: &mut [Queue],
-    mem: &GuestMemoryMmap,
-    interrupt: &InterruptTransport,
-) {
+fn discard_tx_queue(queues: &mut [Queue], mem: &GuestMemoryMmap, interrupt: &InterruptTransport) {
     while let Some(head) = queues[TX_INDEX].pop(mem) {
         queues[TX_INDEX].add_used(mem, head.index, 0).ok();
     }
@@ -696,8 +692,7 @@ mod tests {
     /// Test that the quiesce protocol works: signal quiesce → worker acks → resume.
     #[test]
     fn test_quiesce_ack_resume() {
-        let mem =
-            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
         let interrupt = InterruptTransport::new(irqchip, "test-net".into()).unwrap();
 
@@ -757,11 +752,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -796,11 +787,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),

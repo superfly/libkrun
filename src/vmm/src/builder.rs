@@ -671,8 +671,7 @@ impl BuiltVm {
 
         // Step 5: Resume all vCPUs — they leave the initial event loop and
         // enter the main execution loop with the final restored state.
-        vmm.resume_vcpus()
-            .map_err(StartMicrovmError::Internal)?;
+        vmm.resume_vcpus().map_err(StartMicrovmError::Internal)?;
 
         drop(vmm);
         Ok(self.vmm.clone())

@@ -18,12 +18,12 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
-use vm_memory::GuestMemoryMmap;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
 };
 use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use utils::epoll::EventSet;
+use vm_memory::GuestMemoryMmap;
 
 pub struct TsiDgramProxy {
     pub id: u64,

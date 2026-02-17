@@ -26,7 +26,6 @@ use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{push_packet, MuxerRx};
-use vm_memory::GuestMemoryMmap;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{
     TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TsiSendtoAddr, VsockPacket,
@@ -35,6 +34,7 @@ use super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
 use utils::epoll::EventSet;
+use vm_memory::GuestMemoryMmap;
 
 pub struct TsiStreamProxy {
     id: u64,
@@ -776,7 +776,7 @@ impl Proxy for TsiStreamProxy {
         };
 
         if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
-            warn!("error sending shutdown to socket: {e}");
+            debug!("error sending shutdown to socket: {e}");
         }
     }
 

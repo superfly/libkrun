@@ -332,9 +332,8 @@ impl Vmm {
         &self,
         data: &[u8],
     ) -> std::result::Result<(), snapshot::SnapshotError> {
-        let ic_snapshot: snapshot::InterruptControllerSnapshot =
-            bincode::deserialize(data)
-                .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))?;
+        let ic_snapshot: snapshot::InterruptControllerSnapshot = bincode::deserialize(data)
+            .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))?;
 
         self.vcpu_list
             .restore_interrupt_state(&ic_snapshot.pending_irqs);

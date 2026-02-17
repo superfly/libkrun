@@ -375,15 +375,15 @@ impl Vcpu {
         match hvf_vcpu.run(self.vcpu_list.clone()) {
             Ok(exit) => match exit {
                 VcpuExit::Breakpoint => {
-                    debug!("vCPU {vcpuid} breakpoint");
+                    trace!("vCPU {vcpuid} breakpoint");
                     Ok(VcpuEmulation::Interrupted)
                 }
                 VcpuExit::Canceled => {
-                    debug!("vCPU {vcpuid} canceled");
+                    trace!("vCPU {vcpuid} canceled");
                     Ok(VcpuEmulation::Canceled)
                 }
                 VcpuExit::DirtyPageFault(pa) => {
-                    debug!("vCPU {vcpuid} dirty page fault at 0x{pa:x}");
+                    trace!("vCPU {vcpuid} dirty page fault at 0x{pa:x}");
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::CpuOn(mpidr, entry, context_id) => {
@@ -398,12 +398,12 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::HypervisorCall => {
-                    debug!("vCPU {vcpuid} HVC");
+                    trace!("vCPU {vcpuid} HVC");
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
                     if let Some(ref mmio_bus) = self.mmio_bus {
-                        debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
+                        trace!("vCPU {vcpuid} MMIO read 0x{addr:x}");
                         mmio_bus.read(vcpuid, addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
@@ -415,11 +415,11 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::PsciHandled => {
-                    debug!("vCPU {vcpuid} PSCI");
+                    trace!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::SecureMonitorCall => {
-                    debug!("vCPU {vcpuid} SMC");
+                    trace!("vCPU {vcpuid} SMC");
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::Shutdown => {
@@ -427,24 +427,24 @@ impl Vcpu {
                     Ok(VcpuEmulation::Stopped)
                 }
                 VcpuExit::SystemRegister => {
-                    debug!("vCPU {vcpuid} accessed a system register");
+                    trace!("vCPU {vcpuid} accessed a system register");
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::VtimerActivated => {
-                    debug!("vCPU {vcpuid} VtimerActivated");
+                    trace!("vCPU {vcpuid} VtimerActivated");
                     self.vcpu_list.set_vtimer_irq(vcpuid);
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::WaitForEvent => {
-                    debug!("vCPU {vcpuid} WaitForEvent");
+                    trace!("vCPU {vcpuid} WaitForEvent");
                     Ok(VcpuEmulation::WaitForEvent)
                 }
                 VcpuExit::WaitForEventExpired => {
-                    debug!("vCPU {vcpuid} WaitForEventExpired");
+                    trace!("vCPU {vcpuid} WaitForEventExpired");
                     Ok(VcpuEmulation::WaitForEventExpired)
                 }
                 VcpuExit::WaitForEventTimeout(duration) => {
-                    debug!("vCPU {vcpuid} WaitForEventTimeout timeout={duration:?}");
+                    trace!("vCPU {vcpuid} WaitForEventTimeout timeout={duration:?}");
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
             },

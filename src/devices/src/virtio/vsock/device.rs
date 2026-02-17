@@ -156,7 +156,9 @@ impl Vsock {
         let mut queue_rx = self.queue_rx.lock().unwrap();
         debug!(
             "vsock: process_stream_rx: next_avail={} next_used={} pending_rx={}",
-            queue_rx.next_avail(), queue_rx.next_used(), self.muxer.has_pending_rx()
+            queue_rx.next_avail(),
+            queue_rx.next_used(),
+            self.muxer.has_pending_rx()
         );
         while let Some(head) = queue_rx.pop(mem) {
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
@@ -164,8 +166,13 @@ impl Vsock {
                     if self.muxer.recv_pkt(&mut pkt).is_ok() {
                         debug!(
                             "vsock: RX pkt: op={} src={}:{} dst={}:{} len={} type={}",
-                            pkt.op(), pkt.src_cid(), pkt.src_port(),
-                            pkt.dst_cid(), pkt.dst_port(), pkt.len(), pkt.type_()
+                            pkt.op(),
+                            pkt.src_cid(),
+                            pkt.src_port(),
+                            pkt.dst_cid(),
+                            pkt.dst_port(),
+                            pkt.len(),
+                            pkt.type_()
                         );
                         pkt.hdr().len() as u32 + pkt.len()
                     } else {
@@ -188,8 +195,11 @@ impl Vsock {
         self.queues[RXQ_INDEX] = queue_rx.clone();
 
         if have_used {
-            debug!("vsock: process_stream_rx: delivered packets, next_avail={} next_used={}",
-                self.queues[RXQ_INDEX].next_avail(), self.queues[RXQ_INDEX].next_used());
+            debug!(
+                "vsock: process_stream_rx: delivered packets, next_avail={} next_used={}",
+                self.queues[RXQ_INDEX].next_avail(),
+                self.queues[RXQ_INDEX].next_used()
+            );
         }
         have_used
     }
@@ -207,7 +217,8 @@ impl Vsock {
         let mut queue_tx = self.queue_tx.lock().unwrap();
         debug!(
             "vsock: process_stream_tx: next_avail={} next_used={}",
-            queue_tx.next_avail(), queue_tx.next_used()
+            queue_tx.next_avail(),
+            queue_tx.next_used()
         );
         while let Some(head) = queue_tx.pop(mem) {
             let pkt = match VsockPacket::from_tx_virtq_head(&head) {
@@ -224,8 +235,13 @@ impl Vsock {
 
             debug!(
                 "vsock: TX pkt: op={} src={}:{} dst={}:{} len={} type={}",
-                pkt.op(), pkt.src_cid(), pkt.src_port(),
-                pkt.dst_cid(), pkt.dst_port(), pkt.len(), pkt.type_()
+                pkt.op(),
+                pkt.src_cid(),
+                pkt.src_port(),
+                pkt.dst_cid(),
+                pkt.dst_port(),
+                pkt.len(),
+                pkt.type_()
             );
 
             if pkt.type_() == uapi::VSOCK_TYPE_DGRAM {
@@ -311,7 +327,10 @@ impl VirtioDevice for Vsock {
     }
 
     fn activate(&mut self, mem: GuestMemoryMmap, interrupt: InterruptTransport) -> ActivateResult {
-        warn!("vsock: activate called, already_activated={}", self.device_state.is_activated());
+        debug!(
+            "vsock: activate called, already_activated={}",
+            self.device_state.is_activated()
+        );
         if self.queues.len() != defs::NUM_QUEUES {
             error!(
                 "Cannot perform activate. Expected {} queue(s), got {}",
@@ -388,7 +407,10 @@ impl VirtioDevice for Vsock {
         &mut self,
         timeout: Duration,
     ) -> std::result::Result<(), SnapshotError> {
-        warn!("vsock: begin_snapshot_quiesce, activated={}", self.device_state.is_activated());
+        warn!(
+            "vsock: begin_snapshot_quiesce, activated={}",
+            self.device_state.is_activated()
+        );
         if !self.device_state.is_activated() {
             return Ok(());
         }
@@ -440,7 +462,10 @@ impl VirtioDevice for Vsock {
     }
 
     fn abort_snapshot_quiesce(&mut self) {
-        warn!("vsock: abort_snapshot_quiesce (resume workers), activated={}", self.device_state.is_activated());
+        warn!(
+            "vsock: abort_snapshot_quiesce (resume workers), activated={}",
+            self.device_state.is_activated()
+        );
         if !self.device_state.is_activated() {
             return;
         }
@@ -468,7 +493,10 @@ impl VirtioDevice for Vsock {
     }
 
     fn post_snapshot_restore(&mut self) {
-        warn!("vsock: post_snapshot_restore called, activated={}", self.device_state.is_activated());
+        warn!(
+            "vsock: post_snapshot_restore called, activated={}",
+            self.device_state.is_activated()
+        );
 
         let rx_q = &self.queues[RXQ_INDEX];
         let tx_q = &self.queues[TXQ_INDEX];
@@ -491,5 +519,4 @@ impl VirtioDevice for Vsock {
         *self.queue_rx.lock().unwrap() = self.queues[RXQ_INDEX].clone();
         *self.queue_tx.lock().unwrap() = self.queues[TXQ_INDEX].clone();
     }
-
 }

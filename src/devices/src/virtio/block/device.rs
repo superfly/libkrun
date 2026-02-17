@@ -723,7 +723,6 @@ impl VirtioDevice for Block {
         self.worker_queue_generation.fetch_add(1, Ordering::SeqCst);
         let _ = self.worker_resyncfd.write(1);
     }
-
 }
 
 impl VmmExitObserver for Block {

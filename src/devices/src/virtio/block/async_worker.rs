@@ -222,7 +222,7 @@ impl AsyncBlockWorker {
 
     /// Main async work loop.
     async fn work_async(self) {
-        warn!("async block worker: work_async starting");
+        debug!("async block worker: work_async starting");
 
         // Destructure self so we can consume the factory while keeping other fields
         let AsyncBlockWorker {
@@ -242,7 +242,7 @@ impl AsyncBlockWorker {
         } = self;
 
         // Create the backend from the factory (inside this runtime)
-        warn!("async block worker: creating backend from factory");
+        debug!("async block worker: creating backend from factory");
         let disk = match factory.create().await {
             Ok(disk) => disk,
             Err(e) => {
@@ -250,7 +250,10 @@ impl AsyncBlockWorker {
                 return;
             }
         };
-        warn!("async block worker: backend created, nsectors={}", disk.nsectors());
+        debug!(
+            "async block worker: backend created, nsectors={}",
+            disk.nsectors()
+        );
 
         // Create metrics
         let metrics = Arc::new(AsyncWorkerMetrics::default());
@@ -364,7 +367,10 @@ impl AsyncBlockWorker {
             AsyncFd::new(resume_fd_dup).expect("failed to create AsyncFd for resume");
 
         let worker_nsectors = disk.nsectors();
-        warn!("async block worker [ns={}]: AsyncFd configured, entering main loop", worker_nsectors);
+        debug!(
+            "async block worker [ns={}]: AsyncFd configured, entering main loop",
+            worker_nsectors
+        );
         let mut applied_generation: u64 = 0;
         let mut total_queue_events: u64 = 0;
 
@@ -575,12 +581,12 @@ impl AsyncBlockWorker {
                                     &shared_generation,
                                     &mut applied_generation,
                                 );
-                                warn!("async block worker [ns={}]: resync applied, queue avail={} used={}",
+                                debug!("async block worker [ns={}]: resync applied, queue avail={} used={}",
                                     worker_nsectors, queue.next_avail().0, queue.next_used().0);
                                 // Restore backend state if the device provided one
                                 if let Ok(mut shared) = shared_backend_state.lock() {
                                     if let Some(data) = shared.take() {
-                                        warn!("async block worker [ns={}]: restoring backend state ({} bytes)", worker_nsectors, data.len());
+                                        debug!("async block worker [ns={}]: restoring backend state ({} bytes)", worker_nsectors, data.len());
                                         disk.restore_snapshot_state(&data);
                                     }
                                 }
@@ -612,7 +618,7 @@ impl AsyncBlockWorker {
                                     total_queue_events += 1;
                                     // Pop and parse all available requests
                                     let requests = pop_and_parse_requests(&mut queue, &mem);
-                                    warn!("async block worker [ns={}]: queue event #{}, parsed {} requests, queue avail={} used={}",
+                                    debug!("async block worker [ns={}]: queue event #{}, parsed {} requests, queue avail={} used={}",
                                         worker_nsectors, total_queue_events, requests.len(),
                                         queue.next_avail().0, queue.next_used().0);
 
@@ -736,7 +742,7 @@ impl AsyncBlockWorker {
                                     }
                                 }
                             } else {
-                                warn!("async block worker [ns={}]: poll ok, avail_idx={} next_avail={} next_used={} events={}",
+                                trace!("async block worker [ns={}]: poll ok, avail_idx={} next_avail={} next_used={} events={}",
                                     worker_nsectors, avail_idx, next_avail, queue.next_used().0, total_queue_events);
                             }
                         }
@@ -1300,8 +1306,13 @@ fn complete_request(
     if let Err(e) = interrupt.try_signal_used_queue() {
         error!("complete_request: error signalling queue: {e:?}");
     }
-    warn!("complete_request: index={} status={} len={} queue_used={}",
-        result.index, result.status, result.len, queue.next_used().0);
+    trace!(
+        "complete_request: index={} status={} len={} queue_used={}",
+        result.index,
+        result.status,
+        result.len,
+        queue.next_used().0
+    );
 }
 
 /// Process a single request asynchronously, returning request type for metrics.
@@ -2408,8 +2419,10 @@ mod tests {
 
         fn create(
             self: Box<Self>,
-        ) -> SendBoxFuture<'static, std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>>
-        {
+        ) -> SendBoxFuture<
+            'static,
+            std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>,
+        > {
             Box::pin(async move {
                 Ok(Arc::new(TrackingBackend::new(self.size_bytes))
                     as Arc<dyn super::super::AsyncBlockBackend + Send + Sync>)
@@ -2420,8 +2433,7 @@ mod tests {
     /// Test that the quiesce protocol works: signal quiesce → worker acks → resume.
     #[test]
     fn test_quiesce_ack_resume() {
-        let mem =
-            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
         let interrupt = InterruptTransport::new(irqchip, "test-blk".into()).unwrap();
 
@@ -2478,11 +2490,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -2518,11 +2526,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -2549,7 +2553,7 @@ mod tests {
     const AVAIL_RING_ADDR: u64 = 0x0100; // 4 + 2*16 + 2 = 38 bytes, 2-byte aligned
     const USED_RING_ADDR: u64 = 0x0200; // 4 + 8*16 + 2 = 134 bytes, 4-byte aligned
     const DATA_AREA_ADDR: u64 = 0x1000; // request headers, data, status bytes
-    // Each request uses 0x300 bytes: 0x00=header(16), 0x10=data(512), 0x210+1=status(1)
+                                        // Each request uses 0x300 bytes: 0x00=header(16), 0x10=data(512), 0x210+1=status(1)
     const REQ_STRIDE: u64 = 0x300;
 
     /// Write a single virtio-blk WRITE request into guest memory as a 3-descriptor chain.
@@ -2659,15 +2663,16 @@ mod tests {
     #[test]
     fn test_snapshot_restore_with_real_io() {
         // 128KB guest memory
-        let mem =
-            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
 
         // Zero out the avail ring flags + idx
         mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap(); // flags
-        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap(); // idx
-        // Zero out used ring flags + idx
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2))
+            .unwrap(); // idx
+                       // Zero out used ring flags + idx
         mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap(); // flags
-        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap(); // idx
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2))
+            .unwrap(); // idx
 
         let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
         let interrupt = InterruptTransport::new(irqchip, "test-blk-snap".into()).unwrap();
@@ -2763,11 +2768,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -2785,12 +2786,14 @@ mod tests {
         // next_avail should be 2 (popped 2 from avail ring)
         // next_used should be 2 (added 2 to used ring)
         assert_eq!(
-            snapshot_queue.next_avail().0, 2,
+            snapshot_queue.next_avail().0,
+            2,
             "Expected next_avail=2 after 2 requests, got {}",
             snapshot_queue.next_avail().0
         );
         assert_eq!(
-            snapshot_queue.next_used().0, 2,
+            snapshot_queue.next_used().0,
+            2,
             "Expected next_used=2 after 2 requests, got {}",
             snapshot_queue.next_used().0
         );
@@ -2868,11 +2871,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(5),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -2889,12 +2888,14 @@ mod tests {
         // next_avail should be 4 (2 from restore + 2 new)
         // next_used should be 4 (2 from restore + 2 new)
         assert_eq!(
-            final_queue.next_avail().0, 4,
+            final_queue.next_avail().0,
+            4,
             "Expected next_avail=4 after restore + 2 more requests, got {}",
             final_queue.next_avail().0
         );
         assert_eq!(
-            final_queue.next_used().0, 4,
+            final_queue.next_used().0,
+            4,
             "Expected next_used=4 after restore + 2 more requests, got {}",
             final_queue.next_used().0
         );
@@ -2928,8 +2929,10 @@ mod tests {
 
         fn create(
             self: Box<Self>,
-        ) -> SendBoxFuture<'static, std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>>
-        {
+        ) -> SendBoxFuture<
+            'static,
+            std::io::Result<Arc<dyn super::super::AsyncBlockBackend + Send + Sync>>,
+        > {
             let backend = self.backend.clone();
             Box::pin(async move {
                 Ok(backend as Arc<dyn super::super::AsyncBlockBackend + Send + Sync>)
@@ -2952,14 +2955,15 @@ mod tests {
     #[test]
     fn test_quiesce_drains_inflight_before_memory_overwrite() {
         // 128KB guest memory
-        let mem =
-            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
 
         // Zero out queue rings
         mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2))
+            .unwrap();
         mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2))
+            .unwrap();
 
         let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
         let interrupt = InterruptTransport::new(irqchip, "test-blk-race".into()).unwrap();
@@ -3036,11 +3040,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(10),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(10), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -3079,7 +3079,8 @@ mod tests {
 
         // Also overwrite the used ring area to simulate a full memory restore.
         mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2))
+            .unwrap();
 
         // === Step 4: Resume worker and verify memory is not corrupted ===
         {
@@ -3093,7 +3094,8 @@ mod tests {
         // should NOT have written anything back into guest memory after resume
         // (since there are no new requests pending).
         let mut readback = vec![0u8; 512];
-        mem.read_slice(&mut readback, GuestAddress(data_addr)).unwrap();
+        mem.read_slice(&mut readback, GuestAddress(data_addr))
+            .unwrap();
         assert_eq!(
             readback, sentinel,
             "Guest memory was corrupted after restore! Worker wrote stale data."
@@ -3109,11 +3111,7 @@ mod tests {
 
     /// Write a virtio-blk READ request (VIRTIO_BLK_T_IN) descriptor chain.
     /// Returns the head descriptor index.
-    fn write_blk_read_request(
-        mem: &GuestMemoryMmap,
-        request_idx: u16,
-        sector: u64,
-    ) -> u16 {
+    fn write_blk_read_request(mem: &GuestMemoryMmap, request_idx: u16, sector: u64) -> u16 {
         let base_desc = request_idx * 3;
         let data_base = DATA_AREA_ADDR + (request_idx as u64) * REQ_STRIDE;
         let header_addr = data_base;
@@ -3142,7 +3140,11 @@ mod tests {
             flags: 0x1, // VIRTQ_DESC_F_NEXT
             next: base_desc + 1,
         };
-        mem.write_obj(desc0, GuestAddress(DESC_TABLE_ADDR + (base_desc as u64) * 16)).unwrap();
+        mem.write_obj(
+            desc0,
+            GuestAddress(DESC_TABLE_ADDR + (base_desc as u64) * 16),
+        )
+        .unwrap();
 
         // desc[1]: data buffer, WRITABLE + NEXT (device writes read data here)
         let desc1 = Descriptor {
@@ -3151,7 +3153,11 @@ mod tests {
             flags: 0x3, // VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
             next: base_desc + 2,
         };
-        mem.write_obj(desc1, GuestAddress(DESC_TABLE_ADDR + ((base_desc + 1) as u64) * 16)).unwrap();
+        mem.write_obj(
+            desc1,
+            GuestAddress(DESC_TABLE_ADDR + ((base_desc + 1) as u64) * 16),
+        )
+        .unwrap();
 
         // desc[2]: status, writable, no NEXT
         let desc2 = Descriptor {
@@ -3160,7 +3166,11 @@ mod tests {
             flags: 0x2, // VIRTQ_DESC_F_WRITE
             next: 0,
         };
-        mem.write_obj(desc2, GuestAddress(DESC_TABLE_ADDR + ((base_desc + 2) as u64) * 16)).unwrap();
+        mem.write_obj(
+            desc2,
+            GuestAddress(DESC_TABLE_ADDR + ((base_desc + 2) as u64) * 16),
+        )
+        .unwrap();
 
         base_desc
     }
@@ -3182,14 +3192,15 @@ mod tests {
     /// 2. After quiesce + memory overwrite, no stale read writes corrupt RAM
     #[test]
     fn test_quiesce_drains_inflight_reads_before_ack() {
-        let mem =
-            vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let mem = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
 
         // Zero out queue rings
         mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL_RING_ADDR + 2))
+            .unwrap();
         mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2))
+            .unwrap();
 
         let irqchip: crate::legacy::IrqChip = DummyIrqChip::new().into();
         let interrupt = InterruptTransport::new(irqchip, "test-blk-read-drain".into()).unwrap();
@@ -3266,11 +3277,7 @@ mod tests {
             let (lock, cvar) = &*quiesce_ack_clone;
             let guard = lock.lock().unwrap();
             let (guard, timeout_result) = cvar
-                .wait_timeout_while(
-                    guard,
-                    std::time::Duration::from_secs(10),
-                    |acked| !*acked,
-                )
+                .wait_timeout_while(guard, std::time::Duration::from_secs(10), |acked| !*acked)
                 .unwrap();
             assert!(
                 *guard && !timeout_result.timed_out(),
@@ -3289,7 +3296,8 @@ mod tests {
         // Verify the read data was written to guest memory.
         let data_addr = DATA_AREA_ADDR + 0x10;
         let mut readback = vec![0u8; 512];
-        mem.read_slice(&mut readback, GuestAddress(data_addr)).unwrap();
+        mem.read_slice(&mut readback, GuestAddress(data_addr))
+            .unwrap();
         assert!(
             readback.iter().all(|&b| b == 0xBB),
             "Read data should have been written to guest memory before quiesce"
@@ -3307,7 +3315,8 @@ mod tests {
         let sentinel = vec![0x55u8; 512];
         mem.write_slice(&sentinel, GuestAddress(data_addr)).unwrap();
         mem.write_obj(0u16, GuestAddress(USED_RING_ADDR)).unwrap();
-        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(USED_RING_ADDR + 2))
+            .unwrap();
 
         // === Step 4: Resume and verify no corruption ===
         {
@@ -3319,7 +3328,8 @@ mod tests {
 
         // Sentinel should be intact — no stale read writes after resume.
         let mut final_readback = vec![0u8; 512];
-        mem.read_slice(&mut final_readback, GuestAddress(data_addr)).unwrap();
+        mem.read_slice(&mut final_readback, GuestAddress(data_addr))
+            .unwrap();
         assert_eq!(
             final_readback, sentinel,
             "Guest memory was corrupted after restore! Stale read wrote data."

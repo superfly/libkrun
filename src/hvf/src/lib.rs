@@ -1063,7 +1063,7 @@ impl HvfVcpu<'_> {
         let ec = (syndrome >> 26) & 0x3f;
         match ec {
             EC_AA64_BKPT => {
-                debug!("vcpu[{}]: BRK exit", self.vcpuid);
+                trace!("vcpu[{}]: BRK exit", self.vcpuid);
                 Ok(VcpuExit::Breakpoint)
             }
             EC_DATAABORT => {
@@ -1098,7 +1098,7 @@ impl HvfVcpu<'_> {
                 let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
                 let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
 
-                debug!(
+                trace!(
                     "EC_DATAABORT {} {} {} {} {} {} {} {}",
                     syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
                 );
@@ -1130,7 +1130,7 @@ impl HvfVcpu<'_> {
                 let isread: bool = (syndrome & 1) != 0;
                 let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
                 let reg: u32 = syndrome as u32 & SYSREG_MASK;
-                debug!(
+                trace!(
                     "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
                     isread as u32,
                     syndrome,
@@ -1197,11 +1197,11 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => {
-                debug!("vcpu[{}]: EC_AA64_HVC PSCI", self.vcpuid);
+                trace!("vcpu[{}]: EC_AA64_HVC PSCI", self.vcpuid);
                 self.handle_psci_request()
             }
             EC_AA64_SMC => {
-                debug!("vcpu[{}]: EC_AA64_SMC PSCI", self.vcpuid);
+                trace!("vcpu[{}]: EC_AA64_SMC PSCI", self.vcpuid);
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }

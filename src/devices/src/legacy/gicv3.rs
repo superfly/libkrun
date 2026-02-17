@@ -227,11 +227,11 @@ impl GicV3 {
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             data[i] = *b;
         }
-        debug!("[GICv3] -> read32 DIST offset={offset} val={val}");
+        trace!("[GICv3] -> read32 DIST offset={offset} val={val}");
     }
 
     fn handle_dist_write32(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        debug!(
+        trace!(
             "[GICv3] write32 DIST offset={} val={}",
             offset,
             u32::from_le_bytes(data.try_into().unwrap())
@@ -286,7 +286,7 @@ impl GicV3 {
 
     fn handle_dist_write64(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
         let val = u64::from_le_bytes(data.try_into().unwrap());
-        debug!("[GICv3] write64 DIST offset=0x{offset:x} value=0x{val:x}");
+        trace!("[GICv3] write64 DIST offset=0x{offset:x} value=0x{val:x}");
         match offset {
             _ if (GICD_IROUTER..GICD_IROUTER + 0x1fdf).contains(&offset) => {
                 let intid = ((offset - GICD_IROUTER) / 8) as usize;
@@ -341,7 +341,7 @@ impl GicV3 {
             data[i] = *b;
         }
 
-        debug!("[GICv3] -> read32 REDIST offset={offset} val={val}");
+        trace!("[GICv3] -> read32 REDIST offset={offset} val={val}");
     }
 
     fn handle_redist_read64(&self, vcpuid: u64, offset: u64, data: &mut [u8]) {
@@ -362,11 +362,11 @@ impl GicV3 {
             data[i] = *b;
         }
 
-        debug!("[GICv3] -> read64 REDIST offset={offset} val={val}");
+        trace!("[GICv3] -> read64 REDIST offset={offset} val={val}");
     }
 
     fn handle_redist_write32(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        debug!(
+        trace!(
             "[GICv3] write32 REDIST offset={} val={}",
             offset,
             u32::from_le_bytes(data.try_into().unwrap())

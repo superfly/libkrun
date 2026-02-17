@@ -518,16 +518,12 @@ impl BusDevice for MmioTransport {
                             // Level-triggered re-assertion: if new status bits arrived
                             // between the guest's ISR read and this ack, the ISR is still
                             // non-zero. Re-fire the GIC interrupt so the guest processes them.
-                            let remaining =
-                                self.interrupt.status().load(Ordering::SeqCst) as u32;
+                            let remaining = self.interrupt.status().load(Ordering::SeqCst) as u32;
                             if remaining != 0 {
-                                if let Err(e) = self
-                                    .interrupt
-                                    .intc()
-                                    .lock()
-                                    .unwrap()
-                                    .set_irq(self.interrupt.irq_line(), Some(self.interrupt.event()))
-                                {
+                                if let Err(e) = self.interrupt.intc().lock().unwrap().set_irq(
+                                    self.interrupt.irq_line(),
+                                    Some(self.interrupt.event()),
+                                ) {
                                     log::error!("failed to re-assert interrupt after ack: {e:?}");
                                 }
                             }
@@ -802,7 +798,10 @@ impl MmioTransport {
         if self.needs_post_restore_activate {
             self.needs_post_restore_activate = false;
             let mut device = self.locked_device();
-            debug!("mmio: complete_restore '{}': calling activate()", device_name);
+            debug!(
+                "mmio: complete_restore '{}': calling activate()",
+                device_name
+            );
             device
                 .activate(self.mem.clone(), self.interrupt.clone())
                 .map_err(|e| {
