@@ -29,7 +29,8 @@ impl PerCPUInterruptControllerState {
     fn set_irq_common(&mut self, irq: u32) {
         trace!(
             "[GICv3] SET_IRQ_COMMON vcpuid={}, irq_line={}",
-            self.vcpuid, irq
+            self.vcpuid,
+            irq
         );
         self.pending_irqs.push_back(irq);
 

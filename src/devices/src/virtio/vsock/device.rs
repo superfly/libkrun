@@ -407,7 +407,7 @@ impl VirtioDevice for Vsock {
         &mut self,
         timeout: Duration,
     ) -> std::result::Result<(), SnapshotError> {
-        warn!(
+        debug!(
             "vsock: begin_snapshot_quiesce, activated={}",
             self.device_state.is_activated()
         );
@@ -462,7 +462,7 @@ impl VirtioDevice for Vsock {
     }
 
     fn abort_snapshot_quiesce(&mut self) {
-        warn!(
+        debug!(
             "vsock: abort_snapshot_quiesce (resume workers), activated={}",
             self.device_state.is_activated()
         );
@@ -485,7 +485,7 @@ impl VirtioDevice for Vsock {
     fn sync_queues_for_snapshot(&mut self) {
         self.queues[RXQ_INDEX] = self.queue_rx.lock().unwrap().clone();
         self.queues[TXQ_INDEX] = self.queue_tx.lock().unwrap().clone();
-        warn!(
+        debug!(
             "vsock: sync_queues_for_snapshot: rx(next_avail={}, next_used={}) tx(next_avail={}, next_used={})",
             self.queues[RXQ_INDEX].next_avail(), self.queues[RXQ_INDEX].next_used(),
             self.queues[TXQ_INDEX].next_avail(), self.queues[TXQ_INDEX].next_used(),

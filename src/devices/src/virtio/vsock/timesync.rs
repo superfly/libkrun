@@ -71,7 +71,7 @@ impl TimesyncThread {
 
     fn handle_quiesce(&self) {
         let _ = self.quiesce_fd.read();
-        warn!("vsock: timesync_thread quiesced");
+        debug!("vsock: timesync_thread quiesced");
 
         // Signal the device that we're quiesced.
         let (lock, cvar) = &*self.quiesce_ack;
@@ -83,7 +83,7 @@ impl TimesyncThread {
 
         // Park until resume_fd is signalled.
         let _ = self.resume_fd.read();
-        warn!("vsock: timesync_thread resumed");
+        debug!("vsock: timesync_thread resumed");
     }
 
     fn work(&mut self) {

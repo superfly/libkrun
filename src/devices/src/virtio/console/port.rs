@@ -158,7 +158,8 @@ impl Port {
 
         let tx_thread = output.map(|output| {
             let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
+            let port_id = self.port_id;
+            thread::spawn(move || process_tx(port_id, mem, tx_queue, interrupt, output, stop))
         });
 
         self.state = PortState::Active {

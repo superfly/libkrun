@@ -1127,7 +1127,14 @@ impl HvfVcpu<'_> {
 
                 trace!(
                     "EC_DATAABORT {} {} {} {} {} {} {} {}",
-                    syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
+                    syndrome,
+                    isv as u8,
+                    iswrite as u8,
+                    s1ptw as u8,
+                    sas,
+                    len,
+                    srt,
+                    cm
                 );
 
                 self.pending_advance_pc = true;

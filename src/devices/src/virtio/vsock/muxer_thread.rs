@@ -184,7 +184,7 @@ impl MuxerThread {
 
     fn handle_quiesce(&self) {
         let _ = self.quiesce_fd.read();
-        warn!("vsock: muxer_thread quiesced");
+        debug!("vsock: muxer_thread quiesced");
 
         // Signal the device that we're quiesced.
         let (lock, cvar) = &*self.quiesce_ack;
@@ -196,7 +196,7 @@ impl MuxerThread {
 
         // Park until resume_fd is signalled.
         let _ = self.resume_fd.read();
-        warn!("vsock: muxer_thread resumed");
+        debug!("vsock: muxer_thread resumed");
     }
 
     fn work(self) {
