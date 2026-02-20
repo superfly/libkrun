@@ -2382,7 +2382,9 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b153a59bb3ca930ff8148655b2ef68c34259a623ae08cf2fb9b570b2e45363"
 dependencies = [
+ "serde",
  "vmm-sys-util 0.14.0",
+ "zerocopy",
 ]
 
 [[package]]
@@ -5380,6 +5382,8 @@ checksum = "d21f366bf22bfba3e868349978766a965cbe628c323d58e026be80b8357ab789"
 dependencies = [
  "bitflags 1.3.2",
  "libc",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

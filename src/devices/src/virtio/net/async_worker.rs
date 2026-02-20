@@ -502,17 +502,28 @@ fn drain_tx_queue(
         }
 
         if queues[TX_INDEX].next_avail() == next_avail_before {
-            // Queue reports empty but check if next_avail is desynchronized
+            // Queue made no progress; distinguish two cases:
+            // 1) Guest advanced avail_idx concurrently -> retry without mutating next_avail.
+            // 2) next_avail drifted ahead of avail_idx (e.g. after restore) -> rewind.
             if let Some(avail_idx_addr) = queues[TX_INDEX].avail_ring.checked_add(2) {
                 if let Ok(avail_idx) = mem.read_obj::<u16>(avail_idx_addr) {
-                    if avail_idx != queues[TX_INDEX].next_avail().0 {
+                    let next_avail = queues[TX_INDEX].next_avail().0;
+                    if avail_idx != next_avail {
+                        let queue_size = queues[TX_INDEX].actual_size();
+                        if queue_size != 0 {
+                            let pending = avail_idx.wrapping_sub(next_avail);
+                            if pending <= queue_size {
+                                continue; // New/pending descriptors are available; retry pop()
+                            }
+                        }
+
                         error!(
-                            "async net worker: TX queue made no progress; resyncing next_avail {} -> {}",
-                            queues[TX_INDEX].next_avail().0,
+                            "async net worker: TX queue next_avail appears ahead; rewinding {} -> {}",
+                            next_avail,
                             avail_idx
                         );
                         queues[TX_INDEX].set_next_avail(avail_idx);
-                        continue; // Retry with corrected next_avail
+                        continue;
                     }
                 }
             }

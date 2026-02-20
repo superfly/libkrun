@@ -441,30 +441,48 @@ impl Snapshottable for Serial {
             read_trigger: self.read_trigger,
         };
 
-        bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
+        #[cfg(feature = "snapshot")]
+        {
+            bincode::serialize(&state).map_err(|e| SnapshotError::Serialize(e.to_string()))
+        }
+        #[cfg(not(feature = "snapshot"))]
+        {
+            let _ = state;
+            Err(SnapshotError::Serialize(
+                "snapshot feature not enabled".to_string(),
+            ))
+        }
     }
 
     fn restore_state(&mut self, data: &[u8]) -> std::result::Result<(), SnapshotError> {
-        let state: SerialState =
-            bincode::deserialize(data).map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
-
-        self.flags = state.flags;
-        self.lcr = state.lcr;
-        self.rsr = state.rsr;
-        self.cr = state.cr;
-        self.dmacr = state.dmacr;
-        self.debug = state.debug;
-        self.int_enabled = state.int_enabled;
-        self.int_level = state.int_level;
-        self.read_fifo = state.read_fifo.into_iter().collect();
-        self.ilpr = state.ilpr;
-        self.ibrd = state.ibrd;
-        self.fbrd = state.fbrd;
-        self.ifl = state.ifl;
-        self.read_count = state.read_count;
-        self.read_trigger = state.read_trigger;
-
-        Ok(())
+        #[cfg(feature = "snapshot")]
+        {
+            let state: SerialState = bincode::deserialize(data)
+                .map_err(|e| SnapshotError::Deserialize(e.to_string()))?;
+            self.flags = state.flags;
+            self.lcr = state.lcr;
+            self.rsr = state.rsr;
+            self.cr = state.cr;
+            self.dmacr = state.dmacr;
+            self.debug = state.debug;
+            self.int_enabled = state.int_enabled;
+            self.int_level = state.int_level;
+            self.read_fifo = state.read_fifo.into_iter().collect();
+            self.ilpr = state.ilpr;
+            self.ibrd = state.ibrd;
+            self.fbrd = state.fbrd;
+            self.ifl = state.ifl;
+            self.read_count = state.read_count;
+            self.read_trigger = state.read_trigger;
+            Ok(())
+        }
+        #[cfg(not(feature = "snapshot"))]
+        {
+            let _ = data;
+            Err(SnapshotError::Deserialize(
+                "snapshot feature not enabled".to_string(),
+            ))
+        }
     }
 }
 

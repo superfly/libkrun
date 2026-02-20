@@ -623,7 +623,7 @@ impl BuiltVm {
     /// 4. Apply each incremental snapshot in order (dirty pages, updated
     ///    device/interrupt/vCPU state — each RestoreState overwrites the last)
     /// 5. Resume all vCPUs — they continue from the final restored state
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn restore_from_snapshot(
         &mut self,
         base_path: &std::path::Path,
@@ -641,10 +641,12 @@ impl BuiltVm {
         vmm.start_vcpus_paused(&mut vcpus)
             .map_err(StartMicrovmError::Internal)?;
 
-        // Step 2: Unblock secondary vCPUs. They block on boot_receiver.recv()
-        // waiting for PSCI CPU_ON from the kernel. Since we're skipping boot,
-        // send a dummy entry address to unblock them. RestoreState will
-        // overwrite their registers anyway.
+        // Step 2 (macOS only): Unblock secondary vCPUs. On HVF they block on
+        // boot_receiver.recv() waiting for PSCI CPU_ON from the kernel. Since
+        // we're skipping boot, send a dummy entry address to unblock them.
+        // On KVM, secondary vCPUs are powered off via KVM_ARM_VCPU_POWER_OFF
+        // and don't need unblocking — they go straight to the paused state.
+        #[cfg(target_os = "macos")]
         for sender in self.boot_senders.drain(..) {
             let _ = sender.send(0);
         }
@@ -1093,6 +1095,8 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         vcpu_list: vcpu_list.clone(),
         #[cfg(target_os = "macos")]
+        intc: intc.clone(),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
         intc: intc.clone(),
     };
 

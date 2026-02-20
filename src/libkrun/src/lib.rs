@@ -3046,7 +3046,7 @@ impl Context {
     /// Restores the full base snapshot, then applies any incremental
     /// snapshots in order. The VM starts executing from the final
     /// restored state. Blocks until the VM exits.
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn restore_and_run(
         mut self,
         base_path: &std::path::Path,
@@ -3073,7 +3073,7 @@ pub struct VmHandle {
 }
 
 impl VmHandle {
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     fn snapshot_err_to_start_error(e: vmm::snapshot::SnapshotError) -> StartError {
         StartError::Microvm(vmm::builder::StartMicrovmError::Internal(
             vmm::Error::EventFd(std::io::Error::new(
@@ -3121,7 +3121,7 @@ impl VmHandle {
     }
 
     /// Create a full snapshot of the VM. Pauses vCPUs, takes snapshot, resumes vCPUs.
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
         let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
         vmm.pause_vcpus()
@@ -3135,7 +3135,7 @@ impl VmHandle {
     }
 
     /// Restore a full snapshot into the running VM. Pauses vCPUs, restores, resumes vCPUs.
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn restore_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
         let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
         vmm.pause_vcpus()
@@ -3149,7 +3149,7 @@ impl VmHandle {
     }
 
     /// Enable dirty page tracking for incremental snapshots.
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn enable_dirty_tracking(&self) -> Result<(), StartError> {
         let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
         vmm.enable_dirty_tracking()
@@ -3157,7 +3157,7 @@ impl VmHandle {
     }
 
     /// Create an incremental snapshot (dirty pages only).
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn incremental_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
         let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
         vmm.pause_vcpus()
@@ -3173,7 +3173,7 @@ impl VmHandle {
     /// Restore an incremental snapshot into the running VM.
     ///
     /// This applies dirty pages and state on top of the current memory image.
-    #[cfg(all(target_os = "macos", feature = "snapshot"))]
+    #[cfg(feature = "snapshot")]
     pub fn restore_incremental_snapshot(&self, path: &std::path::Path) -> Result<(), StartError> {
         let mut vmm = self.vmm.lock().expect("Poisoned vmm lock");
         vmm.pause_vcpus()

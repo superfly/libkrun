@@ -53,6 +53,8 @@ use kvm_bindings::{
     kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
     KVM_API_VERSION, KVM_MEM_GUEST_MEMFD, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
 };
+#[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+use kvm_bindings::{kvm_mp_state, RegList};
 #[cfg(feature = "tee")]
 use kvm_bindings::{kvm_enable_cap, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
 #[cfg(not(target_arch = "riscv64"))]
@@ -159,6 +161,24 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     /// Error getting the Vcpu preferred target on Arm.
     VcpuArmPreferredTarget(kvm_ioctls::Error),
+    #[cfg(feature = "snapshot")]
+    /// Generic vCPU state save/restore error.
+    VcpuState(String),
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    /// Failed to get a single KVM register.
+    VcpuGetOneReg(kvm_ioctls::Error),
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    /// Failed to set a single KVM register.
+    VcpuSetOneReg(kvm_ioctls::Error),
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    /// Failed to get KVM register list.
+    VcpuGetRegList(kvm_ioctls::Error),
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    /// Failed to get KVM vcpu mp state.
+    VcpuGetMpState(kvm_ioctls::Error),
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    /// Failed to set KVM vcpu mp state.
+    VcpuSetMpState(kvm_ioctls::Error),
     /// vCPU count is not initialized.
     VcpuCountNotInitialized,
     /// Cannot open the VCPU file descriptor.
@@ -417,6 +437,18 @@ impl Display for Error {
             }
             #[cfg(target_arch = "aarch64")]
             VcpuArmInit(e) => write!(f, "Error doing Vcpu Init on Arm: {e}"),
+            #[cfg(feature = "snapshot")]
+            VcpuState(e) => write!(f, "vCPU state error: {e}"),
+            #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+            VcpuGetOneReg(e) => write!(f, "Failed to get KVM register: {e}"),
+            #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+            VcpuSetOneReg(e) => write!(f, "Failed to set KVM register: {e}"),
+            #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+            VcpuGetRegList(e) => write!(f, "Failed to get KVM register list: {e}"),
+            #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+            VcpuGetMpState(e) => write!(f, "Failed to get KVM vcpu mp state: {e}"),
+            #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+            VcpuSetMpState(e) => write!(f, "Failed to set KVM vcpu mp state: {e}"),
 
             #[cfg(feature = "tee")]
             InvalidTee => write!(f, "TEE selected is not currently supported"),
@@ -506,6 +538,10 @@ pub struct Vm {
     pub tee_config: Tee,
 
     pub guest_memfds: Vec<(Range<u64>, RawFd)>,
+
+    /// Memory slot info for dirty tracking: (slot, guest_addr, size, host_addr)
+    #[cfg(feature = "snapshot")]
+    pub mem_slots: Vec<(u32, u64, u64, u64)>,
 }
 
 impl Vm {
@@ -531,6 +567,8 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             supported_msrs,
             guest_memfds: Vec::new(),
+            #[cfg(feature = "snapshot")]
+            mem_slots: Vec::new(),
         })
     }
 
@@ -570,6 +608,8 @@ impl Vm {
             tee,
             tee_config: tee_config.tee,
             guest_memfds: Vec::new(),
+            #[cfg(feature = "snapshot")]
+            mem_slots: Vec::new(),
         })
     }
 
@@ -615,6 +655,8 @@ impl Vm {
             tdx: Some(IntelTdx::new()),
             tee_config: tee_config.tee,
             guest_memfds: Vec::new(),
+            #[cfg(feature = "snapshot")]
+            mem_slots: Vec::new(),
         })
     }
 
@@ -746,6 +788,14 @@ impl Vm {
             self.guest_memfds.push((Range { start, end }, guest_memfd));
         }
 
+        #[cfg(feature = "snapshot")]
+        self.mem_slots.push((
+            self.next_mem_slot,
+            start,
+            region.len(),
+            host_addr as u64,
+        ));
+
         self.next_mem_slot += 1;
 
         Ok(())
@@ -828,8 +878,7 @@ impl Vm {
         &self.fd
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
     /// Saves and returns the Kvm Vm state.
     pub fn save_state(&self) -> Result<VmState> {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
@@ -871,8 +920,7 @@ impl Vm {
         })
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
     /// Restores the Kvm Vm state.
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
         self.fd
@@ -892,8 +940,8 @@ impl Vm {
     }
 }
 
-#[allow(unused)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+#[derive(serde::Serialize, serde::Deserialize)]
 /// Structure holding VM kvm state.
 pub struct VmState {
     pitstate: kvm_pit_state2,
@@ -1297,8 +1345,7 @@ impl Vcpu {
         ))
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
     fn save_state(&self) -> Result<VcpuState> {
         /*
          * Ordering requirements:
@@ -1361,8 +1408,7 @@ impl Vcpu {
         })
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
     fn restore_state(&self, state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
@@ -1412,6 +1458,62 @@ impl Vcpu {
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    fn save_state(&self) -> Result<Aarch64VcpuState> {
+        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
+
+        // Get the list of register IDs from KVM.
+        // Try with 500 slots first; handle E2BIG by reallocating to the
+        // kernel-reported count (SVE-capable CPUs can exceed 500).
+        let mut reg_list = RegList::new(500).map_err(|e| {
+            Error::VcpuState(format!("Failed to allocate RegList: {e}"))
+        })?;
+        match self.fd.get_reg_list(&mut reg_list) {
+            Ok(_) => {}
+            Err(e) if e.errno() == libc::E2BIG => {
+                let actual_count = reg_list.as_fam_struct_ref().n as usize;
+                reg_list = RegList::new(actual_count).map_err(|e| {
+                    Error::VcpuState(format!("Failed to reallocate RegList({actual_count}): {e}"))
+                })?;
+                self.fd
+                    .get_reg_list(&mut reg_list)
+                    .map_err(Error::VcpuGetRegList)?;
+            }
+            Err(e) => return Err(Error::VcpuGetRegList(e)),
+        }
+
+        let reg_ids = reg_list.as_slice();
+        let mut registers = Vec::with_capacity(reg_ids.len());
+        for &reg_id in reg_ids {
+            let size = kvm_ioctls::reg_size(reg_id);
+            let mut buf = vec![0u8; size];
+            self.fd
+                .get_one_reg(reg_id, &mut buf)
+                .map_err(Error::VcpuGetOneReg)?;
+            registers.push((reg_id, buf));
+        }
+
+        Ok(Aarch64VcpuState {
+            mp_state: mp_state.mp_state,
+            registers,
+        })
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+    fn restore_state(&self, state: &Aarch64VcpuState) -> Result<()> {
+        for (reg_id, data) in &state.registers {
+            self.fd
+                .set_one_reg(*reg_id, data)
+                .map_err(Error::VcpuSetOneReg)?;
+        }
+        self.fd
+            .set_mp_state(kvm_mp_state {
+                mp_state: state.mp_state,
+            })
+            .map_err(Error::VcpuSetMpState)?;
         Ok(())
     }
 
@@ -1636,6 +1738,49 @@ impl Vcpu {
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
             }
+            #[cfg(feature = "snapshot")]
+            Ok(VcpuEvent::SaveState) => {
+                let response = match self.save_state() {
+                    Ok(state) => match bincode::serialize(&state) {
+                        Ok(data) => VcpuResponse::StateSaved(data),
+                        Err(e) => VcpuResponse::StateError(format!("Serialize error: {e}")),
+                    },
+                    Err(e) => VcpuResponse::StateError(format!("Save error: {e}")),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send save state response");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(feature = "snapshot")]
+            Ok(VcpuEvent::RestoreState(data)) => {
+                let response = {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        match bincode::deserialize::<Aarch64VcpuState>(&data) {
+                            Ok(state) => match self.restore_state(&state) {
+                                Ok(()) => VcpuResponse::StateRestored,
+                                Err(e) => VcpuResponse::StateError(format!("Restore error: {e}")),
+                            },
+                            Err(e) => VcpuResponse::StateError(format!("Deserialize error: {e}")),
+                        }
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        match bincode::deserialize::<VcpuState>(&data) {
+                            Ok(state) => match self.restore_state(state) {
+                                Ok(()) => VcpuResponse::StateRestored,
+                                Err(e) => VcpuResponse::StateError(format!("Restore error: {e}")),
+                            },
+                            Err(e) => VcpuResponse::StateError(format!("Deserialize error: {e}")),
+                        }
+                    }
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send restore state response");
+                StateMachine::next(Self::paused)
+            }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
             // Unhandled exit of the other end.
@@ -1694,7 +1839,8 @@ impl Drop for Vcpu {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+#[derive(serde::Serialize, serde::Deserialize)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
     cpuid: CpuId,
@@ -1709,8 +1855,15 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
+/// aarch64 vCPU state for snapshot/restore.
+#[cfg(all(target_arch = "aarch64", feature = "snapshot"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Aarch64VcpuState {
+    pub mp_state: u32,
+    /// (reg_id, value) pairs from KVM_GET_REG_LIST + KVM_GET_ONE_REG
+    pub registers: Vec<(u64, Vec<u8>)>,
+}
+
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
@@ -1718,10 +1871,15 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Save the vCPU state and return it as opaque bytes.
+    #[cfg(feature = "snapshot")]
+    SaveState,
+    /// Restore the vCPU state from opaque bytes.
+    #[cfg(feature = "snapshot")]
+    RestoreState(Vec<u8>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -1730,6 +1888,15 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// vCPU state was saved successfully.
+    #[cfg(feature = "snapshot")]
+    StateSaved(Vec<u8>),
+    /// vCPU state was restored successfully.
+    #[cfg(feature = "snapshot")]
+    StateRestored,
+    /// vCPU state operation failed.
+    #[cfg(feature = "snapshot")]
+    StateError(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -1771,6 +1938,48 @@ impl VcpuHandle {
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+
+    /// Save vCPU state. Must be called while vCPU is paused.
+    #[cfg(feature = "snapshot")]
+    pub fn save_state(&self) -> Result<Vec<u8>> {
+        self.send_event(VcpuEvent::SaveState)?;
+        match self
+            .response_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+        {
+            Ok(VcpuResponse::StateSaved(data)) => Ok(data),
+            Ok(VcpuResponse::StateError(e)) => {
+                Err(Error::VcpuState(format!("Save state failed: {e}")))
+            }
+            Ok(other) => Err(Error::VcpuState(format!(
+                "Unexpected response to SaveState: {other:?}"
+            ))),
+            Err(e) => Err(Error::VcpuState(format!(
+                "Timeout waiting for SaveState response: {e}"
+            ))),
+        }
+    }
+
+    /// Restore vCPU state. Must be called while vCPU is paused.
+    #[cfg(feature = "snapshot")]
+    pub fn restore_state(&self, data: Vec<u8>) -> Result<()> {
+        self.send_event(VcpuEvent::RestoreState(data))?;
+        match self
+            .response_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+        {
+            Ok(VcpuResponse::StateRestored) => Ok(()),
+            Ok(VcpuResponse::StateError(e)) => {
+                Err(Error::VcpuState(format!("Restore state failed: {e}")))
+            }
+            Ok(other) => Err(Error::VcpuState(format!(
+                "Unexpected response to RestoreState: {other:?}"
+            ))),
+            Err(e) => Err(Error::VcpuState(format!(
+                "Timeout waiting for RestoreState response: {e}"
+            ))),
+        }
     }
 }
 

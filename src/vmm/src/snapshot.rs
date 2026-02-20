@@ -3,7 +3,9 @@
 
 //! VM snapshot and restore support.
 //!
-//! Provides full and incremental snapshot capabilities for macOS/HVF VMs.
+//! Provides full and incremental snapshot capabilities.
+//! Platform-agnostic: vCPU states are stored as opaque serialized bytes
+//! so the snapshot format doesn't depend on HVF or KVM types.
 
 use std::fmt::{Display, Formatter};
 use std::fs::File;
@@ -11,8 +13,6 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
-
-use hvf::Aarch64VcpuState;
 
 pub const SNAPSHOT_MAGIC: u32 = 0x4B52_534E; // "KRSN"
 pub const SNAPSHOT_VERSION: u32 = 1;
@@ -123,11 +123,15 @@ pub struct SnapshotHeader {
 #[derive(Debug, Clone)]
 pub struct VmSnapshot {
     pub header: SnapshotHeader,
-    pub vcpu_states: Vec<Aarch64VcpuState>,
+    /// Per-vCPU states as opaque serialized bytes (platform-specific format).
+    pub vcpu_states: Vec<Vec<u8>>,
     /// Device states as (device_id, serialized_bytes) pairs.
     pub device_states: Vec<(String, Vec<u8>)>,
     #[cfg_attr(feature = "snapshot", serde(default))]
     pub gic_state: Option<Vec<u8>>,
+    /// VM-level state (x86_64: PIT/PIC/IOAPIC/clock) as opaque serialized bytes.
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub vm_state: Option<Vec<u8>>,
 }
 
 /// Dump guest memory to a file.
@@ -218,9 +222,10 @@ pub fn load_vmstate(path: &Path) -> Result<VmSnapshot, SnapshotError> {
 pub fn create_full_snapshot(
     path: &Path,
     guest_memory: &GuestMemoryMmap,
-    vcpu_states: Vec<Aarch64VcpuState>,
+    vcpu_states: Vec<Vec<u8>>,
     device_states: Vec<(String, Vec<u8>)>,
     gic_state: Option<Vec<u8>>,
+    vm_state: Option<Vec<u8>>,
     nested_enabled: bool,
 ) -> Result<(), SnapshotError> {
     std::fs::create_dir_all(path)?;
@@ -236,6 +241,7 @@ pub fn create_full_snapshot(
         vcpu_states,
         device_states,
         gic_state,
+        vm_state,
     };
 
     save_vmstate(&snapshot, &path.join("vmstate"))?;
@@ -260,11 +266,15 @@ pub struct DirtyPage {
 #[derive(Debug, Clone)]
 pub struct IncrementalSnapshot {
     pub header: SnapshotHeader,
-    pub vcpu_states: Vec<Aarch64VcpuState>,
+    /// Per-vCPU states as opaque serialized bytes (platform-specific format).
+    pub vcpu_states: Vec<Vec<u8>>,
     pub device_states: Vec<(String, Vec<u8>)>,
     pub dirty_pages: Vec<DirtyPage>,
     #[cfg_attr(feature = "snapshot", serde(default))]
     pub gic_state: Option<Vec<u8>>,
+    /// VM-level state (x86_64: PIT/PIC/IOAPIC/clock) as opaque serialized bytes.
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub vm_state: Option<Vec<u8>>,
 }
 
 /// Combined interrupt controller snapshot: pending IRQs + GIC register state.
@@ -312,15 +322,6 @@ pub fn apply_dirty_pages(
     dirty_pages: &[DirtyPage],
 ) -> Result<(), SnapshotError> {
     for page in dirty_pages {
-        if page.data.len() != PAGE_SIZE as usize {
-            return Err(SnapshotError::Deserialize(format!(
-                "Dirty page at 0x{:x} has {} bytes (expected {})",
-                page.guest_addr,
-                page.data.len(),
-                PAGE_SIZE
-            )));
-        }
-
         guest_memory
             .write_slice(&page.data, GuestAddress(page.guest_addr))
             .map_err(|e| {

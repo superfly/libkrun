@@ -41,6 +41,8 @@ pub enum Error {
     DeviceNotFound,
     /// Failed to update the mmio device.
     UpdateFailed,
+    /// Snapshot operation failed.
+    SnapshotState(String),
 }
 
 impl fmt::Display for Error {
@@ -59,6 +61,7 @@ impl fmt::Display for Error {
             Error::RegisterIrqFd(ref e) => write!(f, "failed to register irqfd: {e}"),
             Error::DeviceNotFound => write!(f, "the device couldn't be found"),
             Error::UpdateFailed => write!(f, "failed to update the mmio device"),
+            Error::SnapshotState(ref e) => write!(f, "snapshot operation failed: {e}"),
         }
     }
 }
@@ -298,6 +301,151 @@ impl MMIODeviceManager {
             }
         }
         None
+    }
+
+    /// Save all snapshottable device states.
+    #[cfg(feature = "snapshot")]
+    pub fn save_all_device_states(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut states = Vec::new();
+
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                return Err(Error::SnapshotState(format!(
+                    "Device {device_type}:{device_id} missing from bus"
+                )));
+            };
+
+            let device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id}: {e}"
+                    )));
+                }
+            };
+            if let Some(snapshottable) = device.as_snapshottable() {
+                let state = match snapshottable.save_state() {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return Err(Error::SnapshotState(format!(
+                            "Failed to save state for {device_type}:{device_id}: {e}"
+                        )));
+                    }
+                };
+                let id = format!("{device_type}:{device_id}");
+                states.push((id, state));
+            } else {
+                debug!(
+                    "Skipping non-snapshottable device during snapshot save: {device_type}:{device_id}"
+                );
+            }
+        }
+        Ok(states)
+    }
+
+    /// Quiesce all device workers before snapshot/restore.
+    #[cfg(feature = "snapshot")]
+    pub fn quiesce_all_device_workers(&self, timeout: std::time::Duration) -> Result<()> {
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                continue;
+            };
+            let device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id} for quiesce: {e}"
+                    )));
+                }
+            };
+            if let Err(e) = device.quiesce_workers(timeout) {
+                return Err(Error::SnapshotState(format!(
+                    "Failed to quiesce workers for {device_type}:{device_id}: {e}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume all device workers after snapshot/restore.
+    #[cfg(feature = "snapshot")]
+    pub fn resume_all_device_workers(&self) {
+        for (_, dev_info) in &self.id_to_dev_info {
+            if let Some((_, device)) = self.bus.get_device(dev_info.addr) {
+                if let Ok(device) = device.lock() {
+                    device.resume_workers();
+                }
+            }
+        }
+    }
+
+    /// Complete device restore (activate devices, spawn worker threads).
+    #[cfg(feature = "snapshot")]
+    pub fn complete_all_device_restores(&self) -> Result<()> {
+        for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+            let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                continue;
+            };
+            let mut device = match device.lock() {
+                Ok(device) => device,
+                Err(e) => {
+                    return Err(Error::SnapshotState(format!(
+                        "Failed to lock device {device_type}:{device_id} for complete_restore: {e}"
+                    )));
+                }
+            };
+            if let Err(e) = device.complete_restore() {
+                return Err(Error::SnapshotState(format!(
+                    "Failed to complete restore for {device_type}:{device_id}: {e}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore all snapshottable device states.
+    #[cfg(feature = "snapshot")]
+    pub fn restore_all_device_states(&self, states: &[(String, Vec<u8>)]) -> Result<()> {
+        for (id, data) in states {
+            let mut found = false;
+            for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
+                let expected_id = format!("{device_type}:{device_id}");
+                if &expected_id == id {
+                    let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
+                        return Err(Error::SnapshotState(format!(
+                            "Device {id} missing from bus during restore"
+                        )));
+                    };
+                    let mut device = match device.lock() {
+                        Ok(device) => device,
+                        Err(e) => {
+                            return Err(Error::SnapshotState(format!(
+                                "Failed to lock device {id} during restore: {e}"
+                            )));
+                        }
+                    };
+                    let Some(snapshottable) = device.as_snapshottable_mut() else {
+                        return Err(Error::SnapshotState(format!(
+                            "Device {id} does not support snapshot restore"
+                        )));
+                    };
+                    if let Err(e) = snapshottable.restore_state(data) {
+                        return Err(Error::SnapshotState(format!(
+                            "Failed to restore state for device {id}: {e}"
+                        )));
+                    }
+
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(Error::SnapshotState(format!(
+                    "No matching device found for snapshot state: {id}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

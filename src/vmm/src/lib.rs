@@ -25,7 +25,6 @@ pub mod resources;
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
 /// VM snapshot and restore support.
-#[cfg(target_os = "macos")]
 pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
@@ -224,6 +223,8 @@ pub struct Vmm {
     vcpu_list: Arc<devices::legacy::VcpuList>,
     #[cfg(target_os = "macos")]
     intc: IrqChip,
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
+    intc: IrqChip,
 }
 
 impl Vmm {
@@ -349,6 +350,154 @@ impl Vmm {
         Ok(())
     }
 
+    /// Save all vCPU states as opaque bytes. vCPUs must already be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn save_vcpu_states(&self) -> Result<Vec<Vec<u8>>> {
+        let mut states = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in self.vcpus_handles.iter() {
+            states.push(handle.save_state().map_err(Error::Vcpu)?);
+        }
+        Ok(states)
+    }
+
+    /// Restore all vCPU states from opaque bytes. vCPUs must already be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn restore_vcpu_states(&self, states: Vec<Vec<u8>>) -> Result<()> {
+        if states.len() != self.vcpus_handles.len() {
+            return Err(Error::VcpuPause);
+        }
+        for (handle, state) in self.vcpus_handles.iter().zip(states.into_iter()) {
+            handle.restore_state(state).map_err(Error::Vcpu)?;
+        }
+        Ok(())
+    }
+
+    /// Save interrupt controller state for snapshot (Linux/aarch64).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
+    fn save_interrupt_controller_state(
+        &self,
+    ) -> std::result::Result<Option<Vec<u8>>, snapshot::SnapshotError> {
+        let gic_data = self.intc.lock().unwrap().save_snapshot_state();
+        Ok(gic_data)
+    }
+
+    /// Restore interrupt controller state from snapshot (Linux/aarch64).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
+    fn restore_interrupt_controller_state(
+        &self,
+        data: &[u8],
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        self.intc.lock().unwrap().restore_snapshot_state(data);
+        Ok(())
+    }
+
+    /// Create a full snapshot of the VM. vCPUs must already be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn create_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let device_states = self
+            .mmio_device_manager
+            .save_all_device_states()
+            .map_err(|e| {
+                snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
+            })?;
+
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        #[cfg(target_arch = "aarch64")]
+        let gic_state = self.save_interrupt_controller_state()?;
+        #[cfg(not(target_arch = "aarch64"))]
+        let gic_state = None;
+
+        #[cfg(target_arch = "x86_64")]
+        let vm_state = Some(
+            bincode::serialize(&self.vm.save_state().map_err(|e| {
+                snapshot::SnapshotError::Serialize(format!("Failed to save VM state: {e}"))
+            })?)
+            .map_err(|e| snapshot::SnapshotError::Serialize(e.to_string()))?,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let vm_state = None;
+
+        snapshot::create_full_snapshot(
+            path,
+            &self.guest_memory,
+            vcpu_states,
+            device_states,
+            gic_state,
+            vm_state,
+            false,
+        )
+    }
+
+    /// Restore a full snapshot into the running VM. vCPUs must already be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn restore_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let vmstate = snapshot::load_vmstate(&path.join("vmstate"))?;
+        snapshot::validate_header_for_vm(
+            &vmstate.header,
+            &self.guest_memory,
+            self.vcpus_handles.len(),
+        )?;
+
+        self.mmio_device_manager
+            .quiesce_all_device_workers(snapshot::SNAPSHOT_QUIESCE_TIMEOUT)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to quiesce device workers before restore: {e}"
+                ))
+            })?;
+
+        snapshot::load_memory(&self.guest_memory, &path.join("memory"))?;
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(gic_data) = &vmstate.gic_state {
+            self.restore_interrupt_controller_state(gic_data)?;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(data) = &vmstate.vm_state {
+            let state: vstate::VmState = bincode::deserialize(data)
+                .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))?;
+            self.vm
+                .restore_state(&state)
+                .map_err(|e| {
+                    snapshot::SnapshotError::Deserialize(format!(
+                        "Failed to restore VM state: {e}"
+                    ))
+                })?;
+        }
+
+        self.mmio_device_manager
+            .restore_all_device_states(&vmstate.device_states)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to restore device states: {e}"
+                ))
+            })?;
+
+        self.mmio_device_manager
+            .complete_all_device_restores()
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to complete device restores: {e}"
+                ))
+            })?;
+        self.mmio_device_manager.resume_all_device_workers();
+
+        self.restore_vcpu_states(vmstate.vcpu_states).map_err(|e| {
+            snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+        })?;
+        Ok(())
+    }
+
     /// Sends a resume command to the vcpus.
     pub fn resume_vcpus(&mut self) -> Result<()> {
         for handle in self.vcpus_handles.iter() {
@@ -469,14 +618,23 @@ impl Vmm {
             snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
         })?;
 
+        let serialized_vcpu_states: Vec<Vec<u8>> = vcpu_states
+            .iter()
+            .map(|s| {
+                bincode::serialize(s)
+                    .map_err(|e| snapshot::SnapshotError::Serialize(e.to_string()))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
         let gic_state = self.save_interrupt_controller_state()?;
 
         snapshot::create_full_snapshot(
             path,
             &self.guest_memory,
-            vcpu_states,
+            serialized_vcpu_states,
             device_states,
             gic_state,
+            None, // vm_state: not needed on macOS/aarch64
             false, // TODO: get nested_enabled from VM config
         )
     }
@@ -533,7 +691,16 @@ impl Vmm {
             })?;
         self.mmio_device_manager.resume_all_device_workers();
 
-        self.restore_vcpu_states(vmstate.vcpu_states).map_err(|e| {
+        let vcpu_states: Vec<hvf::Aarch64VcpuState> = vmstate
+            .vcpu_states
+            .iter()
+            .map(|data| {
+                bincode::deserialize(data)
+                    .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
+        self.restore_vcpu_states(vcpu_states).map_err(|e| {
             snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
         })?;
         Ok(())
@@ -627,6 +794,14 @@ impl Vmm {
             snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
         })?;
 
+        let serialized_vcpu_states: Vec<Vec<u8>> = vcpu_states
+            .iter()
+            .map(|s| {
+                bincode::serialize(s)
+                    .map_err(|e| snapshot::SnapshotError::Serialize(e.to_string()))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
         let gic_state = self.save_interrupt_controller_state()?;
 
         let mut dirty_pages = Vec::new();
@@ -666,14 +841,15 @@ impl Vmm {
             header: snapshot::SnapshotHeader {
                 magic: snapshot::SNAPSHOT_MAGIC,
                 version: snapshot::SNAPSHOT_VERSION,
-                vcpu_count: vcpu_states.len() as u32,
+                vcpu_count: serialized_vcpu_states.len() as u32,
                 ram_regions: snapshot::ram_layout(&self.guest_memory),
                 nested_enabled: false,
             },
-            vcpu_states,
+            vcpu_states: serialized_vcpu_states,
             device_states,
             dirty_pages,
             gic_state,
+            vm_state: None,
         };
 
         snapshot::save_incremental_snapshot(&incremental, path)
@@ -727,10 +903,206 @@ impl Vmm {
             })?;
         self.mmio_device_manager.resume_all_device_workers();
 
-        self.restore_vcpu_states(incremental.vcpu_states)
+        let vcpu_states: Vec<hvf::Aarch64VcpuState> = incremental
+            .vcpu_states
+            .iter()
+            .map(|data| {
+                bincode::deserialize(data)
+                    .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
+        self.restore_vcpu_states(vcpu_states).map_err(|e| {
+            snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+        })?;
+        Ok(())
+    }
+
+    /// Enable dirty page tracking via KVM dirty log. vCPUs must be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn enable_dirty_tracking(&mut self) -> Result<()> {
+        use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
+
+        for &(slot, guest_addr, size, host_addr) in &self.vm.mem_slots {
+            let region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: guest_addr,
+                memory_size: size,
+                userspace_addr: host_addr,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm
+                    .fd()
+                    .set_user_memory_region(region)
+                    .map_err(|e| Error::Vm(vstate::Error::SetUserMemoryRegion(e)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect dirty pages from KVM dirty log.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    fn collect_dirty_pages(
+        &self,
+    ) -> std::result::Result<Vec<snapshot::DirtyPage>, snapshot::SnapshotError> {
+        use vm_memory::{GuestAddress, GuestMemory};
+
+        let page_size = 4096u64;
+        let mut pages = Vec::new();
+        for &(slot, guest_addr, size, _) in &self.vm.mem_slots {
+            let bitmap = self
+                .vm
+                .fd()
+                .get_dirty_log(slot, size as usize)
+                .map_err(|e| {
+                    snapshot::SnapshotError::Serialize(format!(
+                        "Failed to get dirty log for slot {slot}: {e}"
+                    ))
+                })?;
+            for (word_idx, &word) in bitmap.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                for bit in 0..64u32 {
+                    if (word >> bit) & 1 != 0 {
+                        let page_idx = word_idx as u64 * 64 + bit as u64;
+                        let addr = guest_addr + page_idx * page_size;
+                        let host_ptr = self
+                            .guest_memory
+                            .get_host_address(GuestAddress(addr))
+                            .map_err(|e| {
+                                snapshot::SnapshotError::Serialize(format!(
+                                    "Invalid guest address for dirty page 0x{addr:x}: {e}"
+                                ))
+                            })?;
+                        let data = unsafe {
+                            std::slice::from_raw_parts(host_ptr, page_size as usize)
+                        };
+                        pages.push(snapshot::DirtyPage {
+                            guest_addr: addr,
+                            data: data.to_vec(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Create an incremental snapshot (dirty pages only). vCPUs must be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn create_incremental_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let device_states = self
+            .mmio_device_manager
+            .save_all_device_states()
             .map_err(|e| {
-                snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+                snapshot::SnapshotError::Serialize(format!("Failed to save device states: {e}"))
             })?;
+
+        let vcpu_states = self.save_vcpu_states().map_err(|e| {
+            snapshot::SnapshotError::Serialize(format!("Failed to save vCPU states: {e}"))
+        })?;
+
+        #[cfg(target_arch = "aarch64")]
+        let gic_state = self.save_interrupt_controller_state()?;
+        #[cfg(not(target_arch = "aarch64"))]
+        let gic_state = None;
+
+        #[cfg(target_arch = "x86_64")]
+        let vm_state = Some(
+            bincode::serialize(&self.vm.save_state().map_err(|e| {
+                snapshot::SnapshotError::Serialize(format!("Failed to save VM state: {e}"))
+            })?)
+            .map_err(|e| snapshot::SnapshotError::Serialize(e.to_string()))?,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let vm_state = None;
+
+        let dirty_pages = self.collect_dirty_pages()?;
+
+        let incremental = snapshot::IncrementalSnapshot {
+            header: snapshot::SnapshotHeader {
+                magic: snapshot::SNAPSHOT_MAGIC,
+                version: snapshot::SNAPSHOT_VERSION,
+                vcpu_count: vcpu_states.len() as u32,
+                ram_regions: snapshot::ram_layout(&self.guest_memory),
+                nested_enabled: false,
+            },
+            vcpu_states,
+            device_states,
+            dirty_pages,
+            gic_state,
+            vm_state,
+        };
+
+        snapshot::save_incremental_snapshot(&incremental, path)
+    }
+
+    /// Restore an incremental snapshot. vCPUs must already be paused.
+    #[cfg(all(target_os = "linux", feature = "snapshot"))]
+    pub fn restore_incremental_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), snapshot::SnapshotError> {
+        let incremental = snapshot::load_incremental_snapshot(path)?;
+        snapshot::validate_header_for_vm(
+            &incremental.header,
+            &self.guest_memory,
+            self.vcpus_handles.len(),
+        )?;
+
+        self.mmio_device_manager
+            .quiesce_all_device_workers(snapshot::SNAPSHOT_QUIESCE_TIMEOUT)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to quiesce device workers before restore: {e}"
+                ))
+            })?;
+
+        snapshot::apply_dirty_pages(&self.guest_memory, &incremental.dirty_pages)?;
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(gic_data) = &incremental.gic_state {
+            self.restore_interrupt_controller_state(gic_data)?;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(data) = &incremental.vm_state {
+            let state: vstate::VmState = bincode::deserialize(data)
+                .map_err(|e| snapshot::SnapshotError::Deserialize(e.to_string()))?;
+            self.vm
+                .restore_state(&state)
+                .map_err(|e| {
+                    snapshot::SnapshotError::Deserialize(format!(
+                        "Failed to restore VM state: {e}"
+                    ))
+                })?;
+        }
+
+        self.mmio_device_manager
+            .restore_all_device_states(&incremental.device_states)
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to restore device states: {e}"
+                ))
+            })?;
+
+        self.mmio_device_manager
+            .complete_all_device_restores()
+            .map_err(|e| {
+                snapshot::SnapshotError::Deserialize(format!(
+                    "Failed to complete device restores: {e}"
+                ))
+            })?;
+        self.mmio_device_manager.resume_all_device_workers();
+
+        self.restore_vcpu_states(incremental.vcpu_states).map_err(|e| {
+            snapshot::SnapshotError::Deserialize(format!("Failed to restore vCPU states: {e}"))
+        })?;
         Ok(())
     }
 
