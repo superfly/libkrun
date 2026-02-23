@@ -1719,6 +1719,15 @@ impl Vcpu {
                 // Move to 'exited' state.
                 state = self.exit(FC_EXIT_CODE_GENERIC_ERROR);
             }
+            // SaveState/RestoreState should only arrive while paused.
+            #[cfg(feature = "snapshot")]
+            Ok(VcpuEvent::SaveState) | Ok(VcpuEvent::RestoreState(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::StateError(
+                        "snapshot events require vCPU to be paused".to_string(),
+                    ))
+                    .expect("failed to send state error response");
+            }
             // All other events or lack thereof have no effect on current 'running' state.
             Err(TryRecvError::Empty) => (),
         }
