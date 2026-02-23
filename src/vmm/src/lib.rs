@@ -220,8 +220,10 @@ pub struct Vmm {
 
     // Interrupt controller state needed for snapshots.
     #[cfg(target_os = "macos")]
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     vcpu_list: Arc<devices::legacy::VcpuList>,
     #[cfg(target_os = "macos")]
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     intc: IrqChip,
     #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
     intc: IrqChip,

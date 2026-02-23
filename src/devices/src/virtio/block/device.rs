@@ -31,7 +31,7 @@ use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
-use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{ByteValued, GuestMemoryMmap, VolatileSlice};
 
 use super::worker::BlockWorker;
 use super::{

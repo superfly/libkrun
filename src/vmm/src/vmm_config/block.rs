@@ -3,11 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use devices::virtio::block::device::BlockDeviceType;
-use devices::virtio::BlockBackend;
-use devices::virtio::{
-    block::{ImageType, SyncMode},
-    Block, CacheType,
-};
+use devices::virtio::{Block, CacheType};
 
 #[derive(Debug)]
 pub enum BlockConfigError {

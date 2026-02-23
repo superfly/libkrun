@@ -181,19 +181,11 @@ struct ContextConfig {
 }
 
 impl ContextConfig {
-    fn set_workdir(&mut self, workdir: String) {
-        self.workdir = Some(workdir);
-    }
-
     fn get_workdir(&self) -> String {
         match &self.workdir {
             Some(workdir) => format!("KRUN_WORKDIR={workdir}"),
             None => "".to_string(),
         }
-    }
-
-    fn set_exec_path(&mut self, exec_path: String) {
-        self.exec_path = Some(exec_path);
     }
 
     fn get_exec_path(&self) -> String {
@@ -231,10 +223,6 @@ impl ContextConfig {
         "".to_string()
     }
 
-    fn set_env(&mut self, env: String) {
-        self.env = Some(env);
-    }
-
     fn get_env(&self) -> String {
         match &self.env {
             Some(env) => env.clone(),
@@ -242,19 +230,11 @@ impl ContextConfig {
         }
     }
 
-    fn set_args(&mut self, args: String) {
-        self.args = Some(args);
-    }
-
     fn get_args(&self) -> String {
         match &self.args {
             Some(args) => args.clone(),
             None => "".to_string(),
         }
-    }
-
-    fn set_rlimits(&mut self, rlimits: String) {
-        self.rlimits = Some(rlimits);
     }
 
     fn get_rlimits(&self) -> String {
@@ -301,15 +281,6 @@ impl ContextConfig {
         self.legacy_mac = Some(mac);
     }
 
-    fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
-        if self.net_index != 0 {
-            return Err(());
-        }
-
-        self.tsi_port_map.replace(new_port_map);
-        Ok(())
-    }
-
     #[cfg(feature = "tee")]
     fn set_tee_config_file(&mut self, filepath: PathBuf) {
         self.tee_config_file = Some(filepath);
@@ -318,32 +289,6 @@ impl ContextConfig {
     #[cfg(feature = "tee")]
     fn get_tee_config_file(&self) -> Option<PathBuf> {
         self.tee_config_file.clone()
-    }
-
-    fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
-        if let Some(ref mut map) = &mut self.unix_ipc_port_map {
-            map.insert(port, (filepath, listen));
-        } else {
-            let mut map: HashMap<u32, (PathBuf, bool)> = HashMap::new();
-            map.insert(port, (filepath, listen));
-            self.unix_ipc_port_map = Some(map);
-        }
-    }
-
-    fn set_gpu_virgl_flags(&mut self, virgl_flags: u32) {
-        self.gpu_virgl_flags = Some(virgl_flags);
-    }
-
-    fn set_gpu_shm_size(&mut self, shm_size: usize) {
-        self.gpu_shm_size = Some(shm_size);
-    }
-
-    fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
-        self.vmm_uid = Some(vmm_uid);
-    }
-
-    fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
-        self.vmm_gid = Some(vmm_gid);
     }
 
     #[cfg(feature = "nitro")]

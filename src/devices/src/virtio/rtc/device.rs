@@ -102,6 +102,7 @@ unsafe impl ByteValued for RespRead {}
 
 /// REQ_CROSS_CAP request body (after header)
 /// Kernel uses: le16 clock_id, u8 hw_counter, u8 reserved[5]
+#[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 #[repr(C, packed)]
 struct ReqCrossCap {
@@ -129,6 +130,7 @@ unsafe impl ByteValued for RespCrossCap {}
 
 /// REQ_READ_CROSS request body (after header)
 /// Kernel uses: le16 clock_id, u8 hw_counter, u8 reserved[5]
+#[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 #[repr(C, packed)]
 struct ReqReadCross {

@@ -18,7 +18,8 @@
 //! 2. Implement `AsyncNetBackend` for packet handling
 //! 3. Pass the factory to libkrun via `VirtioNetBackend::CustomAsyncFactory`
 //!
-//! See the `examples/smoltcp-proxy` for a complete implementation using smoltcp.
+//! See the async backend and worker integration in this module and
+//! `crate::virtio::net::proxy` for an end-to-end example pattern.
 
 use bytes::Bytes;
 use std::io;

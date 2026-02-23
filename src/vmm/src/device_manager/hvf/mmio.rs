@@ -323,6 +323,7 @@ impl MMIODeviceManager {
 
     /// Save the state of all snapshottable devices.
     /// Returns a list of (device_id, serialized_state) pairs.
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     pub fn save_all_device_states(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut states = Vec::new();
 
@@ -363,6 +364,7 @@ impl MMIODeviceManager {
 
     /// Quiesce all device workers before snapshot restore overwrites guest memory.
     /// This ensures no async workers hold stale pointers into guest RAM.
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     pub fn quiesce_all_device_workers(&self, timeout: std::time::Duration) -> Result<()> {
         for ((device_type, device_id), dev_info) in &self.id_to_dev_info {
             let Some((_, device)) = self.bus.get_device(dev_info.addr) else {
@@ -386,6 +388,7 @@ impl MMIODeviceManager {
     }
 
     /// Resume all device workers after snapshot restore completes.
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     pub fn resume_all_device_workers(&self) {
         for (_, dev_info) in &self.id_to_dev_info {
             if let Some((_, device)) = self.bus.get_device(dev_info.addr) {
@@ -425,6 +428,7 @@ impl MMIODeviceManager {
     }
 
     /// Restore device states from a snapshot.
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     pub fn restore_all_device_states(&self, states: &[(String, Vec<u8>)]) -> Result<()> {
         for (id, data) in states {
             // Find the matching device by iterating all registered devices

@@ -583,6 +583,7 @@ pub struct BuiltVm {
     /// restore (they wait on boot_receiver for a PSCI CPU_ON that never comes
     /// when we skip the kernel boot).
     #[cfg(target_os = "macos")]
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
     boot_senders: Vec<Sender<u64>>,
 }
 
@@ -927,7 +928,9 @@ pub fn build_microvm(
     };
 
     let vcpus;
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let boot_senders: Vec<Sender<u64>>;
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
     let mut boot_senders: Vec<Sender<u64>> = Vec::new();
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`

@@ -388,7 +388,7 @@ impl ProxyNetWorker {
 
     pub fn run(mut self) {
         thread::Builder::new()
-            .name("smoltcp-proxy".into())
+            .name("virtio-net-proxy".into())
             .spawn(move || self.work())
             .unwrap();
     }
