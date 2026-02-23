@@ -131,6 +131,14 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Save interrupt controller register state for snapshot. Default: no state.
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restore interrupt controller register state from snapshot. Default: no-op.
+    fn restore_snapshot_state(&mut self, _data: &[u8]) {}
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -161,6 +169,14 @@ pub trait IrqChipT: BusDevice + AIADevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Save interrupt controller register state for snapshot. Default: no state.
+    fn save_snapshot_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restore interrupt controller register state from snapshot. Default: no-op.
+    fn restore_snapshot_state(&mut self, _data: &[u8]) {}
 }
 
 #[cfg(any(test, feature = "test_utils"))]
