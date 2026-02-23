@@ -7,6 +7,7 @@ use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "blk")]
 pub use devices::virtio::CacheType;
 use env_logger::{Env, Target};
+use std::ops::{Deref, DerefMut};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
 
@@ -142,7 +143,7 @@ enum LegacyNetworkConfig {
 }
 
 #[derive(Default)]
-struct ContextConfig {
+pub(crate) struct ContextConfig {
     krunfw: Option<KrunfwBindings>,
     vmr: VmResources,
     workdir: Option<String>,
@@ -2332,11 +2333,24 @@ pub struct ConsoleDeviceInfo {
 }
 
 #[derive(Default)]
-pub struct Builder {
+pub(crate) struct Builder {
     config: ContextConfig,
     kernel_cmdline: Vec<String>,
     /// Number of console devices added (for computing device paths)
     console_count: u32,
+}
+
+impl Deref for Builder {
+    type Target = ContextConfig;
+    fn deref(&self) -> &ContextConfig {
+        &self.config
+    }
+}
+
+impl DerefMut for Builder {
+    fn deref_mut(&mut self) -> &mut ContextConfig {
+        &mut self.config
+    }
 }
 
 impl Builder {
