@@ -150,22 +150,62 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     }
 }
 
+// The libc crate doesn't expose statx types/constants for musl targets.
+// Define them locally and use the raw syscall to work on both glibc and musl.
+const STATX_BASIC_STATS: libc::c_uint = 0x07ff;
+const STATX_MNT_ID: libc::c_uint = 0x1000;
+
+#[repr(C)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    _reserved: i32,
+}
+
+#[repr(C)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    _spare0: [u16; 1],
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    _spare2: u64,
+    _spare3: [u64; 12],
+}
+
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
-    let mut stx = MaybeUninit::<libc::statx>::zeroed();
+    let mut stx = MaybeUninit::<Statx>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
     let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
 
-    // Safe because the kernel will only write data in `st` and we check the return
-    // value.
+    // Safe because the kernel will only write data in `stx` and we check the return
+    // value. Uses raw syscall to avoid dependency on libc exposing statx (musl doesn't).
     let res = unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             f.as_raw_fd(),
             pathname.as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+            STATX_BASIC_STATS | STATX_MNT_ID,
             stx.as_mut_ptr(),
-        )
+        ) as libc::c_int
     };
     if res >= 0 {
         // Safe because the kernel guarantees that the struct is now fully initialized.
