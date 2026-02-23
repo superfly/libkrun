@@ -143,7 +143,7 @@ enum LegacyNetworkConfig {
 }
 
 #[derive(Default)]
-pub(crate) struct ContextConfig {
+pub struct ContextConfig {
     krunfw: Option<KrunfwBindings>,
     vmr: VmResources,
     workdir: Option<String>,
@@ -2333,7 +2333,7 @@ pub struct ConsoleDeviceInfo {
 }
 
 #[derive(Default)]
-pub(crate) struct Builder {
+pub struct Builder {
     config: ContextConfig,
     kernel_cmdline: Vec<String>,
     /// Number of console devices added (for computing device paths)
