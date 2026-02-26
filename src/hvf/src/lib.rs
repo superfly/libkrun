@@ -184,7 +184,7 @@ pub enum Error {
     GicStateSize,
     GicStateRead,
     GicStateRestore,
-    VmCreate,
+    VmCreate(i32),
 }
 
 impl Display for Error {
@@ -222,8 +222,25 @@ impl Display for Error {
             GicStateSize => write!(f, "Error obtaining HVF GIC state size"),
             GicStateRead => write!(f, "Error reading HVF GIC state data"),
             GicStateRestore => write!(f, "Error restoring HVF GIC state data"),
-            VmCreate => write!(f, "Error creating HVF VM instance"),
+            VmCreate(ret) => {
+                let reason = hv_return_name(*ret);
+                write!(f, "Error creating HVF VM instance: {reason} ({ret})")
+            }
         }
+    }
+}
+
+fn hv_return_name(ret: i32) -> &'static str {
+    match ret {
+        HV_ERROR => "HV_ERROR",
+        HV_BUSY => "HV_BUSY",
+        HV_BAD_ARGUMENT => "HV_BAD_ARGUMENT",
+        HV_ILLEGAL_GUEST_STATE => "HV_ILLEGAL_GUEST_STATE",
+        HV_NO_RESOURCES => "HV_NO_RESOURCES",
+        HV_NO_DEVICE => "HV_NO_DEVICE",
+        HV_DENIED => "HV_DENIED",
+        HV_UNSUPPORTED => "HV_UNSUPPORTED",
+        _ => "unknown",
     }
 }
 
@@ -401,7 +418,7 @@ impl HvfVm {
         let ret = unsafe { hv_vm_create(config) };
 
         if ret != HV_SUCCESS {
-            Err(Error::VmCreate)
+            Err(Error::VmCreate(ret))
         } else {
             Ok(Self {})
         }
