@@ -883,12 +883,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
     use super::super::devices;
     use super::*;
 
+    #[cfg(target_os = "linux")]
     use utils::signal::validate_signal_num;
 
     // In tests we need to close any pending Vcpu threads on test completion.
+    #[cfg(target_os = "linux")]
     impl Drop for VcpuHandle {
         fn drop(&mut self) {
             // Make sure the Vcpu is out of KVM_RUN.
@@ -902,6 +905,7 @@ mod tests {
     }
 
     // Auxiliary function being used throughout the tests.
+    #[cfg(target_os = "linux")]
     fn setup_vcpu(mem_size: usize) -> (Vm, Vcpu, GuestMemoryMmap) {
         let kvm = KvmContext::new().unwrap();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
@@ -926,13 +930,25 @@ mod tests {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            vcpu = Vcpu::new_aarch64(1, vm.fd(), exit_evt).unwrap();
+            let scheduler = Arc::new(crate::vcpu_scheduler::PassthroughScheduler);
+            let vcpu_list = Arc::new(devices::legacy::VcpuList::new(1));
+            vcpu = Vcpu::new_aarch64(
+                1,
+                GuestAddress(0),
+                None,
+                exit_evt,
+                vcpu_list,
+                false,
+                scheduler,
+            )
+            .unwrap();
             vm.setup_irqchip(1).expect("Cannot setup irqchip");
         }
 
         (vm, vcpu, gm)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_set_mmio_bus() {
         let (_, mut vcpu, _) = setup_vcpu(0x1000);
@@ -941,8 +957,8 @@ mod tests {
         assert!(vcpu.mmio_bus.is_some());
     }
 
+    #[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn test_get_supported_cpuid() {
         let kvm = KvmContext::new().unwrap();
         let vm = Vm::new(kvm.fd()).expect("Cannot create new vm");
@@ -953,6 +969,7 @@ mod tests {
         assert_eq!(vm.supported_cpuid().as_slice(), cpuid.as_slice());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_vm_memory_init() {
         let mut kvm_context = KvmContext::new().unwrap();
@@ -998,7 +1015,7 @@ mod tests {
         assert!(vm.setup_irqchip().is_err());
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     #[test]
     fn test_setup_irqchip() {
         let kvm = KvmContext::new().unwrap();
@@ -1045,7 +1062,7 @@ mod tests {
             .is_ok());
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     #[test]
     fn test_configure_vcpu() {
         let kvm = KvmContext::new().unwrap();
@@ -1078,6 +1095,7 @@ mod tests {
             .is_ok());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_kvm_context() {
         use std::os::unix::fs::MetadataExt;
@@ -1096,6 +1114,7 @@ mod tests {
         assert_eq!(m1.ino(), m2.ino());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_vcpu_tls() {
         let (_, mut vcpu, _) = setup_vcpu(0x1000);
@@ -1127,6 +1146,7 @@ mod tests {
         assert!(vcpu.reset_thread_local_data().is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_invalid_tls() {
         let (_, mut vcpu, _) = setup_vcpu(0x1000);
@@ -1136,6 +1156,7 @@ mod tests {
         vcpu.init_thread_local_data().unwrap_err();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_vcpu_kick() {
         Vcpu::register_kick_signal_handler();
@@ -1206,6 +1227,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_vcpu_rtsig_offset() {
         assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());

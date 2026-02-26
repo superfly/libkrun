@@ -229,6 +229,11 @@ pub struct Vmm {
     intc: IrqChip,
     #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
     intc: IrqChip,
+
+    /// vCPU scheduler for snapshot save/restore.
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(not(feature = "snapshot"), allow(dead_code))]
+    scheduler: Arc<dyn crate::vcpu_scheduler::VcpuScheduler>,
 }
 
 impl Vmm {
@@ -632,6 +637,11 @@ impl Vmm {
 
         let gic_state = self.save_interrupt_controller_state()?;
 
+        let scheduler_state = {
+            let state = self.scheduler.save_state();
+            if state.is_empty() { None } else { Some(state) }
+        };
+
         snapshot::create_full_snapshot(
             path,
             &self.guest_memory,
@@ -640,6 +650,7 @@ impl Vmm {
             gic_state,
             None, // vm_state: not needed on macOS/aarch64
             false, // TODO: get nested_enabled from VM config
+            scheduler_state,
         )
     }
 
@@ -674,6 +685,9 @@ impl Vmm {
         // Device state is deserialized but activate() is deferred.
         if let Some(gic_data) = &vmstate.gic_state {
             self.restore_interrupt_controller_state(gic_data)?;
+        }
+        if let Some(state) = &vmstate.scheduler_state {
+            self.scheduler.restore_state(state);
         }
         self.mmio_device_manager
             .restore_all_device_states(&vmstate.device_states)

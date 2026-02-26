@@ -1103,6 +1103,8 @@ pub fn build_microvm(
         intc: intc.clone(),
         #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "snapshot"))]
         intc: intc.clone(),
+        #[cfg(target_os = "macos")]
+        scheduler: scheduler.clone(),
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

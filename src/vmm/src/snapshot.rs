@@ -132,6 +132,9 @@ pub struct VmSnapshot {
     /// VM-level state (x86_64: PIT/PIC/IOAPIC/clock) as opaque serialized bytes.
     #[cfg_attr(feature = "snapshot", serde(default))]
     pub vm_state: Option<Vec<u8>>,
+    /// Scheduler state as opaque serialized bytes.
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub scheduler_state: Option<Vec<u8>>,
 }
 
 /// Dump guest memory to a file.
@@ -227,6 +230,7 @@ pub fn create_full_snapshot(
     gic_state: Option<Vec<u8>>,
     vm_state: Option<Vec<u8>>,
     nested_enabled: bool,
+    scheduler_state: Option<Vec<u8>>,
 ) -> Result<(), SnapshotError> {
     std::fs::create_dir_all(path)?;
 
@@ -242,6 +246,7 @@ pub fn create_full_snapshot(
         device_states,
         gic_state,
         vm_state,
+        scheduler_state,
     };
 
     save_vmstate(&snapshot, &path.join("vmstate"))?;
