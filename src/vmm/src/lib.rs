@@ -16,6 +16,8 @@ extern crate log;
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+/// vCPU scheduler trait and implementations.
+pub mod vcpu_scheduler;
 /// Dirty page bitmap for incremental snapshots.
 #[cfg(target_os = "macos")]
 pub mod dirty_bitmap;
