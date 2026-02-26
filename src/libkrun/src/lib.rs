@@ -53,6 +53,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use utils::eventfd::EventFd;
 use vmm::builder::StartMicrovmError;
 pub use vmm::resources::VirtioConsoleConfigMode;
+pub use vmm::vcpu_scheduler::{VcpuScheduler, VcpuExitReason, PassthroughScheduler};
 use vmm::resources::{DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VmResources};
 #[cfg(feature = "blk")]
 pub use vmm::vmm_config::block::{BlockConfigError, BlockDeviceConfig, BlockRootConfig};
@@ -179,6 +180,7 @@ pub struct ContextConfig {
     nitro_image_path: Option<PathBuf>,
     #[cfg(feature = "nitro")]
     nitro_start_flags: StartFlags,
+    vcpu_scheduler: Option<Arc<dyn vmm::vcpu_scheduler::VcpuScheduler>>,
 }
 
 impl ContextConfig {
@@ -2750,6 +2752,11 @@ impl Builder {
         self
     }
 
+    pub fn vcpu_scheduler(&mut self, scheduler: Arc<dyn vmm::vcpu_scheduler::VcpuScheduler>) -> &mut Self {
+        self.config.vcpu_scheduler = Some(scheduler);
+        self
+    }
+
     pub fn build(self) -> Result<Context, StartError> {
         let mut event_manager = EventManager::new().map_err(StartError::EventManager)?;
 
@@ -2895,11 +2902,17 @@ impl Builder {
             .and_then(|efd| efd.try_clone().ok())
             .map(Arc::new);
 
+        let scheduler: Arc<dyn vmm::vcpu_scheduler::VcpuScheduler> = ctx_cfg
+            .vcpu_scheduler
+            .clone()
+            .unwrap_or_else(|| Arc::new(vmm::vcpu_scheduler::PassthroughScheduler));
+
         let built_vm = vmm::builder::build_microvm(
             &mut ctx_cfg.vmr,
             &mut event_manager,
             ctx_cfg.shutdown_efd,
             sender,
+            scheduler,
         )?;
 
         #[cfg(target_os = "macos")]
