@@ -323,7 +323,7 @@ impl Display for StartMicrovmError {
                 "Cannot load initrd due to an invalid memory configuration."
             ),
             InitrdRead(ref err) => write!(f, "Cannot load initrd due to an invalid image: {err}"),
-            Internal(ref err) => write!(f, "Internal error while starting microVM: {err:?}"),
+            Internal(ref err) => write!(f, "Internal error while starting microVM: {err}"),
             InvalidKernelBundle(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");

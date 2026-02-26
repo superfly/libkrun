@@ -68,7 +68,7 @@ impl Display for Error {
         match self {
             GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
             VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
-            VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
+            VmSetup(e) => write!(f, "Cannot configure the microvm: {e}"),
             VcpuRun => write!(f, "Cannot run the VCPUs"),
             VcpuState(e) => write!(f, "Failed to save or restore vCPU state: {e}"),
             NotEnoughMemorySlots => write!(
