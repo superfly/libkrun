@@ -686,6 +686,7 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    scheduler: Arc<dyn crate::vcpu_scheduler::VcpuScheduler>,
 ) -> std::result::Result<BuiltVm, StartMicrovmError> {
     let mut device_info = VmDeviceInfo::default();
 
@@ -1040,6 +1041,7 @@ pub fn build_microvm(
             &exit_evt,
             vcpu_list.clone(),
             vm_resources.nested_enabled,
+            scheduler.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
         vcpus = created;
@@ -1938,6 +1940,7 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    scheduler: Arc<dyn crate::vcpu_scheduler::VcpuScheduler>,
 ) -> super::Result<(Vec<Vcpu>, Vec<Sender<u64>>)> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
@@ -1958,6 +1961,7 @@ fn create_vcpus_aarch64(
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
+            scheduler.clone(),
         )
         .map_err(Error::Vcpu)?;
 

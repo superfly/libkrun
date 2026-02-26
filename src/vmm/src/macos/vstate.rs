@@ -188,6 +188,21 @@ pub struct VcpuConfig {
 // Using this for easier explicit type-casting to help IDEs interpret the code.
 type VcpuCell = Cell<Option<*const Vcpu>>;
 
+/// Convert HVF vCPU exit reasons to scheduler exit reasons.
+fn vcpu_exit_to_reason(exit: &VcpuExit<'_>) -> crate::vcpu_scheduler::VcpuExitReason {
+    use crate::vcpu_scheduler::VcpuExitReason;
+    match exit {
+        VcpuExit::MmioRead(_, _) | VcpuExit::MmioWrite(_, _) => VcpuExitReason::Mmio,
+        VcpuExit::SystemRegister => VcpuExitReason::SystemRegister,
+        VcpuExit::VtimerActivated => VcpuExitReason::TimerActivated,
+        VcpuExit::WaitForEvent
+        | VcpuExit::WaitForEventExpired
+        | VcpuExit::WaitForEventTimeout(_) => VcpuExitReason::WaitForEvent,
+        VcpuExit::Shutdown => VcpuExitReason::Shutdown,
+        _ => VcpuExitReason::Other,
+    }
+}
+
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     id: u8,
@@ -213,6 +228,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    scheduler: Arc<dyn crate::vcpu_scheduler::VcpuScheduler>,
 }
 
 impl Vcpu {
@@ -287,6 +303,7 @@ impl Vcpu {
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
+        scheduler: Arc<dyn crate::vcpu_scheduler::VcpuScheduler>,
     ) -> Result<Self> {
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -306,6 +323,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            scheduler,
         })
     }
 
@@ -372,8 +390,16 @@ impl Vcpu {
     fn run_emulation(&mut self, hvf_vcpu: &mut HvfVcpu) -> Result<VcpuEmulation> {
         let vcpuid = hvf_vcpu.id();
 
+        self.scheduler.request_run_permission(self.id as usize);
+
         match hvf_vcpu.run(self.vcpu_list.clone()) {
-            Ok(exit) => match exit {
+            Ok(exit) => {
+                let exit_reason = vcpu_exit_to_reason(&exit);
+                if self.scheduler.on_exit(self.id as usize, exit_reason) {
+                    self.scheduler.release_run_permission(self.id as usize);
+                }
+
+                match exit {
                 VcpuExit::Breakpoint => {
                     trace!("vCPU {vcpuid} breakpoint");
                     Ok(VcpuEmulation::Interrupted)
@@ -447,8 +473,12 @@ impl Vcpu {
                     trace!("vCPU {vcpuid} WaitForEventTimeout timeout={duration:?}");
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
-            },
-            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+                }
+            }
+            Err(e) => {
+                self.scheduler.release_run_permission(self.id as usize);
+                panic!("Error running HVF vCPU: {e:?}");
+            }
         }
     }
 
