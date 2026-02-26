@@ -390,6 +390,15 @@ pub fn host_counter_now() -> u64 {
 
 pub struct HvfVm {}
 
+impl Drop for HvfVm {
+    fn drop(&mut self) {
+        let ret = unsafe { hv_vm_destroy() };
+        if ret != HV_SUCCESS {
+            error!("hv_vm_destroy failed: {ret}");
+        }
+    }
+}
+
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
     libloading::Library::new(
         "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
