@@ -101,7 +101,19 @@ const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
 const INIT_PATH: &str = "/init.krun";
 
 static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+    LazyLock::new(|| {
+        if let Ok(path) = std::env::var("LIBKRUNFW_PATH") {
+            if let Ok(lib) = unsafe { libloading::Library::new(&path) } {
+                return Some(lib);
+            }
+            // LIBKRUNFW_PATH was set but loading failed — fall through to standard search
+            eprintln!(
+                "warning: LIBKRUNFW_PATH={} could not be loaded, falling back to system search",
+                path
+            );
+        }
+        unsafe { libloading::Library::new(KRUNFW_NAME).ok() }
+    });
 
 pub struct KrunfwBindings {
     get_kernel: libloading::Symbol<
