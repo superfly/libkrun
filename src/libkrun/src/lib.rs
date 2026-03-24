@@ -46,7 +46,7 @@ use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -145,6 +145,24 @@ impl KrunfwBindings {
 
     pub fn new() -> Option<Self> {
         Self::load_bindings().ok()
+    }
+
+    /// Load bindings from a specific library path (dlopen).
+    ///
+    /// The library is leaked to ensure symbols remain valid for the process lifetime.
+    fn from_path(path: &Path) -> Result<KrunfwBindings, libloading::Error> {
+        let lib = unsafe { libloading::Library::new(path) }?;
+        // Leak the library so it lives for 'static — symbols borrow from it.
+        let lib = Box::leak(Box::new(lib));
+        Ok(unsafe {
+            KrunfwBindings {
+                get_kernel: lib.get(b"krunfw_get_kernel")?,
+                #[cfg(feature = "tee")]
+                get_initrd: lib.get(b"krunfw_get_initrd")?,
+                #[cfg(feature = "tee")]
+                get_qboot: lib.get(b"krunfw_get_qboot")?,
+            }
+        })
     }
 }
 
@@ -2383,6 +2401,17 @@ impl Builder {
             },
             ..Default::default()
         }
+    }
+
+    /// Load libkrunfw from an explicit path (dlopen).
+    ///
+    /// This overrides the default library search — the firmware shared library
+    /// is loaded from the given path and its exported symbols are used to
+    /// extract kernel/initrd payloads.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_firmware(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, libloading::Error> {
+        self.config.krunfw = Some(KrunfwBindings::from_path(path.as_ref())?);
+        Ok(self)
     }
 
     pub fn vm_config(&mut self, num_vcpus: u8, ram_mib: u32) -> &mut Self {
