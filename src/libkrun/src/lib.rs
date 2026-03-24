@@ -2414,6 +2414,25 @@ impl Builder {
         Ok(self)
     }
 
+    /// Check if nested virtualization is supported on this system.
+    ///
+    /// Returns `true` on M3+ chips running macOS 15 (Sequoia) or later.
+    #[cfg(target_os = "macos")]
+    pub fn check_nested_virt() -> Result<bool, hvf::Error> {
+        hvf::check_nested_virt()
+    }
+
+    /// Enable nested virtualization for the guest VM.
+    ///
+    /// When enabled, the guest sees EL2 hardware virtualization extensions,
+    /// allowing it to run its own hypervisor (e.g. KVM).
+    /// Requires M3+ and macOS 15+; call `check_nested_virt()` first.
+    #[cfg(target_os = "macos")]
+    pub fn enable_nested_virt(&mut self) -> &mut Self {
+        self.config.vmr.nested_enabled = true;
+        self
+    }
+
     pub fn vm_config(&mut self, num_vcpus: u8, ram_mib: u32) -> &mut Self {
         let mem_size_mib: usize = ram_mib.try_into().expect("ram_mib did not fit in a usize");
 
